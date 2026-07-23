@@ -1,0 +1,66 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "glide",
+  "main": "src/server.ts",
+  "compatibility_date": "2025-06-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "durable_objects": {
+    "bindings": [{ "name": "GlideAgent", "class_name": "GlideAgent" }]
+  },
+  // Service binding to the Switchflare / migration tool Worker. Invokes it
+  // directly inside the runtime (bypasses the public edge + Cloudflare Access),
+  // so Glide can read existing provider config even though switchflare's public
+  // hostname is Access-protected. Falls back to MIGRATION_API_URL when absent.
+  //
+  // Disabled: no `switchflare` Worker exists in this account, so a service
+  // binding makes `wrangler deploy` fail. Re-enable the line below once
+  // switchflare is deployed, or set MIGRATION_API_URL instead. Until then the
+  // migration tools stay dormant and explain how to enable them; the rest of
+  // Glide works normally.
+  // "services": [{ "binding": "MIGRATION", "service": "switchflare" }],
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["GlideAgent"] }],
+  "ai": { "binding": "AI" },
+  // Vector DB for guidance RAG. Admin "Team guidance" docs are embedded with
+  // GLIDE_EMBED_MODEL and stored here; at chat time we retrieve only the most
+  // relevant docs (per-room, isolated by Vectorize `namespace`) into the prompt
+  // instead of injecting every doc. Create the index once with:
+  //   wrangler vectorize create glide-guidance --dimensions=768 --metric=cosine
+  // The dimensions MUST match GLIDE_EMBED_MODEL's output (bge-base-en-v1.5 = 768);
+  // both are immutable, so changing the embed model means a new index. If the
+  // binding/index is absent, Glide safely falls back to injecting all enabled docs.
+  "vectorize": [{ "binding": "VECTORIZE", "index_name": "glide-guidance" }],
+  "observability": { "enabled": true },
+  // Weekly Cloudflare-docs refresh. The scheduled() handler in src/server.ts
+  // drives a full docs reindex (scrape → embed → upsert into the shared Vectorize
+  // '__cfdocs__' namespace) via one well-known DO. Sunday 02:00 UTC, matching the
+  // upstream cadence. Reindex is idempotent (deterministic vector ids), so a run
+  // that overlaps a manual admin reindex is safe.
+  "triggers": { "crons": ["0 2 * * SUN"] },
+  "assets": {
+    "directory": "./dist/client",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": true
+  },
+  // Non-secret vars. The Cloudflare API token (CF_API_TOKEN), the at-rest token
+  // encryption key (GLIDE_TOKEN_KEY), and the migration tool base URL
+  // (MIGRATION_API_URL) are provided via `.dev.vars` locally or `wrangler secret put`
+  // in production — see `.dev.vars.example` and `src/env.d.ts`.
+  "vars": {
+    // Chat/reasoning model. We moved OFF the quantized
+    // `@cf/meta/llama-3.3-70b-instruct-fp8-fast` because fp8 quantization made it
+    // unreliable at structured output: it returned empty completions and often
+    // "promised" a tool action (or pasted a tool call as text) without actually
+    // calling the tool — so onboarding stalled and no pending approvals appeared.
+    // gpt-oss-120b is full-precision, reasons well, has a 128k context (fits the
+    // big system prompt + RAG) and reliable function calling. Note: gpt-oss does
+    // NOT support /ai/run streaming, so workers-ai-provider transparently falls
+    // back to a single non-streaming call and synthesizes the stream (see
+    // server.ts onChatMessage); we set `sendReasoning:false` so the harmony
+    // reasoning channel never leaks into the chat UI.
+    "GLIDE_MODEL": "@cf/openai/gpt-oss-120b",
+    // Workers AI text-embedding model for guidance RAG. Its output dimensionality
+    // must match the Vectorize index above (bge-base-en-v1.5 → 768 dims).
+    "GLIDE_EMBED_MODEL": "@cf/baai/bge-base-en-v1.5"
+  }
+}

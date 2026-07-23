@@ -1,0 +1,37 @@
+{
+  "name": "glide",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Glide — a multi-user, real-time chat room that drives the Cloudflare API with persistent memory.",
+  "scripts": {
+    "build": "vite build",
+    "dev": "wrangler dev",
+    "dev:ui": "vite",
+    "deploy": "npm run build && wrangler deploy",
+    "test": "node --experimental-strip-types --test tests/*.test.ts",
+    "types": "wrangler types",
+    "check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@ai-sdk/react": "^3.0.216",
+    "@cloudflare/ai-chat": "^0.9.1",
+    "agents": "^0.17.1",
+    "ai": "^6.0.214",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7",
+    "workers-ai-provider": "^3.2.1",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@cloudflare/vite-plugin": "^1.42.3",
+    "@cloudflare/workers-types": "^4.20260629.1",
+    "@types/node": "^26.0.1",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.3",
+    "typescript": "^6.0.3",
+    "vite": "^8.1.0",
+    "wrangler": "^4.105.0"
+  }
+}

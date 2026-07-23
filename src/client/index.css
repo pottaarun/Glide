@@ -1,0 +1,296 @@
+/**
+ * Glide — global polish + atmosphere layer.
+ *
+ * The component tree styles its static look with an inline `S` object. This
+ * stylesheet owns everything inline styles *can't* express: fonts, the living
+ * "aurora over the edge" backdrop, the animated gradient wordmark, hover /
+ * focus / active feedback, entrance motion, and custom scrollbars. Inline wins
+ * on same-property base values; these :hover/animation/pseudo rules layer on
+ * top without fighting it.
+ */
+
+:root {
+  color-scheme: dark;
+  /* Signature palette — a dawn sky seen while gliding above the edge. */
+  --ink: #070b16;
+  --flare: #f97316; /* Cloudflare-warm orange — primary identity  */
+  --ember: #fbbf24; /* amber                                       */
+  --magenta: #ec4899; /* hot dawn pink — energy / highlight        */
+  --violet: #8b5cf6; /* cool upper sky                             */
+  --cyan: #38bdf8; /* data / links                                */
+  --ring: rgba(236, 72, 153, 0.4);
+  --grad-brand: linear-gradient(
+    120deg,
+    #fb923c 0%,
+    #f97316 20%,
+    #ec4899 58%,
+    #a855f7 100%
+  );
+  --grad-cta: linear-gradient(135deg, #f97316 0%, #ec4899 100%);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background: var(--ink);
+  color: #e5e7eb;
+  font-family: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI",
+    Roboto, sans-serif;
+  font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+/* ---------------------------------------------------------------------------
+ * Signature: the living aurora. Slow-drifting warm/cool gradient blooms behind
+ * everything, with a vignette that settles the edges. App surfaces are glass
+ * (translucent) so this glows through without hurting readability.
+ * ------------------------------------------------------------------------- */
+body::before {
+  content: "";
+  position: fixed;
+  inset: -25vmax;
+  z-index: -2;
+  background:
+    radial-gradient(38vmax 38vmax at 12% 6%, rgba(249, 115, 22, 0.24), transparent 60%),
+    radial-gradient(34vmax 34vmax at 90% -4%, rgba(236, 72, 153, 0.2), transparent 60%),
+    radial-gradient(44vmax 44vmax at 82% 96%, rgba(139, 92, 246, 0.22), transparent 62%),
+    radial-gradient(30vmax 30vmax at 4% 98%, rgba(56, 189, 248, 0.14), transparent 60%);
+  filter: blur(26px) saturate(125%);
+  animation: auroraDrift 30s ease-in-out infinite alternate;
+}
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background: radial-gradient(
+    120vmax 80vmax at 50% -12%,
+    transparent 42%,
+    rgba(7, 11, 22, 0.6) 100%
+  );
+}
+
+@keyframes auroraDrift {
+  0% {
+    transform: translate3d(-3%, -2%, 0) scale(1);
+  }
+  50% {
+    transform: translate3d(3%, 2%, 0) scale(1.08);
+  }
+  100% {
+    transform: translate3d(-2%, 3%, 0) scale(1.04);
+  }
+}
+
+/* Monospace for code-ish surfaces (these tags carry no inline font-family). */
+code,
+pre,
+kbd,
+samp {
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo,
+    Consolas, monospace;
+  font-feature-settings: "calt" 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * Wordmark — the gradient catches a slow moving sheen. The gradient itself is
+ * set inline (with background-size:200%); we only animate its position here.
+ * ------------------------------------------------------------------------- */
+.glide-brand {
+  animation: brandSheen 7s linear infinite;
+}
+@keyframes brandSheen {
+  to {
+    background-position: 200% center;
+  }
+}
+
+/* ---------------------------------------------------------------------------
+ * Motion & tactility on interactive elements.
+ * ------------------------------------------------------------------------- */
+button,
+input,
+textarea,
+select,
+a,
+summary,
+[role="button"] {
+  transition: background-color 0.18s ease, border-color 0.18s ease,
+    color 0.18s ease, box-shadow 0.2s ease, filter 0.18s ease,
+    transform 0.12s cubic-bezier(0.22, 1, 0.36, 1), opacity 0.18s ease;
+}
+
+button {
+  cursor: pointer;
+}
+button:not(:disabled):hover {
+  filter: brightness(1.09) saturate(1.05);
+}
+button:not(:disabled):active {
+  transform: translateY(1px) scale(0.99);
+}
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+/* Cards / panels that opt into a hover lift + glow (class added in JSX). */
+.glide-lift {
+  transition: transform 0.2s cubic-bezier(0.22, 1, 0.36, 1),
+    box-shadow 0.2s ease, border-color 0.2s ease;
+}
+.glide-lift:hover {
+  transform: translateY(-3px);
+  border-color: rgba(236, 72, 153, 0.35);
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.5),
+    0 0 0 1px rgba(236, 72, 153, 0.12), 0 0 26px rgba(249, 115, 22, 0.12);
+}
+
+/* Text fields get a branded focus glow (beats the non-important inline border). */
+input:focus,
+textarea:focus {
+  outline: none;
+  border-color: var(--magenta) !important;
+  box-shadow: 0 0 0 3px var(--ring), 0 0 22px rgba(236, 72, 153, 0.18);
+}
+
+/* Keyboard-only focus ring for everything else. */
+:focus-visible {
+  outline: 2px solid #fb7185;
+  outline-offset: 2px;
+  border-radius: 10px;
+}
+:focus:not(:focus-visible) {
+  outline: none;
+}
+
+::placeholder {
+  color: #64748b;
+  opacity: 1;
+}
+::selection {
+  background: rgba(236, 72, 153, 0.4);
+  color: #fff;
+}
+
+/* Custom scrollbars — the default chrome ones look cheap on a dark UI. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #2f3a52 transparent;
+}
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: linear-gradient(180deg, #35415c, #2a3348);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: linear-gradient(180deg, #f97316, #ec4899);
+  background-clip: padding-box;
+}
+
+/* Message entrance — referenced inline via `animation` on the bubble. */
+@keyframes glideIn {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* Soft pop for cards appearing (queue items, stat cards). */
+@keyframes glidePop {
+  from {
+    opacity: 0;
+    transform: translateY(6px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* A pending item quietly pulses its warm edge so it reads as "waiting on you". */
+@keyframes pendingPulse {
+  0%,
+  100% {
+    box-shadow: 0 2px 14px rgba(0, 0, 0, 0.35),
+      inset 3px 0 0 rgba(251, 191, 36, 0.7);
+  }
+  50% {
+    box-shadow: 0 2px 14px rgba(0, 0, 0, 0.35),
+      inset 3px 0 0 rgba(251, 191, 36, 1), -1px 0 18px rgba(251, 191, 36, 0.28);
+  }
+}
+.glide-pending {
+  animation: pendingPulse 3.2s ease-in-out infinite;
+}
+.glide-pending--applying {
+  animation-duration: 1.35s;
+}
+.glide-pending--failed {
+  animation: none;
+  box-shadow: 0 2px 14px rgba(0, 0, 0, 0.35), inset 3px 0 0 rgba(244, 63, 94, 0.9);
+}
+
+/* Animated "thinking…" indicator — three bouncing dots (replaces the text). */
+.glide-dots {
+  gap: 5px;
+}
+.glide-dots span {
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: linear-gradient(135deg, var(--flare), var(--magenta));
+  animation: glideBounce 1.2s infinite ease-in-out both;
+}
+.glide-dots span:nth-child(1) {
+  animation-delay: -0.24s;
+}
+.glide-dots span:nth-child(2) {
+  animation-delay: -0.12s;
+}
+@keyframes glideBounce {
+  0%,
+  80%,
+  100% {
+    opacity: 0.35;
+    transform: translateY(0) scale(0.8);
+  }
+  40% {
+    opacity: 1;
+    transform: translateY(-5px) scale(1);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}

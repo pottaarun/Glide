@@ -3,6 +3,8 @@ import test from "node:test";
 
 import {
   claimsNewQueuedAction,
+  hasSuccessfulToolOutput,
+  needsOnboardingFollowUp,
   promisesToolAction,
   queueClaimCorrection,
   repairOnboardingToolInput,
@@ -118,6 +120,90 @@ test("does not flag onboarding replies that ask the user for input", () => {
   );
   assert.equal(
     promisesToolAction("To get started, please provide your domain name so I can create the zone."),
+    false,
+  );
+});
+
+test("continues active onboarding after a successful tool result that asks no question", () => {
+  const active = { active: true, completed: false };
+  const dnsSummary = "I found eight DNS records and displayed them above.";
+
+  assert.equal(needsOnboardingFollowUp(active, dnsSummary, true), true);
+  assert.equal(
+    needsOnboardingFollowUp(active, `${dnsSummary} Which records should Cloudflare proxy?`, true),
+    false,
+  );
+  assert.equal(
+    needsOnboardingFollowUp(active, `${dnsSummary} Tell me which records should be proxied.`, true),
+    false,
+  );
+  assert.equal(
+    needsOnboardingFollowUp(active, "I found eight records, three of which are proxied.", true),
+    true,
+  );
+  assert.equal(
+    needsOnboardingFollowUp(active, "Here is what I found: eight DNS records.", true),
+    true,
+  );
+  assert.equal(
+    needsOnboardingFollowUp(active, "What is currently proxied is listed above.", true),
+    true,
+  );
+  assert.equal(
+    needsOnboardingFollowUp(active, "Why does this matter? The records are listed above.", true),
+    true,
+  );
+  assert.equal(
+    needsOnboardingFollowUp(active, "Which records should Cloudflare proxy? For example, your web records.", true),
+    false,
+  );
+  assert.equal(
+    needsOnboardingFollowUp(active, "Which records should Cloudflare proxy? (For example, www.)", true),
+    false,
+  );
+  assert.equal(
+    needsOnboardingFollowUp(active, "I found eight DNS records. Is there anything else I can help with?", true),
+    true,
+  );
+});
+
+test("does not force an onboarding follow-up without a successful tool or after completion", () => {
+  const summary = "Here is how Cloudflare proxy status works.";
+
+  assert.equal(needsOnboardingFollowUp({ active: true }, summary, false), false);
+  assert.equal(needsOnboardingFollowUp({ active: true, completed: true }, summary, true), false);
+  assert.equal(needsOnboardingFollowUp({ active: false }, summary, true), false);
+  assert.equal(needsOnboardingFollowUp(undefined, summary, true), false);
+});
+
+test("requires a correlated, non-error output for a successful tool result", () => {
+  const input = {
+    type: "tool-input-available",
+    toolCallId: "dns-1",
+    toolName: "list_dns_records",
+  };
+  const output = { type: "tool-output-available", toolCallId: "dns-1", output: "[]" };
+
+  assert.equal(hasSuccessfulToolOutput([input, output], "list_dns_records"), true);
+  assert.equal(hasSuccessfulToolOutput([input], "list_dns_records"), false);
+  assert.equal(
+    hasSuccessfulToolOutput([input, { ...output, toolCallId: "dns-2" }], "list_dns_records"),
+    false,
+  );
+  assert.equal(hasSuccessfulToolOutput([input, output], "find_zone"), false);
+  assert.equal(
+    hasSuccessfulToolOutput(
+      [input, { type: "tool-output-error", toolCallId: "dns-1", output: "failed" }],
+      "list_dns_records",
+    ),
+    false,
+  );
+  assert.equal(
+    hasSuccessfulToolOutput([input, { ...output, output: "Error: forbidden" }], "list_dns_records"),
+    false,
+  );
+  assert.equal(
+    hasSuccessfulToolOutput([input, { ...output, output: { ok: false } }], "list_dns_records"),
     false,
   );
 });

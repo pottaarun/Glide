@@ -75,7 +75,9 @@ This README is the overview. In-depth docs live in [`docs/`](docs/):
   scrapes the official Cloudflare developer docs, embeds them into **Vectorize**
   (a shared `__cfdocs_v2__` namespace), starts on first use, and refreshes them weekly. Each chat
   turn retrieves the most relevant excerpts into the prompt so Glide cites current,
-  authoritative guidance instead of guessing.
+  authoritative guidance instead of guessing. Pages surfaced during the
+  conversation accumulate into a deduplicated **Cloudflare docs** reading list in
+  the sidebar and read-only admin view.
 - **Persistent room memory.** Durable facts (account IDs, zone defaults, naming
   conventions) survive restarts and are shared with everyone in the room.
 - **Guided, chat-led onboarding.** Glide greets a new room and walks a team

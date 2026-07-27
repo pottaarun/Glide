@@ -22,7 +22,7 @@
  * The embedding model (GLIDE_EMBED_MODEL) and index dimensions are shared with
  * guidance RAG and immutable — see wrangler.jsonc.
  */
-import type { DocChunk } from "./shared";
+import { isCloudflareDocsUrl, type DocChunk } from "./shared.ts";
 import { embedTexts } from "./guidance-rag.ts";
 
 /** Top-level index listing every Cloudflare product and its per-product index. */
@@ -134,6 +134,7 @@ export function parseTopIndex(md: string): DocProduct[] {
     if (!m) continue;
     const label = m[1].trim();
     const url = m[2].trim();
+    if (!isCloudflareDocsUrl(url)) continue;
     if (!/\/llms\.txt$/i.test(url)) continue; // only per-product indexes
     if (seen.has(url)) continue;
     seen.add(url);
@@ -164,6 +165,7 @@ export function parseProductIndex(md: string): DocPage[] {
     if (!m) continue;
     const title = m[1].trim();
     const url = m[2].trim();
+    if (!isCloudflareDocsUrl(url)) continue;
     if (!/\.md$/i.test(url)) continue; // only Markdown page links
     if (seen.has(url)) continue;
     seen.add(url);
@@ -273,6 +275,7 @@ export async function indexDocPage(
   page: DocPage,
   product: string,
 ): Promise<IndexPageResult> {
+  if (!isCloudflareDocsUrl(page.url)) return { ok: false, chunks: 0 };
   const index = vectorizeIndex(env);
   if (!index) return { ok: false, chunks: 0 };
 
@@ -384,7 +387,7 @@ export async function retrieveDocChunks(
     const meta = (m.metadata ?? {}) as Record<string, unknown>;
     const text = typeof meta.text === "string" ? meta.text : "";
     const url = typeof meta.url === "string" ? meta.url : "";
-    if (!text || !url) continue;
+    if (!text || !isCloudflareDocsUrl(url)) continue;
     out.push({
       url,
       title: typeof meta.title === "string" ? meta.title : url,

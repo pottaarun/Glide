@@ -47,6 +47,13 @@ const ACTION_INTENT =
 const SOLICITS_INPUT =
   /\b(?:let (?:me|us) know|tell (?:me|us)|give (?:me|us)|send (?:me|us)|share (?:your|the|it|that|those|these)|provide (?:your|the|a|an|me|us|it|that)|paste (?:your|the|it|in)|upload (?:your|the|it|a)|which\b|what(?:['’]s| is| are|['’]re)?\b|who(?:['’]s| is)?\b|where(?:['’]s| is| are)?\b|do you (?:have|want|need|know|use|prefer)|could you|can you|would you (?:like|prefer|mind)|go ahead and (?:tell|share|send|paste|upload|provide))\b/i;
 
+// Unlike SOLICITS_INPUT, this is anchored to the final sentence so descriptive
+// phrases such as "three of which are proxied" do not look like a hand-off.
+const FINAL_HANDOFF_REQUEST =
+  /^(?:please\s+)?(?:let (?:me|us) know|tell (?:me|us)|give (?:me|us)|send (?:me|us)|share\b|provide\b|paste\b|upload\b|choose\b|select\b|confirm\b)/i;
+const TRAILING_QUESTION = /\?[\s*_~`'"”’)\]]*$/;
+const QUESTION_EXAMPLE = /^(?:for (?:example|instance)\b|e\.g\.|you can (?:answer|reply|choose)\b)/i;
+
 // "Let me know once you've approved it" is not a real question: it hands the
 // turn back on the false premise that an action already exists.
 const ACTION_DEPENDENT_HANDOFF =
@@ -63,6 +70,82 @@ const GENERIC_COURTESY_QUESTION =
 /** True when the reply asks the user for input (a question or explicit request). */
 export function solicitsUserInput(prose: string): boolean {
   return /\?/.test(prose) || SOLICITS_INPUT.test(prose);
+}
+
+/** True when the reply finishes with a user-facing question or request. */
+export function hasFinalUserHandoff(prose: string): boolean {
+  const clauses = prose
+    .trim()
+    .split(/(?<=[.!?…])\s+|\n+/)
+    .map((clause) => clause.trim())
+    .filter(Boolean);
+  if (!clauses.length) return false;
+
+  const clean = (clause: string): string => clause.replace(/^[\s(>*#_`~-]+/, "");
+  const last = clean(clauses[clauses.length - 1]);
+  if (GENERIC_COURTESY_QUESTION.test(last)) return false;
+  if (TRAILING_QUESTION.test(last) || FINAL_HANDOFF_REQUEST.test(last)) return true;
+
+  // Preserve a final question followed only by a short example.
+  if (clauses.length > 1 && QUESTION_EXAMPLE.test(last)) {
+    return TRAILING_QUESTION.test(clean(clauses[clauses.length - 2]));
+  }
+  return false;
+}
+
+/**
+ * True when a successful tool result would otherwise leave guided onboarding
+ * without a clear hand-off to the user.
+ */
+export function needsOnboardingFollowUp(
+  onboarding: { active?: boolean; completed?: boolean } | undefined,
+  prose: string,
+  hasSuccessfulToolOutput: boolean,
+): boolean {
+  return (
+    !!onboarding?.active &&
+    !onboarding.completed &&
+    hasSuccessfulToolOutput &&
+    !hasFinalUserHandoff(prose)
+  );
+}
+
+type ToolStreamChunk = {
+  type: string;
+  toolCallId?: string;
+  toolName?: string;
+  output?: unknown;
+};
+
+/** True when the named tool produced a correlated, non-error output chunk. */
+export function hasSuccessfulToolOutput(
+  chunks: ReadonlyArray<ToolStreamChunk>,
+  toolName: string,
+): boolean {
+  const callIds = new Set(
+    chunks
+      .filter(
+        (chunk) =>
+          chunk.type === "tool-input-available" &&
+          chunk.toolName === toolName &&
+          typeof chunk.toolCallId === "string",
+      )
+      .map((chunk) => chunk.toolCallId as string),
+  );
+  return chunks.some((chunk) => {
+    if (chunk.type !== "tool-output-available" || !chunk.toolCallId || !callIds.has(chunk.toolCallId)) {
+      return false;
+    }
+    if (typeof chunk.output === "string") {
+      return !/^\s*Error(?:\s+from[^:]*)?:/i.test(chunk.output);
+    }
+    return !(
+      chunk.output &&
+      typeof chunk.output === "object" &&
+      "ok" in chunk.output &&
+      chunk.output.ok === false
+    );
+  });
 }
 
 /** Detect a future-tense action promise that ended without a tool-backed result. */

@@ -248,6 +248,12 @@ button:disabled {
   box-shadow: 0 10px 28px rgba(0, 0, 0, 0.2) !important;
 }
 
+/* Docs reading-list links: branded orange edge on hover. */
+.glide-doclink:hover {
+  border-color: rgba(246, 130, 31, 0.5) !important;
+  background: rgba(246, 130, 31, 0.06) !important;
+}
+
 .glide-glass-card:hover::after {
   opacity: 0.5;
 }

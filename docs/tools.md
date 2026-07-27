@@ -171,6 +171,15 @@ checks, or anything needing discovery / a paid plan / a dashboard step) is **not
 one-click and instead offers an **Ask Glide** hand-off in chat
 (`isRecommendationQueueable()`, `src/recommendations.ts`).
 
+### Conversation docs reading list
+
+Cloudflare-docs retrieval automatically builds `state.docLinks`; it is not
+manually editable and does not affect the shared Vectorize index.
+
+| RPC | Args | Returns | Notes |
+| --- | --- | --- | --- |
+| `clearDocLinks` | `by?` | `{ ok: true }` | Clear this room's **Cloudflare docs** reading list. The sidebar exposes this as **Clear**; `/admin` renders the same list read-only. |
+
 ### Migration checks & exports
 
 | RPC | Args | Notes |

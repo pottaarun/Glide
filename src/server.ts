@@ -50,6 +50,7 @@ import {
 import {
   EMPTY_BUSINESS_PROFILE,
   INITIAL_GLIDE_STATE,
+  mergeDocLinks,
   type ActionResult,
   type BusinessProfile,
   type DocChunk,
@@ -101,6 +102,9 @@ import {
 import { buildSystemPrompt } from "./system-prompt";
 import {
   claimsNewQueuedAction,
+  hasFinalUserHandoff,
+  hasSuccessfulToolOutput,
+  needsOnboardingFollowUp,
   promisesToolAction,
   queueClaimCorrection,
   repairOnboardingToolInput,
@@ -1233,6 +1237,13 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     return { ok: true };
   }
 
+  /** UI: clear the running "Cloudflare docs from this chat" reading list. */
+  @callable()
+  async clearDocLinks(_by = "someone"): Promise<{ ok: true }> {
+    this.setState({ ...this.state, docLinks: [] });
+    return { ok: true };
+  }
+
   /**
    * UI: queue a single tailored recommendation (from recommendations.ts) as a
    * pending action for human Apply — the "Queue" button in the sidebar
@@ -1960,6 +1971,18 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     return hits.length ? hits : undefined;
   }
 
+  /**
+   * Fold the Cloudflare-docs pages surfaced this turn into the room's running
+   * "further reading" list (deduped by URL, most-recent first, capped). Built
+   * automatically from what the conversation actually needed; rendered in the
+   * sidebar and `/admin`. Best-effort — never blocks the chat turn.
+   */
+  private recordDocLinks(hits: DocChunk[]): void {
+    if (!hits.length) return;
+    const next = mergeDocLinks(this.state.docLinks, hits, Date.now());
+    this.setState({ ...this.state, docLinks: next });
+  }
+
   // ---------------------------------------------------------------------------
   // Chat brain
   // ---------------------------------------------------------------------------
@@ -2065,6 +2088,9 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
       guidanceCount: guidanceForPrompt?.length ?? 0,
       docsCount: docsForPrompt?.length ?? 0,
     });
+    // Fold the docs surfaced this turn into the room's running "further reading"
+    // list so the team gets a reading list built from the actual conversation.
+    if (docsForPrompt?.length) this.recordDocLinks(docsForPrompt);
     const system = buildSystemPrompt(this.state, guidanceForPrompt, docsForPrompt);
     const tools = this.buildTools();
     const repairToolCall: ToolCallRepairFunction<typeof tools> = async ({ toolCall }) => {
@@ -2172,11 +2198,20 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
         const runNarration = async (
           responseMessages: Awaited<typeof first.response>["messages"],
           narrate: string,
+          fallbackQuestion?: string,
         ): Promise<void> => {
           stage = "model.narration";
+          // Tools may have updated onboarding/defaults since `system` was built
+          // (notably list_dns_records marks DNS review complete). Rebuild here so
+          // the forced follow-up asks for the actual next unchecked step.
+          const narrationSystem = buildSystemPrompt(
+            this.state,
+            guidanceForPrompt,
+            docsForPrompt,
+          );
           const narration = streamText({
             model,
-            system: `${system}\n\n${narrate}`,
+            system: `${narrationSystem}\n\n${narrate}`,
             messages: [...messages, ...responseMessages],
             toolChoice: "none",
             abortSignal,
@@ -2185,13 +2220,20 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
             narration.toUIMessageStream({ sendStart: false, sendFinish: false, sendReasoning: false }),
           );
           if (emitQueueNarration(narrationChunks, "chat narration")) {
+            if (fallbackQuestion) appendText(fallbackQuestion, true);
             writer.write({ type: "finish" });
             return;
           }
           writeChunks(narrationChunks, false);
           const narrationProse = assistantProse(textFromChunks(narrationChunks));
           if (promisesToolAction(narrationProse)) {
-            appendText(this.unfulfilledActionNarration(), true);
+            const correction = this.unfulfilledActionNarration();
+            appendText(fallbackQuestion ? `${correction}\n\n${fallbackQuestion}` : correction, true);
+          } else if (fallbackQuestion && !hasFinalUserHandoff(narrationProse)) {
+            appendText(
+              narrationProse ? `${narrationProse}\n\n${fallbackQuestion}` : fallbackQuestion,
+              true,
+            );
           } else {
             appendText(narrationProse, true);
           }
@@ -2223,8 +2265,29 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
           `captured and clearly state the next onboarding step or question. ` +
           `Server-confirmed approvals created this turn: ${this.queuedActionsThisTurn.length}. ` +
           `If that number is zero, explicitly say that nothing was queued.`;
+        const dnsFollowUpNarrate =
+          `The DNS result above is already shown to ${this.currentActor} — do NOT call any tools and do ` +
+          `NOT repeat that data. Onboarding is still in progress. In ONE short, warm sentence, ask the ` +
+          `single next unanswered onboarding question from the current Onboarding status. Ask exactly ` +
+          `one question and end it with a question mark.`;
+        const dnsFallbackQuestion =
+          "Which DNS records should Cloudflare proxy (orange cloud), and which should remain DNS-only?";
+        const completedDnsReview = (chunks: Chunk[]): boolean =>
+          !!this.state.onboarding?.active &&
+          !this.state.onboarding.completed &&
+          hasSuccessfulToolOutput(chunks, "list_dns_records");
+        const needsDnsFollowUp = (chunks: Chunk[], text: string): boolean =>
+          needsOnboardingFollowUp(
+            this.state.onboarding,
+            text,
+            hasSuccessfulToolOutput(chunks, "list_dns_records"),
+          );
 
         if (emitQueueNarration(firstChunks, "initial chat response")) {
+          if (completedDnsReview(firstChunks)) {
+            this.logChatEvent("chat.onboarding_nudge", { turnId, stage });
+            appendText(dnsFallbackQuestion, true);
+          }
           writer.write({ type: "finish" });
           return;
         }
@@ -2262,17 +2325,40 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
           // The first pass contained a non-executing literal tool call. Preserve
           // only protocol/tool chunks; its prose is not trustworthy narration.
           writeChunks(firstChunks, false);
+          const contProse = assistantProse(contText);
+          const contCompletedDnsReview = completedDnsReview(contChunks);
+          const contNeedsDnsFollowUp = needsDnsFollowUp(contChunks, contProse);
           if (emitQueueNarration(contChunks, "tool continuation")) {
+            if (contCompletedDnsReview) {
+              this.logChatEvent("chat.onboarding_nudge", { turnId, stage });
+              appendText(dnsFallbackQuestion, true);
+            }
             writer.write({ type: "finish" });
             return;
           }
-          if (assistantProse(contText).length === 0 && !abortSignal?.aborted) {
+          if (contProse.length === 0 && !abortSignal?.aborted) {
             writeChunks(contChunks);
-            await runNarration(responseMessages, captureNarrate);
-          } else if (promisesToolAction(assistantProse(contText))) {
+            if (contNeedsDnsFollowUp) this.logChatEvent("chat.onboarding_nudge", { turnId, stage });
+            await runNarration(
+              responseMessages,
+              contNeedsDnsFollowUp ? dnsFollowUpNarrate : captureNarrate,
+              contNeedsDnsFollowUp ? dnsFallbackQuestion : undefined,
+            );
+          } else if (promisesToolAction(contProse)) {
             writeChunks(contChunks, false);
-            appendText(this.unfulfilledActionNarration(), true);
+            const correction = this.unfulfilledActionNarration();
+            if (contCompletedDnsReview) {
+              this.logChatEvent("chat.onboarding_nudge", { turnId, stage });
+            }
+            appendText(
+              contCompletedDnsReview ? `${correction}\n\n${dnsFallbackQuestion}` : correction,
+              true,
+            );
             writer.write({ type: "finish" });
+          } else if (contNeedsDnsFollowUp) {
+            this.logChatEvent("chat.onboarding_nudge", { turnId, stage });
+            writeChunks(contChunks);
+            await runNarration(responseMessages, dnsFollowUpNarrate, dnsFallbackQuestion);
           } else {
             writeChunks(contChunks);
             writer.write({ type: "finish" });
@@ -2283,8 +2369,14 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
         // Case B — a tool ran but the model produced no prose (only tool-call
         // JSON / tokens that strip to empty): narrate what happened.
         if (prose.length === 0) {
+          const needsFollowUp = needsDnsFollowUp(firstChunks, prose);
+          if (needsFollowUp) this.logChatEvent("chat.onboarding_nudge", { turnId, stage });
           writeChunks(firstChunks);
-          await runNarration(responseMessages, captureNarrate);
+          await runNarration(
+            responseMessages,
+            needsFollowUp ? dnsFollowUpNarrate : captureNarrate,
+            needsFollowUp ? dnsFallbackQuestion : undefined,
+          );
           return;
         }
 
@@ -2297,8 +2389,23 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
         // junk the pending queue; asking is the correct, safe recovery.
         if (promisesToolAction(prose)) {
           writeChunks(firstChunks, false);
-          appendText(this.unfulfilledActionNarration());
+          const correction = this.unfulfilledActionNarration();
+          const dnsReviewed = completedDnsReview(firstChunks);
+          if (dnsReviewed) this.logChatEvent("chat.onboarding_nudge", { turnId, stage });
+          appendText(
+            dnsReviewed ? `${correction}\n\n${dnsFallbackQuestion}` : correction,
+          );
           writer.write({ type: "finish" });
+          return;
+        }
+
+        // Case D — list_dns_records succeeded mid-onboarding and the model
+        // reported the result but asked nothing. Keep the useful summary, then
+        // force one tool-less follow-up question so the guided flow cannot stall.
+        if (needsDnsFollowUp(firstChunks, prose)) {
+          this.logChatEvent("chat.onboarding_nudge", { turnId, stage });
+          writeChunks(firstChunks);
+          await runNarration(responseMessages, dnsFollowUpNarrate, dnsFallbackQuestion);
           return;
         }
 

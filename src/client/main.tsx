@@ -33,17 +33,19 @@ import { docsManifest } from "virtual:glide-docs";
 
 import "./index.css";
 
-import type {
-  ActionResult,
-  BusinessProfile,
-  GlideMessageMetadata,
-  GlideState,
-  GuidanceDoc,
-  MigrationPlan,
-  OnboardingPath,
-  OnboardingState,
-  PendingAction,
-  SetupType,
+import {
+  isCloudflareDocsUrl,
+  type ActionResult,
+  type BusinessProfile,
+  type DocLink,
+  type GlideMessageMetadata,
+  type GlideState,
+  type GuidanceDoc,
+  type MigrationPlan,
+  type OnboardingPath,
+  type OnboardingState,
+  type PendingAction,
+  type SetupType,
 } from "../shared";
 import { isActionApplying, isActionOutcomeUncertain, pendingActionStatus } from "../action-lifecycle";
 import { containsCloudflareApiToken, persistedDeliveryStatus } from "../chat-delivery";
@@ -1037,6 +1039,11 @@ function Room({ name }: { name: string }) {
     void runRpc("resetBusinessProfile", [name]);
   }, [runRpc, name]);
 
+  // Clear the running "Cloudflare docs from this chat" reading list.
+  const clearDocLinks = useCallback(() => {
+    void runRpc("clearDocLinks", [name]);
+  }, [runRpc, name]);
+
   // One-click queue a tailored recommendation. The server rebuilds the exact API
   // call from its own catalog, targeting the room's default zone.
   const queueRecommendation = useCallback(
@@ -1523,6 +1530,19 @@ function Room({ name }: { name: string }) {
             </Section>
           )}
 
+          {!!state?.docLinks?.length && (
+            <Section
+              title="Cloudflare docs"
+              action={
+                <button style={S.miniBtn} onClick={clearDocLinks} title="Clear this chat's docs reading list">
+                  Clear
+                </button>
+              }
+            >
+              <DocLinksPanel links={state.docLinks} />
+            </Section>
+          )}
+
           {(state?.defaultAccountId || state?.defaultZone) && (
             <Section title="Defaults">
               {state?.defaultAccountId && <KV k="account" v={state.defaultAccountId} />}
@@ -1894,6 +1914,42 @@ function KV({ k, v }: { k: string; v: string }) {
 
 function Muted({ children }: { children: React.ReactNode }) {
   return <p style={{ margin: 0, color: "#6b7280", fontSize: 13 }}>{children}</p>;
+}
+
+/**
+ * Sidebar / admin panel: the running list of Cloudflare docs pages the RAG
+ * retriever surfaced while answering this room's questions (`state.docLinks`).
+ * A "further reading" list built automatically from the actual conversation.
+ * Read-only; links open in a new tab.
+ */
+function DocLinksPanel({ links }: { links: DocLink[] }) {
+  const safeLinks = links.filter((link) => isCloudflareDocsUrl(link.url));
+  if (!safeLinks.length) return <Muted>No official Cloudflare documentation referenced yet.</Muted>;
+
+  return (
+    <>
+      <p style={S.docLinksHint}>
+        Pages Glide referenced while answering — a reading list from your conversation.
+      </p>
+      <ul style={S.docLinkList}>
+        {safeLinks.map((d) => (
+          <li key={d.url}>
+            <a
+              href={d.url}
+              target="_blank"
+              rel="noopener noreferrer"
+              style={S.docLink}
+              className="glide-doclink glide-lift"
+              title={d.url}
+            >
+              <span style={S.docLinkTitle}>{d.title}</span>
+              {d.product ? <span style={S.docLinkTag}>{d.product}</span> : null}
+            </a>
+          </li>
+        ))}
+      </ul>
+    </>
+  );
 }
 
 /**
@@ -3643,6 +3699,14 @@ function AdminRoom({ room, name }: { room: string; name: string }) {
               )}
             </Panel>
 
+            <Panel title="Cloudflare docs">
+              {state?.docLinks?.length ? (
+                <DocLinksPanel links={state.docLinks} />
+              ) : (
+                <Muted>No documentation referenced in this room yet.</Muted>
+              )}
+            </Panel>
+
             <Panel title="Migration">
               {!plan ? (
                 <Muted>
@@ -3967,6 +4031,11 @@ const S: Record<string, React.CSSProperties> = {
   recProposal: { fontSize: 12, color: "#8595a8", fontStyle: "italic" },
   recFlag: { fontSize: 10, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.5, color: "#fca5a5", background: "rgba(248,113,113,.08)", border: "1px solid rgba(248,113,113,.22)", borderRadius: 4, padding: "1px 6px" },
   recDoc: { fontSize: 12, color: "#7dd3fc", textDecoration: "none", fontWeight: 600 },
+  docLinksHint: { margin: "0 0 8px", fontSize: 12, color: "#8595a8", lineHeight: 1.45 },
+  docLinkList: { listStyle: "none", margin: 0, padding: 0, display: "flex", flexDirection: "column", gap: 6 },
+  docLink: { display: "flex", alignItems: "center", gap: 8, textDecoration: "none", border: "1px solid rgba(148,163,184,.14)", borderRadius: 8, padding: "8px 10px", background: "rgba(9,12,17,.4)" },
+  docLinkTitle: { flex: 1, minWidth: 0, fontSize: 12.5, fontWeight: 600, color: "#7dd3fc", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
+  docLinkTag: { flexShrink: 0, fontSize: 10, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.4, color: "#fdba74", background: "rgba(246,130,31,.08)", border: "1px solid rgba(246,130,31,.22)", borderRadius: 4, padding: "1px 6px" },
   checkBox: { marginTop: 10, fontSize: 12, lineHeight: 1.5, border: "1px solid rgba(148,163,184,.14)", borderRadius: 8, padding: "8px 10px", whiteSpace: "pre-wrap" },
   snapRow: { display: "flex", alignItems: "center", gap: 8, padding: "8px 0", borderBottom: "1px solid rgba(148,163,184,.1)" },
   snapZone: { fontSize: 13, color: "#e5e7eb", wordBreak: "break-all" },

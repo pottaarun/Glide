@@ -145,6 +145,7 @@ the optional fields below.
 | `chat.received` | The server received a turn and assigned a `turnId`. |
 | `chat.prepared` | Onboarding inference and both RAG lookups completed; includes guidance/docs counts. |
 | `chat.model_pass` | A model pass completed; includes stage, chunk count, text length, and queued-action count. |
+| `chat.onboarding_nudge` | A successful DNS-record read ended without a concrete user hand-off, so Glide forced the next onboarding question. |
 | `chat.stream_created` | The server returned the UI message stream. |
 | `chat.stream_finished` | Stream execution ended; inspect `stage` and `outcome`. |
 | `chat.error` | Stream execution threw; includes a bounded error name/message, not chat text. |

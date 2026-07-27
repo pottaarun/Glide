@@ -1,7 +1,31 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { deleteDocPages, indexDocPage } from "../src/docs-scraper.ts";
+import {
+  deleteDocPages,
+  indexDocPage,
+  parseProductIndex,
+  parseTopIndex,
+} from "../src/docs-scraper.ts";
+
+test("docs indexes accept only official HTTPS Cloudflare URLs", () => {
+  const products = parseTopIndex(`
+- [DNS](https://developers.cloudflare.com/dns/llms.txt)
+- [External](https://example.com/llms.txt)
+- [Insecure](http://developers.cloudflare.com/waf/llms.txt)
+`);
+  assert.deepEqual(products.map((product) => product.url), ["https://developers.cloudflare.com/dns/llms.txt"]);
+
+  const pages = parseProductIndex(`
+## Reference
+- [Records](https://developers.cloudflare.com/dns/manage-dns-records/index.md)
+- [External](https://example.com/fake.md)
+- [Insecure](http://developers.cloudflare.com/waf/rules.md)
+`);
+  assert.deepEqual(pages.map((page) => page.url), [
+    "https://developers.cloudflare.com/dns/manage-dns-records/index.md",
+  ]);
+});
 
 test("docs cleanup deletes known vector ids in bounded batches", async () => {
   const batches: string[][] = [];

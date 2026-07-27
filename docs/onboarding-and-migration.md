@@ -149,6 +149,10 @@ hand:
   activation, coordinate DNSSEC, set proxy status) are still checked off
   explicitly — by the model via `update_onboarding`'s `checkOff`, or by clicking
   the box (`toggleOnboardingStep`).
+- A successful `list_dns_records` turn cannot silently stop after rendering the
+  records. If the model asks no real follow-up, the server runs one tool-less
+  narration pass against the updated `dnsReviewed` state and, if needed, appends
+  a deterministic question about which records should be proxied versus DNS-only.
 
 **Migrate path:** identify domains → choose DNS setup → preview provider config →
 review scanned DNS records → queue migrated rules → set SSL/TLS to Full (strict) →

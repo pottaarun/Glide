@@ -98,6 +98,13 @@ export interface GlideState {
    * onboarding) so the advisor keeps working after go-live.
    */
   businessProfile?: BusinessProfile;
+  /**
+   * A running "further reading" list of Cloudflare docs pages the RAG retriever
+   * surfaced while answering this room's questions (see {@link DocLink}). Deduped
+   * by URL, most-recent first, capped at {@link MAX_DOC_LINKS}. Built automatically
+   * from the conversation and shown in the sidebar and `/admin`.
+   */
+  docLinks?: DocLink[];
   /** Most recent provider-config preview translated into Cloudflare rules. */
   migrationPlan?: MigrationPlan;
   /** Most recent Terraform export the room generated (downloadable in the UI). */
@@ -180,6 +187,79 @@ export interface DocChunk {
   text: string;
   /** Similarity score from Vectorize (higher is closer), when available. */
   score?: number;
+}
+
+/**
+ * A Cloudflare docs page surfaced by the RAG retriever during this room's
+ * conversation. Accumulated (deduped by URL, most-recent first) into
+ * {@link GlideState.docLinks} so the team gets a running "further reading" list
+ * built from what they actually discussed. Distinct from {@link DocChunk}: a
+ * DocLink is a whole page reference (no excerpt text), safe to render as a link.
+ */
+export interface DocLink {
+  /** Canonical docs page URL. */
+  url: string;
+  /** Page title. */
+  title: string;
+  /** Product the page belongs to, e.g. "WAF". */
+  product?: string;
+  /** Best similarity score seen for this page (higher is closer). */
+  score?: number;
+  /** ms epoch this page was most recently surfaced in the conversation. */
+  ts: number;
+}
+
+/** Cap on the running doc-links reading list kept in synced state. */
+export const MAX_DOC_LINKS = 12;
+
+/** Only official Cloudflare developer-docs pages belong in the reading list. */
+export function isCloudflareDocsUrl(value: string): boolean {
+  try {
+    return new URL(value).origin === "https://developers.cloudflare.com";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Fold freshly retrieved doc chunks into the room's running doc-links list:
+ * dedupe by URL (one entry per page, keeping the best score seen), stamp
+ * `ts = now` on pages surfaced this turn so they float to the top, then return
+ * the list most-recent-first, capped at {@link MAX_DOC_LINKS}. Pure — shared by
+ * the Worker and unit-tested directly.
+ */
+export function mergeDocLinks(
+  existing: DocLink[] | undefined,
+  hits: ReadonlyArray<Pick<DocChunk, "url" | "title" | "product" | "score">>,
+  now: number,
+  cap = MAX_DOC_LINKS,
+): DocLink[] {
+  const byUrl = new Map<string, DocLink>();
+  for (const link of existing ?? []) {
+    if (link && typeof link.url === "string" && isCloudflareDocsUrl(link.url)) {
+      byUrl.set(link.url, { ...link });
+    }
+  }
+  for (const h of hits) {
+    if (!h || typeof h.url !== "string" || !isCloudflareDocsUrl(h.url)) continue;
+    const prev = byUrl.get(h.url);
+    const score =
+      typeof h.score === "number"
+        ? prev?.score !== undefined
+          ? Math.max(prev.score, h.score)
+          : h.score
+        : prev?.score;
+    byUrl.set(h.url, {
+      url: h.url,
+      title: (h.title && h.title.trim()) || prev?.title || h.url,
+      product: h.product ?? prev?.product,
+      score,
+      ts: now,
+    });
+  }
+  return [...byUrl.values()]
+    .sort((a, b) => b.ts - a.ts || (b.score ?? 0) - (a.score ?? 0))
+    .slice(0, cap);
 }
 
 /**

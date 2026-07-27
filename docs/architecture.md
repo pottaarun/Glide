@@ -104,7 +104,8 @@ There is no deployment-wide Cloudflare API token fallback.
    from the request body or latest message metadata for queued-action attribution.
 2. **Prepare context.** Deterministic onboarding inference fills any missing
    fields from the latest user text. Team-guidance and Cloudflare-docs retrieval
-   run concurrently; `chat.prepared` records their result counts.
+   run concurrently; `chat.prepared` records their result counts. Retrieved docs
+   are also folded into the room's capped, deduplicated `docLinks` reading list.
 3. **Build the model call.** `buildSystemPrompt()` injects room memory, defaults,
    onboarding state, migration state, retrieved guidance, retrieved Cloudflare
    docs, and the safety contract. `buildTools()` supplies the LLM tools. The first
@@ -114,6 +115,10 @@ There is no deployment-wide Cloudflare API token fallback.
    pass. If it promises a tool action or emits a literal tool call without running
    it, Glide can run one required-tool continuation and then narrate. Unsupported
    claims that an action was queued are corrected against the server-owned queue.
+   During active onboarding, a successful `list_dns_records` result that ends
+   without a real user hand-off triggers `chat.onboarding_nudge`: narration is
+   rebuilt from the post-tool state and a deterministic proxy-status question is
+   appended if the second model pass still does not ask one.
 5. **Emit one assistant message.** Buffered chunks are replayed through one
    `createUIMessageStream`; `sendReasoning: false` keeps the model's harmony
    reasoning channel out of the room, and exactly one final `finish` is emitted.
@@ -195,6 +200,7 @@ field is broadcast to all clients via `onStateUpdate` (`src/client/main.tsx:375`
 | `tokenValid` | `boolean?` | Result of the latest token authentication check: `/user/tokens/verify`, with account/zone read fallback for account-scoped tokens. |
 | `onboarding` | `OnboardingState?` | Guided onboarding progress; its `checklist` auto-completes as info is captured (see [Onboarding & migration](./onboarding-and-migration.md)). |
 | `businessProfile` | `BusinessProfile?` | The team's "nature of the business" discovery answers (`industry`, `appTypes`, `hasLogin`, `hasApi`, `audience`, `trafficProfile`, `sensitiveData`, `compliance`, `concerns`, `notes`, `completed`; `src/shared.ts:299`). Captured in chat during onboarding and on-demand; feeds the recommendation engine. Kept at the room level (not inside `onboarding`) so the advisor keeps working after go-live. Rendered in the sidebar **Recommendations** panel and the `/admin` dashboard. |
+| `docLinks` | `DocLink[]?` | Up to 12 official `https://developers.cloudflare.com` pages surfaced by per-turn docs retrieval, deduplicated by URL and ordered by recency. Rendered as the room's **Cloudflare docs** reading list in the sidebar and `/admin`; users can clear it without changing the Vectorize index. |
 | `migrationPlan` | `MigrationPlan?` | Most recent provider-config preview as CF rules (rules capped at `MAX_PLAN_RULES` = 300, `src/server.ts:113`). |
 | `terraform` | `TerraformArtifact?` | Most recent Terraform export (downloadable). |
 | `csv` | `TerraformArtifact?` | Most recent CSV export (downloadable). |
@@ -376,7 +382,10 @@ excerpts into the prompt.
 - **Read path.** Each turn, `selectDocsForPrompt()` (`src/server.ts:1551`) calls
   `retrieveDocChunks()` (`src/docs-scraper.ts:333`) for the top `DOCS_TOP_K` = 4
   (`src/docs-scraper.ts:33`) matches, and `renderDocs()` (`src/system-prompt.ts:137`)
-  injects them (with URLs to cite) into the system prompt.
+  injects them (with URLs to cite) into the system prompt. The same hits are
+  merged into `state.docLinks`, capped at 12 and displayed as a running reading
+  list. Index parsing, retrieval, state merging, and rendering all reject URLs
+  outside the official HTTPS developer-docs origin.
 - **Graceful degradation.** Gated by `hasVectorize()` (`src/docs-scraper.ts:69`);
   without the `VECTORIZE` binding the feature is simply inert and never breaks a
   chat turn.

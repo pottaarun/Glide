@@ -1,0 +1,19 @@
+package-lock.json
+  s_52754869f3b33a::t_4bc934fcfb3153 2944-2946,3884-3886,3904,3913-3915
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "483290447629e38ff10bea64a0d7dfc841d0f457",
+  "prompts": {},
+  "sessions": {
+    "s_52754869f3b33a": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_0751a62a5ffeG65ApIMN00qVsO",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Arun Potta <arunpotta1024@gmail.com>"
+    }
+  }
+}

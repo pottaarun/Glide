@@ -1,8 +1,28 @@
-# Glide — Fix & Redesign Progress
+# Glide — Historical Fix & Redesign Log
 
-> Living work log so this task can be resumed if the session is lost.
-> Last updated by the coding agent. Check the checklist boxes below for current state.
-> Original fix + redesign is COMPLETE. Latest product change: **Follow-up 11** at the bottom — delivery-aware chat transport, **live/reconnecting** state, server-authoritative send verification, **Retry response**, privacy-safe structured logs, and chat-token redaction. Production Version `4c424a24-f116-4f60-b84c-e40fbe2ab1e4`, client bundle `index-BYMoMOJD.js`; `npm run check` and all **17/17** tests passed.
+> Historical engineering log, retained for incident context. It is not the
+> current runbook or release status: old version IDs, bundle hashes, line numbers,
+> test counts, and "user action" notes below describe their original moment in
+> time. Use [`README.md`](README.md) and [`docs/`](docs/) for current behavior and
+> operations; use Git and the Workers deployment history for release state.
+
+## Current implementation summary (2026-07-24)
+
+- Production model: `@cf/openai/gpt-oss-120b`.
+- Existing domains are resolved with an exact account-filtered lookup and are
+  selected for DNS review rather than queued again.
+- Zone creation records owning-account provenance, deduplicates matching pending/
+  applying/failed approvals, and cannot be bypassed through generic `cf_write`.
+- Queue narration is checked against actions the server actually created; malformed
+  onboarding aliases are repaired only after strict validation.
+- Approval cards show request details before controls. Bulk approval submits only
+  the exact reviewed IDs and excludes active, stale-interrupted, and uncertain
+  writes. Uncertain individual retries require explicit confirmation.
+- Logical resource locks serialize conflicting update/delete methods and matching
+  zone creates while external API work is in flight.
+- The responsive control-plane UI, delivery-aware transport, token redaction,
+  layered token verification, and structured observability described in the
+  canonical docs are all part of the current codebase.
 
 ## Goal
 1. Fix raw tool-call JSON leaking into the assistant chat message.
@@ -362,3 +382,46 @@ Header showed the amber **"token unverified"** badge + the banner *"The saved Cl
 - Woke the reported room after deploy: still 29 authoritative messages, last role `assistant`, and **zero `cfat_...` patterns**. This both confirms the false final bubble was never server-side and confirms existing secret text was scrubbed.
 - End-to-end observability test in disposable room `glide-log-verification`: synthetic content-free incident returned `{ok:true}` and produced searchable fields `glideEvent=chat.client_issue`, `room=glide-log-verification`, `kind=not_delivered`, `messageId=diagnostic-message`, `connectionEpoch=0`.
 - **User action:** hard-refresh once (Cmd+Shift+R). The false local-only "try now" bubble will disappear because it was never persisted. Wait for **LIVE**, then resend. Also revoke/rotate the API token that was pasted into chat, save the replacement only via **Connection -> Change**, and never paste tokens into chat.
+
+---
+
+## Follow-up 12: existing-zone and approval-boundary hardening
+
+### Symptoms
+
+- Onboarding could claim an **Add domain** approval existed when no action was
+  queued, including for a domain already present in Cloudflare.
+- A stale room default could obscure the zone's owning account or block an
+  explicit target account.
+- Bulk Apply could include risky retries or actions added after the user reviewed
+  the visible queue.
+
+### Fix
+
+1. `findZoneByName` now supports exact account-filtered discovery. `defaultZone`
+   stores `accountId`, and legacy defaults fail closed unless an explicit account
+   is supplied.
+2. `add_domain` verifies the resolved account before queueing. Existing zones are
+   selected for DNS review; matching zone-create approvals are deduplicated by
+   account and normalized domain. Generic `cf_write` refuses `POST /zones`.
+3. The `POST /zones` permission hint now explains the dashboard-selectable scope:
+   Zone > Zone > Edit over All zones/domains, with a separate zone/domain policy
+   for Account API Tokens.
+4. Queue claims and dangling promises are checked against server-created actions.
+   Onboarding tool repair accepts known camel/snake aliases only and rejects
+   unknown or conflicting fields.
+5. Apply lifecycle state is visible and durable. Lost responses become uncertain,
+   writes are never automatically retried, and direct uncertain retries require
+   explicit confirmation.
+6. Bulk approval confirms and sends an immutable reviewed ID snapshot. The server
+   excludes new, applying, stale, and uncertain actions. Resource locks cover
+   method-conflicting writes to one path plus semantic zone creation.
+7. Approval request details render before Apply/Reject controls, and responsive
+   styles preserve the chat/approval workflow on desktop and mobile.
+
+### Validation
+
+The release workflow runs `npm test`, `npm run check`, `npm run build`, and
+`npx wrangler deploy --dry-run` before production deployment, then verifies the
+Worker HTML and referenced hashed assets over HTTPS. Exact deployment IDs belong
+in the Workers deployment history rather than this source document.

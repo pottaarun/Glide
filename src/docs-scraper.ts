@@ -23,12 +23,12 @@
  * guidance RAG and immutable — see wrangler.jsonc.
  */
 import type { DocChunk } from "./shared";
-import { embedTexts } from "./guidance-rag";
+import { embedTexts } from "./guidance-rag.ts";
 
 /** Top-level index listing every Cloudflare product and its per-product index. */
 export const DOCS_ROOT_INDEX = "https://developers.cloudflare.com/llms.txt";
 /** Global Vectorize namespace holding all Cloudflare-docs vectors (shared by all rooms). */
-export const CFDOCS_NAMESPACE = "__cfdocs__";
+export const CFDOCS_NAMESPACE = "__cfdocs_v2__";
 /** Default number of doc chunks to retrieve per user message. */
 export const DOCS_TOP_K = 4;
 
@@ -36,6 +36,8 @@ export const DOCS_TOP_K = 4;
 const MAX_CHUNK_CHARS = 1_400;
 /** Max chunks we keep per page, so one huge page can't dominate the index. */
 const MAX_CHUNKS_PER_PAGE = 8;
+/** Vectorize accepts at most 1,000 ids in one delete mutation. */
+const VECTOR_DELETE_BATCH = 1_000;
 /** Max chars of chunk text stored in metadata (well under Vectorize's 10 KiB/vector). */
 const MAX_META_TEXT = 1_200;
 /** Cap on the query string we embed for retrieval. */
@@ -257,6 +259,8 @@ export interface IndexPageResult {
   ok: boolean;
   /** Number of chunks upserted (0 when the page was empty or embedding failed). */
   chunks: number;
+  /** Conservative live-id count when stale-tail cleanup failed after a successful upsert. */
+  retainedChunks?: number;
 }
 
 /**
@@ -277,7 +281,15 @@ export async function indexDocPage(
 
   const cleaned = cleanDocMarkdown(raw);
   const chunks = chunkText(cleaned);
-  if (!chunks.length) return { ok: true, chunks: 0 }; // fetched fine but nothing to embed
+  if (!chunks.length) {
+    try {
+      await index.deleteByIds(Array.from({ length: MAX_CHUNKS_PER_PAGE }, (_, i) => chunkVectorId(page.url, i)));
+      return { ok: true, chunks: 0 };
+    } catch (err) {
+      console.warn(`[docs-scraper] clear empty page ${page.url} failed:`, (err as Error)?.message ?? err);
+      return { ok: false, chunks: 0 };
+    }
+  }
 
   const vectors = await embedTexts(env, chunks);
   if (!vectors) return { ok: false, chunks: 0 };
@@ -298,31 +310,44 @@ export async function indexDocPage(
 
   try {
     await index.upsert(payload);
-    return { ok: true, chunks: payload.length };
   } catch (err) {
     console.warn(`[docs-scraper] upsert ${page.url} failed:`, (err as Error)?.message ?? err);
     return { ok: false, chunks: 0 };
   }
+  const staleIds: string[] = [];
+  for (let i = payload.length; i < MAX_CHUNKS_PER_PAGE; i++) {
+    staleIds.push(chunkVectorId(page.url, i));
+  }
+  try {
+    if (staleIds.length) await index.deleteByIds(staleIds);
+    return { ok: true, chunks: payload.length };
+  } catch (err) {
+    console.warn(`[docs-scraper] stale-tail cleanup ${page.url} failed:`, (err as Error)?.message ?? err);
+    return { ok: true, chunks: payload.length, retainedChunks: MAX_CHUNKS_PER_PAGE };
+  }
 }
 
-/**
- * Delete a page's chunk vectors by id. `chunks` is the count recorded when the
- * page was indexed, so we can reconstruct every deterministic id. Best-effort.
- */
-export async function deleteDocPage(
+/** Delete known page chunks in bounded batches after a successful replacement crawl. */
+export async function deleteDocPages(
   env: Cloudflare.Env,
-  mdUrl: string,
-  chunks: number,
-): Promise<void> {
+  pages: Array<{ url: string; chunks: number }>,
+): Promise<{ ok: boolean; deleted: number }> {
   const index = vectorizeIndex(env);
-  if (!index || chunks <= 0) return;
+  if (!index) return { ok: false, deleted: 0 };
   const ids: string[] = [];
-  for (let i = 0; i < chunks; i++) ids.push(chunkVectorId(mdUrl, i));
-  try {
-    await index.deleteByIds(ids);
-  } catch (err) {
-    console.warn(`[docs-scraper] delete ${mdUrl} failed:`, (err as Error)?.message ?? err);
+  for (const page of pages) {
+    const count = Math.min(MAX_CHUNKS_PER_PAGE, Math.max(0, Math.floor(Number(page.chunks) || 0)));
+    for (let i = 0; i < count; i++) ids.push(chunkVectorId(page.url, i));
   }
+  for (let i = 0; i < ids.length; i += VECTOR_DELETE_BATCH) {
+    try {
+      await index.deleteByIds(ids.slice(i, i + VECTOR_DELETE_BATCH));
+    } catch (err) {
+      console.warn("[docs-scraper] bulk delete failed:", (err as Error)?.message ?? err);
+      return { ok: false, deleted: i };
+    }
+  }
+  return { ok: true, deleted: ids.length };
 }
 
 /**

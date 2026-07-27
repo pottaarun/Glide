@@ -32,9 +32,9 @@
   "observability": { "enabled": true },
   // Weekly Cloudflare-docs refresh. The scheduled() handler in src/server.ts
   // drives a full docs reindex (scrape → embed → upsert into the shared Vectorize
-  // '__cfdocs__' namespace) via one well-known DO. Sunday 02:00 UTC, matching the
-  // upstream cadence. Reindex is idempotent (deterministic vector ids), so a run
-  // that overlaps a manual admin reindex is safe.
+  // '__cfdocs_v2__' namespace) via one well-known DO. Sunday 02:00 UTC, matching the
+  // upstream cadence. One fixed internal DO owns the global lock and removes the
+  // previous canonical run's vectors before rebuilding; rooms expose no controls.
   "triggers": { "crons": ["0 2 * * SUN"] },
   "assets": {
     "directory": "./dist/client",
@@ -42,8 +42,7 @@
     "not_found_handling": "single-page-application",
     "run_worker_first": true
   },
-  // Non-secret vars. The Cloudflare API token (CF_API_TOKEN), the at-rest token
-  // encryption key (GLIDE_TOKEN_KEY), and the migration tool base URL
+  // Non-secret vars. The at-rest token encryption key (GLIDE_TOKEN_KEY) and the migration tool base URL
   // (MIGRATION_API_URL) are provided via `.dev.vars` locally or `wrangler secret put`
   // in production — see `.dev.vars.example` and `src/env.d.ts`.
   "vars": {

@@ -1,7 +1,7 @@
 # Copy to .dev.vars for local development (never commit .dev.vars).
-# A Cloudflare API token Glide uses to drive the Cloudflare API.
-# Create at https://dash.cloudflare.com/profile/api-tokens
-CF_API_TOKEN="your-cloudflare-api-token"
+# 32-byte key used to encrypt per-room Cloudflare API tokens entered in the GUI.
+# Generate with: openssl rand -base64 32
+GLIDE_TOKEN_KEY="replace-with-a-long-random-string"
 
 # Optional: override the default Workers AI model used for the chat brain.
 # GLIDE_MODEL="@cf/openai/gpt-oss-120b"
@@ -12,8 +12,3 @@ CF_API_TOKEN="your-cloudflare-api-token"
 # Only the migration tool's READ-ONLY endpoints are called. Run it locally with
 # `wrangler dev` (in the migrationtool/web dir) and point this at that origin.
 # MIGRATION_API_URL="http://localhost:8788"
-
-# Optional: 32-byte key (any strong random string) used to encrypt GUI-provided
-# Cloudflare API tokens at rest in the Durable Object. Without it, tokens can only
-# come from CF_API_TOKEN above.
-# GLIDE_TOKEN_KEY="replace-with-a-long-random-string"

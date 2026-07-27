@@ -6,8 +6,9 @@ Glide exposes two distinct surfaces:
    `src/server.ts:1791`). **READ** tools execute against Cloudflare immediately;
    **QUEUE** tools only append a `PendingAction` for human approval.
 2. **`@callable` RPCs** — methods the React client invokes over the WebSocket
-   (token management, approvals, the onboarding wizard, migration checks,
-   snapshots, delivery diagnostics, and the admin dashboard's RAG controls).
+   (token management, approvals, the onboarding wizard, business-profile capture
+   and recommendation queueing, migration checks, snapshots, delivery
+   diagnostics, and room-scoped guidance controls).
 
 A turn runs **at most 8 tool-steps** (`stepCountIs(8)`), and read payloads echoed
 to the model are clipped to ~6 KB. See [Architecture](./architecture.md#the-chat-turn-lifecycle).
@@ -25,9 +26,14 @@ to the model are clipped to ~6 KB. See [Architecture](./architecture.md#the-chat
 | `find_zone` | `name` | Resolve a zone id by domain name and **save it as the room's default zone**. |
 | `list_dns_records` | `zoneId`, `type?` | List DNS records for a zone (optionally by record type). During an active onboarding it also sets `dnsReviewed`, ticking the "review DNS records" checklist step. |
 | `cf_get` | `path` | Generic READ against any Cloudflare API `GET` endpoint (path after `…/client/v4`). |
+| `recommend_configuration` | `focus?` (`all\|security\|performance\|reliability\|privacy\|bots\|api\|tls`) | Turn the room's captured `businessProfile` into tailored, priority-ranked Cloudflare recommendations (rationale, triggering profile signals, and a docs citation). **Read-only — it proposes and QUEUES NOTHING**; the model then presents the items grouped by theme and offers to queue the concrete ones via the write builders. Runs the local engine (`src/recommendations.ts`), so it never calls Cloudflare. |
 
-These never change anything. Failures come back through `readError()`
-(`src/server.ts:2262`), which appends a permission hint when relevant.
+The Cloudflare reads never change anything, and their failures come back through
+`readError()` (`src/server.ts:2262`), which appends a permission hint when
+relevant. `recommend_configuration` reads only the room's own captured
+`businessProfile`, so it makes no Cloudflare call and can never queue an action —
+it only returns text for the model to relay (`formatRecommendationsForModel()`,
+`src/recommendations.ts`).
 
 ### Memory & collaboration
 
@@ -44,23 +50,24 @@ None of these call Cloudflare. Each appends a `PendingAction`; a human must
 
 | Tool | Input | Queues |
 | --- | --- | --- |
-| `add_domain` | `domain`, `accountId?`, `type?` (`full\|partial`) | `POST /zones`. Normalises the domain, then resolves the account (explicit `accountId` → room `defaultAccountId` → the token's sole account). If it can't (no token, or several accounts and none chosen) it returns a question instead of queuing. |
+| `add_domain` | `name`, `accountId?`, `setupType?` (`full\|partial`) | `POST /zones`. Normalises the domain and resolves the account (explicit account → selected-zone provenance / room default → the token's sole account). With a token, it performs an exact account-filtered lookup first: an existing zone becomes the room default and nothing is queued. A matching pending/applying/failed approval is returned instead of duplicated. |
 | `create_dns_record` | `zoneId`, `type`, `name`, `content`, `ttl?`, `proxied?`, `priority?` | `POST /zones/<id>/dns_records`. |
 | `set_zone_setting` | `zoneId`, `setting`, `value` | `PATCH /zones/<id>/settings/<setting>`. |
 | `create_waf_custom_rule` | `zoneId`, `rulesetId`, `description`, `expression`, `action` | `POST /zones/<id>/rulesets/<rulesetId>/rules`. (First `cf_get` the `http_request_firewall_custom` ruleset id.) |
-| `cf_write` | `product`, `summary`, `method` (`POST\|PUT\|PATCH\|DELETE`), `path`, `body?`, `zoneId?` | Any Cloudflare API change — for products without a dedicated builder (Gateway, Access, Tunnels, R2, Load Balancing, cache/redirect rules, …). |
+| `cf_write` | `product`, `summary`, `method` (`POST\|PUT\|PATCH\|DELETE`), `path`, `body?`, `zoneId?` | Any Cloudflare API change for products without a dedicated builder (Gateway, Access, Tunnels, R2, Load Balancing, cache/redirect rules, …). It refuses `POST /zones`; zone creation must use `add_domain` so existing-zone and duplicate-approval checks cannot be bypassed. |
 
 > `expression` fields take Cloudflare wirefilter syntax, e.g.
 > `ip.geoip.country eq "RU"` or `http.request.uri.path contains "/admin"`.
 > Prefer the specific builders over `cf_write` when one exists.
 
-### Onboarding & migration
+### Onboarding, discovery & migration
 
 | Tool | Type | Behaviour |
 | --- | --- | --- |
 | `update_onboarding` | state | Record the path (migrate vs fresh), domain, DNS setup, provider, and goals — call it after **each** answer in the chat-led flow. Captured info **auto-completes** the matching checklist steps, so `checkOff` is only needed for external go-live steps (TTLs, nameservers, verify, DNSSEC, proxy). |
+| `update_business_profile` | state | Record answers to the "nature of the business" discovery questions (industry, app type, audience, traffic, whether users log in / expose an API, sensitive data, compliance, top concerns) into the room's `businessProfile`. **Only stores context — it changes nothing on the account.** Ask one question at a time; array answers are unioned with what's already captured so a partial call never drops earlier ones. Feeds `recommend_configuration`. Runs during onboarding **and** on-demand after go-live. |
 | `list_migration_providers` | READ | List providers the migration tool can parse and their phases. |
-| `preview_provider_migration` | READ | Translate an exported provider config into Cloudflare-equivalent rules; stores a migration plan. Accepts inline `config` or a `configUrl`; formats `json\|xml\|terraform\|panos\|auto`. |
+| `preview_provider_migration` | READ | Translate an exported provider config into Cloudflare-equivalent rules; stores a migration plan. Accepts inline `config` or a `configUrl`; formats `json\|xml\|terraform\|panos\|auto`. Config input is capped at 2,000,000 UTF-8 bytes. |
 | `queue_migration_rules` | QUEUE | Convert supported plan rules into pending actions (`zoneId` required; optional `phases` subset). |
 | `generate_migration_terraform` | READ | Emit Terraform for the plan (reuses the last previewed config unless overridden). Downloadable from the sidebar. |
 | `migration_preflight` | READ | Check the token has the permissions the plan's provider needs. |
@@ -88,19 +95,21 @@ for attribution.
 
 | RPC | Args | Returns | Notes |
 | --- | --- | --- | --- |
-| `applyAction` | `id`, `by?` | `ActionResult` | **Executes** a queued action against Cloudflare. Publishes applying status, snapshots the zone first (best-effort), and safely re-merges ruleset entrypoints. Success removes the action; failure retains it with the error for Retry. |
+| `applyAction` | `id`, `by?`, `confirmUncertain?` | `ActionResult` | **Executes** a queued action against Cloudflare. Publishes applying status, snapshots the zone first (best-effort), and safely re-merges ruleset entrypoints. Success removes the action; failure retains it. An uncertain/interrupted attempt is rejected unless the UI has completed the live-state warning and passes `confirmUncertain: true`. |
 | `rejectAction` | `id`, `by?` | `ActionResult` | Discards a queued action. |
-| `applyAll` | `by?` | `ActionResult[]` | Applies every non-running pending action in order. |
+| `applyAll` | `ids`, `by?` | `ActionResult[]` | Applies only the exact reviewed action IDs supplied by the client, in queue order. Newly queued actions, currently applying actions, and uncertain/interrupted attempts are excluded server-side. The UI confirms the reviewed count and reports if the queue changed before Apply. |
 
-`applyAction` (`src/server.ts:2956`) is the **only** code path that calls a
-mutating Cloudflare endpoint. See [Security model](./security.md).
+`applyAction` delegates to the single server path that executes queued
+`PendingAction` writes. `applyAll` supplies reviewed IDs to that same path; it
+does not bypass action validation, lifecycle state, or resource fences. Snapshot
+restore is a separate human-only migration operation. See [Security model](./security.md).
 
 ### Token management
 
 | RPC | Args | Returns | Notes |
 | --- | --- | --- | --- |
 | `setCloudflareToken` | `rawToken` | `{ ok, message }` | Requires `GLIDE_TOKEN_KEY`. Tries `/user/tokens/verify`, then account/zone read fallbacks for valid account-scoped tokens. Stores AES-256-GCM encrypted regardless of the result and updates `tokenLast4` / `tokenValid`. |
-| `clearCloudflareToken` | — | `{ ok }` | Deletes the stored token; `tokenConfigured` falls back to whether `CF_API_TOKEN` exists. |
+| `clearCloudflareToken` | — | `{ ok }` | Deletes this room's stored token and clears its token status. |
 | `reverifyToken` | — | `{ ok, valid, message }` | Re-checks the already-stored token without returning it and refreshes `tokenValid`. The room calls this once on connect when an older stored token is marked unverified. |
 
 `tokenValid` confirms that one authentication check succeeded; it does not prove
@@ -140,6 +149,28 @@ its checklist **auto-completes** from captured answers + the action queue
 | `toggleOnboardingStep` | `id`, `done`, `by?` | Manually check/uncheck a single step — the override for the human-only go-live steps; most steps auto-complete. |
 | `previewMigration` | `args`, `by?` | Run a read-only provider-config preview from the form wizard; accepts uploaded `configFiles`. |
 
+### Business discovery & recommendations
+
+These back the room's `businessProfile` and the sidebar **Recommendations** panel.
+The profile is normally captured in chat by the `update_business_profile` tool;
+these RPCs power the opt-in form step, the panel's **Queue** / **Ask Glide**
+buttons, and the sidebar **Reset**.
+
+| RPC | Args | Returns | Notes |
+| --- | --- | --- | --- |
+| `updateBusinessProfile` | `patch`, `by?` | `{ ok: true }` | Merge answers into `state.businessProfile` (`applyBusinessProfilePatch()`, `src/server.ts:1193`). Array fields replace (the form sends the full selection); scalars/booleans overwrite when provided. Capturing a profile changes **nothing** on the account. |
+| `resetBusinessProfile` | `by?` | `{ ok: true }` | Clear the captured profile (`businessProfile: undefined`) so discovery can start over. Wired to the sidebar **Reset** behind a `window.confirm` (`src/client/main.tsx:1030`). |
+| `queueRecommendation` | `recId`, `zoneId`, `by?` | `{ ok, message, id? }` | One-click **Queue** for a concrete recommendation. The client sends only the recommendation id + target zone id; the server **recomputes the set from the room's trusted `businessProfile` and rebuilds the exact Cloudflare call from its own catalog** (`recommendationToPending()`), never from a client-supplied path/body. Requires a 32-hex `zoneId`, de-duplicates against the queue, and refuses anything not concretely queueable — routing it to chat instead. |
+
+Only a narrow set of recommendations are one-click queueable: `set_zone_setting`
+for `ssl`, `always_use_https`, `min_tls_version`, `tls_1_3`, and `brotli`, plus the
+concrete `cf_write` items for HSTS (`security_header`) and Tiered Cache
+(`argo/tiered_caching`). Everything else (WAF managed rules, rate limits, Bot Fight
+Mode, API Shield, Access, Argo, Load Balancing, Data Localization, leaked-credential
+checks, or anything needing discovery / a paid plan / a dashboard step) is **not**
+one-click and instead offers an **Ask Glide** hand-off in chat
+(`isRecommendationQueueable()`, `src/recommendations.ts`).
+
 ### Migration checks & exports
 
 | RPC | Args | Notes |
@@ -155,7 +186,7 @@ its checklist **auto-completes** from captured answers + the action queue
 | --- | --- | --- |
 | `snapshotZone` | `zoneId?`, `by?` | Capture a restore point (read-only on Cloudflare). |
 | `refreshSnapshots` | `zoneId?` | Pull the stored snapshot list into synced state. |
-| `restoreSnapshot` | `snapshotId`, `zoneId?`, `by?` | **DESTRUCTIVE** — reverts the zone to a snapshot. Guarded by a `window.confirm` in the UI (`src/client/main.tsx:1024`); never automated. |
+| `restoreSnapshot` | `snapshotId`, `by?` | **DESTRUCTIVE** — reverts the snapshot's recorded zone. Guarded by a `window.confirm`; the server requires the recorded account to match the active account and verifies the room token can read that exact live zone. Never automated. |
 
 ### Team guidance
 
@@ -173,23 +204,14 @@ Vectorize RAG index in sync best-effort — see
 These are the only mutating guidance paths; retrieval happens automatically each
 turn via the private `selectGuidanceForPrompt()` (`src/server.ts:1241`), not an RPC.
 
-### Cloudflare docs (RAG index job)
+### Cloudflare docs (internal RAG index job)
 
-Admin-only controls on the **Cloudflare docs** tab (`CfDocsTab`,
-`src/client/main.tsx:2236`) that drive the background job which indexes the
-official Cloudflare developer docs into the shared `__cfdocs__` Vectorize
-namespace. See [Architecture → Cloudflare-docs RAG](./architecture.md#cloudflare-docs-rag--srcdocs-scraperts).
-
-| RPC | Args | Returns | Notes |
-| --- | --- | --- | --- |
-| `startDocsReindex` | `by?` | `{ ok, message }` | Start (or restart) a full reindex: enumerate products from `llms.txt`, then embed + upsert pages in bounded batches chained via the scheduler (`docsTick`). Refuses if one is already running (`src/server.ts:1326`). |
-| `cancelDocsReindex` | — | `{ ok, message }` | Flip the run to `cancelled` and clear its `runId`; in-flight ticks self-cancel (`src/server.ts:1491`). |
-| `clearDocsIndex` | — | `{ ok, message, deleted }` | Delete all indexed doc vectors from the shared namespace (`src/server.ts:1511`). |
-
-A **weekly cron** (`Sun 02:00 UTC`) also drives a full reindex via the Worker's
-`scheduled()` handler (`src/server.ts:3078`) — no admin action needed. Retrieval
-per chat turn is automatic via the private `selectDocsForPrompt()`
-(`src/server.ts:1551`), not an RPC.
+The shared Cloudflare-docs index has no room-callable RPC controls. A **weekly
+cron** (`Sun 02:00 UTC`) invokes `startDocsReindex` directly on one fixed internal
+Durable Object. The job deletes vectors recorded by the previous canonical run,
+then enumerates, embeds, and upserts current pages in bounded scheduled batches.
+Per-turn retrieval remains automatic via the private `selectDocsForPrompt()`.
+See [Architecture → Cloudflare-docs RAG](./architecture.md#cloudflare-docs-rag--srcdocs-scraperts).
 
 ---
 
@@ -199,9 +221,10 @@ per chat turn is automatic via the private `selectDocsForPrompt()`
 2. The model calls a QUEUE tool (e.g. `create_dns_record`) → `queuePending()`
    appends a `PendingAction` to `state.pendingActions` (`src/server.ts:2274`).
 3. The action shows up in every client's **Pending approvals** panel.
-4. A human clicks **Apply** → `applyAction` RPC (`src/server.ts:2956`) →
+4. A human reviews the method, path, request body, and warnings before the
+   controls, then clicks **Apply** → `applyAction` →
    best-effort zone snapshot → (for ruleset phases) re-read + merge current rules
-   → `cfRequest(method, path, token, body)` (`src/server.ts:3001`).
+   → `cfRequest(method, path, token, body)`.
 5. The action is first marked `applying`, which syncs to every client and fences
    duplicate Apply calls. The outcome is prepended to `recentResults` (capped at
    25). Applied/rejected actions are removed; failed actions remain queued with
@@ -210,6 +233,13 @@ per chat turn is automatic via the private `selectDocsForPrompt()`
 6. Non-idempotent writes are never retried automatically. A network/5xx outcome
    is marked uncertain and must be checked against live Cloudflare state before
    anyone chooses **Retry anyway**.
+
+For bulk approval, the browser captures the IDs in the reviewed queue, asks for
+confirmation, and calls `applyAll(ids, by)`. The server intersects that immutable
+snapshot with its current queue and skips anything new, active, stale, or
+uncertain. Logical resource locks serialize `PUT`/`PATCH`/`DELETE` requests to the
+same API path even when their methods differ; zone creation is locked and deduped
+by account plus normalized domain.
 
 If the call fails with a permission error, the result `detail` names the missing
 token permission.

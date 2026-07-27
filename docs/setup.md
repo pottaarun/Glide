@@ -26,7 +26,7 @@ npm install
 
 # 2. Configure local secrets
 cp .dev.vars.example .dev.vars
-#   then edit .dev.vars; set CF_API_TOKEN and/or GLIDE_TOKEN_KEY
+#   then edit .dev.vars; set GLIDE_TOKEN_KEY
 
 # 3. Build the client bundle the Worker serves from ./dist/client
 npm run build
@@ -44,8 +44,7 @@ For fast UI-only iteration, run the Vite dev server (no Worker/DO/AI):
 npm run dev:ui
 ```
 
-> **Tip:** You don't have to put a token in `.dev.vars`. If you set
-> `GLIDE_TOKEN_KEY`, you can enter a Cloudflare API token directly into the GUI
+> Set `GLIDE_TOKEN_KEY`, then enter a Cloudflare API token directly into the GUI
 > (**Connection → Set token**); it's stored encrypted in the Durable Object. See
 > [Security model](./security.md). Never put a token in the chat composer.
 
@@ -81,13 +80,35 @@ They're declared for TypeScript in `src/env.d.ts`.
 
 | Name | Required | Purpose |
 | --- | --- | --- |
-| `CF_API_TOKEN` | Recommended | Cloudflare API token Glide uses to drive the API. Acts as the fallback when no GUI token is set. |
-| `GLIDE_TOKEN_KEY` | Optional | Key used to derive the AES-256-GCM key that encrypts GUI-provided tokens at rest. **Without it, GUI token storage is disabled** and only `CF_API_TOKEN` is used. Generate one with e.g. `openssl rand -base64 32`. |
+| `GLIDE_TOKEN_KEY` | Required for Cloudflare API access | Key used to derive the AES-256-GCM key that encrypts GUI-provided tokens at rest. **Without it, GUI token storage is disabled.** Generate one with e.g. `openssl rand -base64 32`. |
 | `MIGRATION_API_URL` | Optional | Base URL of the Switchflare / migration tool Worker. Used as a fallback when the `MIGRATION` service binding isn't present. |
 
-How a token is resolved at request time (`GlideAgent.getToken()` in `src/server.ts`):
-**GUI-set token (decrypted) first, then `CF_API_TOKEN`.** If `GLIDE_TOKEN_KEY` is
-missing or was rotated, Glide silently falls back to `CF_API_TOKEN`.
+Each room can use only the token entered in that room. `GlideAgent.getToken()`
+decrypts it with `GLIDE_TOKEN_KEY`; if the key is absent, rotated, or the
+ciphertext is corrupt, token access fails closed and the room must re-enter it.
+There is no deployment-wide Cloudflare API token fallback. This partitions
+credentials by room; it does not add user authentication. Anyone who obtains a
+token-bearing room link can use that room's credential through Glide.
+
+### Upgrading from `CF_API_TOKEN`
+
+Older deployments could use one Worker-wide `CF_API_TOKEN`. Current Glide never
+reads that binding, and Worker secrets are not retrievable in plaintext. Migrate
+deliberately instead of assuming existing rooms inherited the old credential:
+
+1. Set a strong `GLIDE_TOKEN_KEY` with `npx wrangler secret put GLIDE_TOKEN_KEY`,
+   then deploy the current code.
+2. Create a least-privilege Cloudflare API token for each sensitive room (or use
+   the original value from your secure credential store) and enter it through
+   **Connection → Set token**. Do not put it in `.dev.vars` or chat.
+3. In every room that must keep API access, confirm the token badge and run an
+   intended read such as account/zone discovery. A green badge proves
+   authentication, not every product permission.
+4. Confirm no room depends on the Worker-wide secret, then remove it with
+   `npx wrangler secret delete CF_API_TOKEN`. Wrangler immediately deploys a new
+   Worker version when deleting a secret.
+5. Revoke the former Cloudflare token after every room using that value has moved
+   to a replacement. Deleting the Worker secret does not revoke the API token.
 
 ### The `VECTORIZE` binding (team-guidance RAG)
 
@@ -120,16 +141,19 @@ from the admin dashboard (**Team guidance → Reindex**).
 ### Cloudflare-docs RAG & the weekly cron
 
 The same `VECTORIZE` index also backs the **Cloudflare-docs RAG** (a shared
-`__cfdocs__` namespace, separate from the per-room guidance keys). See
+`__cfdocs_v2__` namespace, separate from the per-room guidance keys). See
 [Architecture → Cloudflare-docs RAG](./architecture.md#cloudflare-docs-rag--srcdocs-scraperts).
 
-- **Populate it once** from the admin dashboard: open `/admin#<room>` → **Cloudflare
-  docs** tab → **Start reindex** (the `startDocsReindex` RPC). It runs in the
-  background and shows live progress.
-- **It stays fresh automatically.** `wrangler.jsonc` declares a cron trigger,
+- **It is populated and refreshed automatically.** `wrangler.jsonc` declares a cron trigger,
   `"triggers": { "crons": ["0 2 * * SUN"] }`, so the Worker's `scheduled()` handler
-  reruns the reindex every Sunday at 02:00 UTC. Cron triggers run only on deployed
-  Workers, not under `wrangler dev`.
+  runs the reindex every Sunday at 02:00 UTC through one fixed internal Durable
+  Object. The first GET of `/` also asks that same system object to bootstrap an
+  empty index, so a new deployment does not wait until Sunday. Cron triggers run
+  only on deployed Workers unless tested through Wrangler's scheduled-test route.
+- **It is not room-admin controlled.** Room clients expose no start, cancel, or
+  clear RPC controls for this deployment-wide index. Refreshes update successful
+  pages in place, retain last-known-good vectors for failed pages, and delete
+  removed pages only after all product indexes were enumerated successfully.
 - **Optional.** Without the `VECTORIZE` binding the feature is inert — chat still
   works, it just won't cite the docs.
 
@@ -166,6 +190,8 @@ a permission error, Glide surfaces the exact permission to add — these come fr
 
 | API path contains | Permission to grant |
 | --- | --- |
+| `GET /zones` | Zone > Zone > Read, scoped to the zones Glide must discover. |
+| `POST /zones` | Zone > Zone > Edit, scoped to **All zones/domains**. For Account API Tokens, use a separate zone/domain-scoped policy; this permission is not shown under **Entire Account**. |
 | `/dns_records` | DNS — Edit (Zone) |
 | `/settings/` | Zone Settings — Edit (Zone) |
 | `/rulesets` | Zone WAF — Edit (Zone) + Account Rulesets — Edit (Account) |
@@ -178,7 +204,12 @@ a permission error, Glide surfaces the exact permission to add — these come fr
 | `/teamnet/routes` | Cloudflare Tunnel: Routes — Edit (Account) |
 | `/workers/scripts` | Workers Scripts — Edit (Account) |
 
-Grant only what the team actually needs. `setCloudflareToken` first calls the
+Prefer a distinct token per sensitive room, scoped to only the accounts, zones,
+and product permissions that room needs. Avoid sharing one broad token across
+unrelated rooms. The new-zone exception below needs Zone Edit over all zones, but
+does not justify broad unrelated account permissions.
+
+`setCloudflareToken` first calls the
 user-scoped `/user/tokens/verify` endpoint. Because that endpoint can return
 401/403 for a valid account-scoped token, Glide then tries authenticated
 `/accounts` and `/zones` reads. The token is marked unverified only when the
@@ -189,6 +220,22 @@ Verification proves authentication, not complete authorization. A green badge ca
 still be followed by a permission-specific failure when a later operation reaches
 a product or scope the token cannot access.
 
+Zone creation has a special resource-scope requirement: a domain that does not
+exist yet cannot be selected as a specific-zone resource. For an **Account API
+Token**, add a zone/domain-scoped policy covering **All zones/domains**, then grant
+**DNS & Zones > Zone > Edit**; do not put that permission under an **Entire
+Account** policy. For a user API token, grant **Zone > Zone > Edit** with Zone
+Resources set to **All zones**. Keep the separate account/product permissions as
+narrow as the workflow permits.
+
+When the room has a token, `add_domain` performs an exact, account-filtered zone
+lookup before it queues `POST /zones`. If the zone exists, Glide selects it as the
+room default and moves to DNS review. Without a token, an explicit account id can
+still produce an approval for later Apply; a matching selected default without an
+explicit account is blocked until Glide can verify it. In every case, a matching
+pending, applying, or failed approval is reused. Generic `cf_write` cannot bypass
+the dedicated zone-creation path.
+
 ## Deploying
 
 ```bash
@@ -196,8 +243,7 @@ a product or scope the token cannot access.
 npx wrangler vectorize create glide-guidance --dimensions=768 --metric=cosine
 
 # Set production secrets (once)
-wrangler secret put CF_API_TOKEN
-wrangler secret put GLIDE_TOKEN_KEY      # optional, enables GUI token storage
+wrangler secret put GLIDE_TOKEN_KEY      # enables encrypted per-room token storage
 wrangler secret put MIGRATION_API_URL    # optional, if not using the service binding
 
 # Build + deploy
@@ -215,9 +261,7 @@ room's **live** badge or hard-refresh before sending another message.
 
 ### Deploy checklist
 
-- [ ] `CF_API_TOKEN` set (or rely solely on GUI-provided tokens — but then set
-      `GLIDE_TOKEN_KEY`).
-- [ ] `GLIDE_TOKEN_KEY` set if you want teams to enter tokens in the GUI.
+- [ ] `GLIDE_TOKEN_KEY` set so teams can enter encrypted per-room tokens in the GUI.
 - [ ] `glide-guidance` Vectorize index created (768 dims, cosine) — or you accept
       guidance running in inject-all fallback mode.
 - [ ] `MIGRATION` `services` block left commented out, **or** it points at a real
@@ -225,11 +269,13 @@ room's **live** badge or hard-refresh before sending another message.
       features being disabled.
 - [ ] `npm run check` passes.
 - [ ] `npm test` passes.
+- [ ] `npm run build` passes (the known large-chunk advisory is non-fatal).
+- [ ] `npx wrangler deploy --dry-run` passes before the production deploy.
 - [ ] Workers AI is enabled on the account and both `GLIDE_MODEL` and
       `GLIDE_EMBED_MODEL` are models you can access.
-- [ ] _(Optional)_ Seed the Cloudflare-docs index after the first deploy from
-      `/admin` → **Cloudflare docs** → **Start reindex** (the weekly cron keeps it
-      fresh thereafter).
+- [ ] The weekly Cloudflare-docs cron is present if shared docs grounding is desired.
+- [ ] Open `/` once after the first deploy (or wait for cron) to bootstrap the
+      shared docs index; search remains best-effort while the background crawl runs.
 
 ## Troubleshooting
 

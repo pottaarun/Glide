@@ -88,10 +88,11 @@ text from old persisted messages, and refreshes room status flags:
 
 `sanitizeMessageForPersistence()` also protects every newly persisted text part.
 On startup, older messages are rewritten idempotently if they contain a
-recognizable `cfat_...` value; the encrypted value in `glide_secrets` is not
-touched. The agent then recomputes `tokenConfigured` (a stored token **or** the
-`CF_API_TOKEN` secret exists), `migrationToolConfigured` (a `MIGRATION` binding
+recognizable `cfat_...`, `cfut_...`, or `cfk_...` value; the encrypted value in
+`glide_secrets` is not touched. The agent then recomputes `tokenConfigured` by
+successfully decrypting this room's stored token, `migrationToolConfigured` (a `MIGRATION` binding
 **or** `MIGRATION_API_URL` is set), and any stale Apply-attempt recovery state.
+There is no deployment-wide Cloudflare API token fallback.
 
 ## The chat-turn lifecycle
 
@@ -188,11 +189,12 @@ field is broadcast to all clients via `onStateUpdate` (`src/client/main.tsx:375`
 | `recentResults` | `ActionResult[]` | Last applied/failed/rejected outcomes, newest first (capped at `MAX_RECENT_RESULTS` = 25, `src/server.ts:107`). |
 | `invites` | `Invite[]` | People invited by email (most recent first, capped at 100). |
 | `defaultAccountId` | `string?` | Convenience default so users needn't repeat the account id. |
-| `defaultZone` | `{ id, name }?` | Convenience default zone. |
-| `tokenConfigured` | `boolean` | A token is available (GUI-stored or `CF_API_TOKEN`). |
+| `defaultZone` | `{ id, name, accountId? }?` | Convenience default zone plus owning-account provenance. Legacy rooms may lack `accountId`; zone creation verifies that provenance unless the caller supplies an explicit account. |
+| `tokenConfigured` | `boolean` | This room's encrypted GUI token is available and decryptable. |
 | `tokenLast4` | `string?` | Last 4 chars of the GUI-set token (status only). |
 | `tokenValid` | `boolean?` | Result of the latest token authentication check: `/user/tokens/verify`, with account/zone read fallback for account-scoped tokens. |
 | `onboarding` | `OnboardingState?` | Guided onboarding progress; its `checklist` auto-completes as info is captured (see [Onboarding & migration](./onboarding-and-migration.md)). |
+| `businessProfile` | `BusinessProfile?` | The team's "nature of the business" discovery answers (`industry`, `appTypes`, `hasLogin`, `hasApi`, `audience`, `trafficProfile`, `sensitiveData`, `compliance`, `concerns`, `notes`, `completed`; `src/shared.ts:299`). Captured in chat during onboarding and on-demand; feeds the recommendation engine. Kept at the room level (not inside `onboarding`) so the advisor keeps working after go-live. Rendered in the sidebar **Recommendations** panel and the `/admin` dashboard. |
 | `migrationPlan` | `MigrationPlan?` | Most recent provider-config preview as CF rules (rules capped at `MAX_PLAN_RULES` = 300, `src/server.ts:113`). |
 | `terraform` | `TerraformArtifact?` | Most recent Terraform export (downloadable). |
 | `csv` | `TerraformArtifact?` | Most recent CSV export (downloadable). |
@@ -200,7 +202,7 @@ field is broadcast to all clients via `onStateUpdate` (`src/client/main.tsx:375`
 | `snapshots` | `SnapshotInfo[]?` | Zone snapshots (restore points), capped at 50. |
 | `migrationToolConfigured` | `boolean?` | Whether a migration tool is connected (binding or URL). |
 | `guidance` | `GuidanceDoc[]?` | Team-guidance docs for the room (`title`, `body`, `enabled`, `updatedBy`, `ts`; `src/shared.ts:184`), capped at `MAX_GUIDANCE_DOCS` = 25 (`src/server.ts:115`). Edited from the admin dashboard; embedded into Vectorize (see below). |
-| `docsIndex` | `DocsIndexState?` | Live progress of the admin-triggered Cloudflare-docs reindex job (`src/shared.ts:123`): status, products/pages/chunks counters, `runId`, and attribution. Only present on the room whose admin started the run; drives the **Cloudflare docs** tab (see [Cloudflare-docs RAG](#cloudflare-docs-rag--srcdocs-scraperts)). |
+| `docsIndex` | `DocsIndexState?` | Internal progress of the cron-owned Cloudflare-docs reindex job: status, products/pages/chunks counters, `runId`, and attribution. Present only on the fixed system Durable Object, not normal rooms. |
 
 > **What is _not_ synced:** the decrypted token, the raw provider config
 > (`glide_migration_src`), and the pre-apply zone snapshots (`glide_snapshots`).
@@ -215,12 +217,19 @@ field is broadcast to all clients via `onStateUpdate` (`src/client/main.tsx:375`
   `error` / `attemptedAt`, and an optional `mergeEntrypoint` (see below).
 - **`ActionResult`** (`src/shared.ts:47`) — outcome of an apply/reject, `status`
   is `applied | failed | rejected`.
-- **`OnboardingState`** / **`MigrationPlan`** — documented in
-  [Onboarding & migration](./onboarding-and-migration.md).
+- **`OnboardingState`** / **`MigrationPlan`** / **`BusinessProfile`** — documented
+  in [Onboarding & migration](./onboarding-and-migration.md).
 
 Synced state is server-owned: `validateStateChange()` rejects direct client
 state writes. UI changes flow through callable methods, so a browser cannot
-inject a privileged API request into `pendingActions`.
+inject a privileged API request into `pendingActions`. The `queueRecommendation`
+RPC (`src/server.ts:1249`) is a good example: the browser sends only a
+recommendation id and a target zone id, and the server recomputes the
+recommendation from the room's **trusted** `businessProfile` and rebuilds the exact
+Cloudflare call from `src/recommendations.ts`'s own catalog
+(`recommendationToPending()`) — never from a client-supplied path/body. It also
+requires a 32-hex zone id and de-duplicates against the queue, so a one-click
+**Queue** button cannot inject an arbitrary API request.
 
 ### `mergeEntrypoint`: never silently drop ruleset rules
 
@@ -231,6 +240,26 @@ At **Apply** time, `applyAction` re-reads the phase's *current* rules and append
 `newRules` via `mergeEntrypointRules()` (`src/server.ts:2594`), so the stored
 `body` is only a queue-time preview. `stripRuleForPut()` (`src/server.ts:473`)
 normalises each rule for the `PUT`.
+
+### Approval lifecycle and concurrency fences
+
+Pending actions are server-owned records with `pending`, `applying`, or `failed`
+state. `applyAction` marks the record applying before any snapshot or network I/O.
+An interrupted attempt becomes **outcome uncertain** after the stale threshold;
+it cannot be retried through `applyAll`, and an individual retry is rejected until
+the client has shown the live-state warning and sends explicit confirmation.
+
+Bulk approval is snapshot-based rather than "whatever is pending now": the client
+sends the exact reviewed IDs, and `selectBulkApplyIds()` intersects them with the
+current queue. An action queued after review is never swept into the request.
+Actions that are already applying or whose prior outcome is uncertain are skipped.
+
+`actionResourceKey()` fences logical resources while Apply awaits external I/O:
+`PUT`, `PATCH`, and `DELETE` to the same canonical API path share one lock even
+when their methods differ. Ruleset entrypoints use a zone/phase key. Zone creation
+uses an account/normalized-domain key and is also deduplicated centrally in
+`queuePending()`. The generic `cf_write` tool refuses `POST /zones`, preserving
+the dedicated `add_domain` existence and duplicate checks.
 
 ## The Cloudflare API client (`src/cf-api.ts`)
 
@@ -254,6 +283,9 @@ message, hint? }`.
 - **Token verification** (`verifyToken`): tries `/user/tokens/verify`, then real
   `/accounts` and `/zones` reads because the user-scoped verify endpoint can
   reject otherwise valid account-scoped tokens.
+- **Response-envelope validation:** a 2xx response is successful only when it has
+  a valid Cloudflare API envelope. A malformed 2xx write response is `transient`,
+  so Apply records an uncertain outcome instead of inviting a blind retry.
 - **Zone snapshot** (`snapshotZone`, `src/cf-api.ts:252`): captures 8 zone settings
   (`security_level`, `ssl`, `min_tls_version`, `always_use_https`,
   `automatic_https_rewrites`, `tls_1_3`, `browser_check`, `brotli`) plus the
@@ -275,8 +307,9 @@ through Glide's queue → Apply contract.
   `/api/generate-terraform`, `/api/preflight`, `/api/diff-report`,
   `/api/export-csv`, `/api/validate-config`, `/api/snapshots`,
   `/api/snapshots/:id`, `/api/restore`.
-- Limits: 20 s timeout; a URL-fetched config is capped at `MAX_CONFIG_BYTES`
-  = 2 000 000 bytes (`src/migration.ts:21`).
+- Limits: 20 s timeout; inline, uploaded, and URL-fetched config are capped at
+  `MAX_CONFIG_BYTES` = 2 000 000 UTF-8 bytes. URL bodies are streamed and cancelled
+  as soon as they cross the limit; uploads are capped at `MAX_CONFIG_FILES` = 50.
 
 See [Onboarding & migration](./onboarding-and-migration.md) for the full flow.
 
@@ -328,17 +361,15 @@ excerpts into the prompt.
   (`:184`) strips chrome, and `chunkText()` (`:206`) splits it on paragraph
   boundaries (`MAX_CHUNKS_PER_PAGE` cap).
 - **Shared index, deterministic ids.** Chunks are embedded with `GLIDE_EMBED_MODEL`
-  and upserted into the **global** `CFDOCS_NAMESPACE` (`__cfdocs__`,
+  and upserted into the **global** `CFDOCS_NAMESPACE` (`__cfdocs_v2__`,
   `src/docs-scraper.ts:31`) — distinct from the per-room `r…` guidance keys — with
-  ids derived from the page URL (`cfdoc:<hash>#<i>`). So re-runs update in place
-  (never duplicate), concurrent runs are idempotent, and **every room** benefits.
-- **The reindex job.** Admin-triggered via `startDocsReindex()` (`src/server.ts:1326`),
-  it runs in bounded batches chained through the Agents SDK scheduler
-  (`docsTick`, delay `DOCS_TICK_DELAY_SEC`, `src/server.ts:130`) so it survives
-  client disconnects and DO restarts. `cancelDocsReindex()` (`:1491`) and
-  `clearDocsIndex()` (`:1511`) stop it or wipe the index. Live progress is tracked
-  in `DocsIndexState` (`src/shared.ts:123`), synced to the admin **Cloudflare docs**
-  tab.
+  ids derived from the page URL (`cfdoc:<hash>#<i>`), so every room benefits.
+- **The reindex job.** One fixed internal Durable Object owns the queue and global
+  lock. `startDocsReindex()` is not a browser-callable RPC; the job runs in bounded
+  batches chained through the Agents SDK scheduler. Before replacing the queue it
+  deletes all vectors recorded by the previous canonical run, and each page also
+  removes obsolete tail chunk ids before upsert. The versioned `v2` namespace
+  excludes pre-hardening vectors created by arbitrary room-owned runs.
 - **Weekly refresh.** The Worker's `scheduled()` handler (`src/server.ts:3078`),
   wired to the `Sun 02:00 UTC` cron in `wrangler.jsonc`, drives a full reindex
   automatically via one well-known DO.
@@ -352,7 +383,7 @@ excerpts into the prompt.
 
 ## The admin dashboard (`/admin`)
 
-`/admin#<room>` is a **read-only** control room over the same `GlideAgent`. The
+`/admin#<room>` is read-only for Cloudflare configuration over the same `GlideAgent`. The
 client is a single SPA: `Root()` (`src/client/main.tsx:2796`) checks
 `isAdminPath()` (`src/client/main.tsx:1768`, matches `/admin`) and renders
 `AdminGate` instead of the chat `App`; the room id comes from the URL hash, so
@@ -368,29 +399,25 @@ It **reads** three sources — it defines no dedicated read RPCs:
   tab. It embeds README + everything under `docs/` at build time (title,
   last-modified, size, lines, content), so a fresh `npm run build` refreshes it.
 
-Tabs are `comms | actions | guidance | cfdocs | docs | onboarding`
+Tabs are `comms | actions | guidance | docs | onboarding`
 (`AdminTab`, `src/client/main.tsx:1959`; tab bar built at `src/client/main.tsx:2383`).
 There are no Apply/Reject controls in admin — the **Actions** tab is view-only and
-directs you to the chat room. Two tabs are editable: **Team guidance** (the three
-guidance RPCs via `agent.call(...)`, `src/client/main.tsx:2538`) and **Cloudflare
-docs** (`CfDocsTab`, `src/client/main.tsx:2236`, which starts/cancels/clears the
-docs reindex job). The **Dev docs** tab (build-time Markdown manifest) is distinct
-from **Cloudflare docs** (the live docs RAG index).
+directs you to the chat room. **Team guidance** is the only editable tab and uses
+its three room-scoped guidance RPCs. The deployment-wide Cloudflare-docs index has
+no admin tab or client-callable controls.
 
 ## Client styling
 
 The UI has no CSS framework; its look comes from three cooperating layers:
 
-1. **Inline `S` styles object** (`const S`, `src/client/main.tsx:2829`) — the
+1. **Inline `S` styles object** (`const S` in `src/client/main.tsx`) — the
    single source of every component's *static* appearance (`React.CSSProperties`).
    Gradient/font recipes are shared consts: `GRAD_BRAND`, `GRAD_CTA`, `DISPLAY`,
    `MONO`, and the gradient-text `brandText` (`src/client/main.tsx:2820`).
-2. **`src/client/index.css`** — everything inline styles can't express: Google-font
-   wiring, the fixed **aurora** backdrop (`body::before` + `auroraDrift`), the
-   animated gradient wordmark (`.glide-brand` + `brandSheen`), hover/focus/entrance
-   motion (`.glide-lift`, `.glide-pending`, `.glide-dots`, `glideIn`/`glidePop`/
-   `pendingPulse`/`glideBounce`), custom scrollbars, and a `prefers-reduced-motion`
-   reset. Imported at `src/client/main.tsx:34`.
+2. **`src/client/index.css`** — everything inline styles can't express: font
+   wiring, restrained ambient light, the fine-pointer glow, glass edge treatment,
+   hover/focus/entrance motion, approval status rails, responsive desktop/tablet/
+   mobile layouts, custom scrollbars, and a `prefers-reduced-motion` reset.
 3. **`index.html`** — preconnects and loads the fonts (Space Grotesk, Inter,
    JetBrains Mono) and paints the twilight background before React mounts.
 
@@ -403,11 +430,12 @@ The convention: inline `S` wins on the base property; `index.css` layers on the
 | --- | --- |
 | `src/server.ts` | Worker entry + the `GlideAgent` Durable Object: chat brain, structured chat events, secret-safe persistence, LLM tools, approval/token/diagnostic RPCs, RAG jobs, and migration helpers. |
 | `src/client/main.tsx` | The React client: join screen, delivery-aware chat room, connection recovery, chat-led onboarding + opt-in form wizard, sidebar, read-only `/admin` dashboard, and inline styles. |
-| `src/client/index.css` | Global visual layer: font wiring, the aurora backdrop, gradient wordmark, hover/focus/entrance motion, scrollbars, and the reduced-motion reset. See [Client styling](#client-styling). |
-| `src/shared.ts` | Types shared by the Worker and the client (`GlideState`, `PendingAction`, `OnboardingState`, `MigrationPlan`, `GuidanceDoc`, …). Pure types only. |
+| `src/client/index.css` | Global visual layer: font wiring, restrained ambient light and pointer glow, hover/focus/entrance motion, responsive layouts, scrollbars, and the reduced-motion reset. See [Client styling](#client-styling). |
+| `src/shared.ts` | Types shared by the Worker and the client (`GlideState`, `PendingAction`, `OnboardingState`, `MigrationPlan`, `BusinessProfile`, `GuidanceDoc`, …). Pure types only. |
+| `src/recommendations.ts` | Pure, deterministic recommendation engine: maps a `BusinessProfile` to tailored, priority-ranked Cloudflare recommendations (rationale, triggering signals, docs citation), and maps the concrete ones to queue-ready API calls (`recommendationToPending` / `isRecommendationQueueable`). Imports only types from `src/shared.ts`, so it's **client-safe** and shared by the Worker (the `recommend_configuration` tool + `queueRecommendation`) and the React client (the sidebar Recommendations panel). |
 | `src/system-prompt.ts` | Builds the LLM system prompt, injecting room memory, onboarding status, the migration plan, and the retrieved team-guidance docs. Encodes the safety contract. |
 | `src/guidance-rag.ts` | Team-guidance RAG: embeds docs with `GLIDE_EMBED_MODEL`, upserts/queries Vectorize per room (namespace-isolated), and degrades gracefully when the index is absent. |
-| `src/docs-scraper.ts` | Cloudflare-docs RAG: scrapes/cleans/chunks the developer docs, embeds them into the shared `__cfdocs__` Vectorize namespace with deterministic ids, and retrieves the top matches per turn. |
+| `src/docs-scraper.ts` | Cloudflare-docs RAG: scrapes/cleans/chunks the developer docs, embeds them into the shared `__cfdocs_v2__` Vectorize namespace with deterministic ids, and retrieves the top matches per turn. |
 | `src/cf-api.ts` | Cloudflare API client: retry/backoff, typed error classification, a permission-hint map, and zone-snapshot capture. |
 | `src/chat-delivery.ts` | Pure delivery classification plus Cloudflare token detection and redaction helpers shared by the client and server. |
 | `src/migration.ts` | Read-only client for the Switchflare / migration tool Worker (preview, Terraform, pre-flight, diff, validate, CSV, snapshots, restore). |
@@ -422,7 +450,7 @@ The convention: inline `S` wins on the base property; `index.css` layers on the
 | --- | --- | --- |
 | `GlideAgent` | Durable Object | `new_sqlite_classes: ["GlideAgent"]` (migration tag `v1`). |
 | `AI` | Workers AI | Powers the chat brain, guidance embeddings, and Cloudflare-docs embeddings. |
-| `VECTORIZE` | Vectorize index | `glide-guidance` (768-dim, cosine) for per-room guidance and the shared `__cfdocs__` namespace. Create it once — see [Setup](./setup.md). |
+| `VECTORIZE` | Vectorize index | `glide-guidance` (768-dim, cosine) for per-room guidance and the shared `__cfdocs_v2__` namespace. Create it once — see [Setup](./setup.md). |
 | `ASSETS` | Static assets | Serves `./dist/client` with SPA fallback; `run_worker_first: true`. |
 | `MIGRATION` | Service binding | Points at a Worker named `switchflare`. Optional and **commented out by default** — see [Setup](./setup.md). |
 

@@ -2,31 +2,26 @@
  * Glide — global polish + atmosphere layer.
  *
  * The component tree styles its static look with an inline `S` object. This
- * stylesheet owns everything inline styles *can't* express: fonts, the living
- * "aurora over the edge" backdrop, the animated gradient wordmark, hover /
- * focus / active feedback, entrance motion, and custom scrollbars. Inline wins
+ * stylesheet owns everything inline styles *can't* express: fonts, restrained
+ * ambient light, hover/focus feedback, entrance motion, and custom scrollbars. Inline wins
  * on same-property base values; these :hover/animation/pseudo rules layer on
  * top without fighting it.
  */
 
 :root {
   color-scheme: dark;
-  /* Signature palette — a dawn sky seen while gliding above the edge. */
-  --ink: #070b16;
-  --flare: #f97316; /* Cloudflare-warm orange — primary identity  */
-  --ember: #fbbf24; /* amber                                       */
-  --magenta: #ec4899; /* hot dawn pink — energy / highlight        */
-  --violet: #8b5cf6; /* cool upper sky                             */
-  --cyan: #38bdf8; /* data / links                                */
-  --ring: rgba(236, 72, 153, 0.4);
-  --grad-brand: linear-gradient(
-    120deg,
-    #fb923c 0%,
-    #f97316 20%,
-    #ec4899 58%,
-    #a855f7 100%
-  );
-  --grad-cta: linear-gradient(135deg, #f97316 0%, #ec4899 100%);
+  /* Enterprise control-plane palette: neutral surfaces, one Cloudflare accent. */
+  --ink: #090c11;
+  --ink-raised: #111722;
+  --flare: #f6821f;
+  --ember: #d6a84b;
+  --info: #60a5fa;
+  --frost: #e2e8f0;
+  --glass-border: rgba(148, 163, 184, 0.16);
+  --glass-highlight: rgba(255, 255, 255, 0.055);
+  --ring: rgba(246, 130, 31, 0.22);
+  --grad-brand: linear-gradient(110deg, #fdba74, #f6821f 64%, #d96b12);
+  --grad-cta: #f6821f;
 }
 
 * {
@@ -48,25 +43,28 @@ body {
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   text-rendering: optimizeLegibility;
+  min-height: 100dvh;
+  overflow: auto;
+}
+
+#root {
+  min-height: 100dvh;
+  isolation: isolate;
 }
 
 /* ---------------------------------------------------------------------------
- * Signature: the living aurora. Slow-drifting warm/cool gradient blooms behind
- * everything, with a vignette that settles the edges. App surfaces are glass
- * (translucent) so this glows through without hurting readability.
+ * Restrained ambient light. It gives glass something to refract without becoming
+ * a decorative backdrop or competing with operational data.
  * ------------------------------------------------------------------------- */
 body::before {
   content: "";
   position: fixed;
-  inset: -25vmax;
+  inset: -15vmax;
   z-index: -2;
   background:
-    radial-gradient(38vmax 38vmax at 12% 6%, rgba(249, 115, 22, 0.24), transparent 60%),
-    radial-gradient(34vmax 34vmax at 90% -4%, rgba(236, 72, 153, 0.2), transparent 60%),
-    radial-gradient(44vmax 44vmax at 82% 96%, rgba(139, 92, 246, 0.22), transparent 62%),
-    radial-gradient(30vmax 30vmax at 4% 98%, rgba(56, 189, 248, 0.14), transparent 60%);
-  filter: blur(26px) saturate(125%);
-  animation: auroraDrift 30s ease-in-out infinite alternate;
+    radial-gradient(42vmax 34vmax at 12% 0%, rgba(246, 130, 31, 0.09), transparent 68%),
+    radial-gradient(44vmax 36vmax at 94% 100%, rgba(96, 165, 250, 0.045), transparent 72%);
+  filter: blur(36px);
 }
 body::after {
   content: "";
@@ -74,23 +72,131 @@ body::after {
   inset: 0;
   z-index: -1;
   pointer-events: none;
-  background: radial-gradient(
-    120vmax 80vmax at 50% -12%,
-    transparent 42%,
-    rgba(7, 11, 22, 0.6) 100%
-  );
+  background:
+    radial-gradient(100vmax 72vmax at 50% -8%, transparent 34%, rgba(9, 12, 17, 0.62) 100%);
 }
 
-@keyframes auroraDrift {
-  0% {
-    transform: translate3d(-3%, -2%, 0) scale(1);
-  }
-  50% {
-    transform: translate3d(3%, 2%, 0) scale(1.08);
-  }
-  100% {
-    transform: translate3d(-2%, 3%, 0) scale(1.04);
-  }
+/* ---------------------------------------------------------------------------
+ * Matte glass surfaces. A quiet top-edge highlight preserves depth without a
+ * rainbow or luminous-card treatment.
+ * ------------------------------------------------------------------------- */
+.glide-glass,
+.glide-glass-card,
+.glide-bubble {
+  position: relative;
+  isolation: isolate;
+}
+
+.glide-glass::after,
+.glide-glass-card::after,
+.glide-bubble::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  border-radius: inherit;
+  padding: 1px;
+  pointer-events: none;
+  background: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.12),
+    rgba(148, 163, 184, 0.035) 24%,
+    transparent 58%,
+    rgba(246, 130, 31, 0.045)
+  );
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  opacity: 0.52;
+}
+
+.glide-glass-card::after,
+.glide-bubble::after {
+  opacity: 0.34;
+}
+
+.glide-glass-card {
+  overflow: hidden;
+}
+
+.glide-glass-card > *,
+.glide-glass > *,
+.glide-bubble > * {
+  position: relative;
+  z-index: 1;
+}
+
+.glide-header::before,
+.glide-composer::before,
+.glide-join-card::before,
+.glide-wizard-card::before {
+  content: "";
+  position: absolute;
+  z-index: 0;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.045), transparent 42%);
+}
+
+/* Native cursor stays intact; this is only a soft, lagging light halo. */
+.glide-pointer-glow {
+  position: fixed;
+  left: 0;
+  top: 0;
+  z-index: 1000;
+  width: 0;
+  height: 0;
+  opacity: 0;
+  pointer-events: none;
+  will-change: transform;
+  transition: opacity 0.2s ease;
+}
+
+.glide-pointer-glow[data-visible="true"] {
+  opacity: 1;
+}
+
+.glide-pointer-glow__core {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 132px;
+  height: 132px;
+  border-radius: 50%;
+  transform: translate(-50%, -50%);
+  background: radial-gradient(
+    circle,
+    rgba(246, 130, 31, 0.065) 0,
+    rgba(246, 130, 31, 0.035) 32%,
+    transparent 72%
+  );
+  filter: blur(12px);
+  mix-blend-mode: screen;
+  transition: transform 0.18s ease, filter 0.18s ease;
+}
+
+.glide-pointer-glow__core::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  border: 1px solid rgba(246, 130, 31, 0.22);
+  box-shadow: 0 0 10px rgba(246, 130, 31, 0.2);
+  transform: translate(-50%, -50%);
+}
+
+.glide-pointer-glow[data-interactive="true"] .glide-pointer-glow__core {
+  transform: translate(-50%, -50%) scale(0.88);
+  filter: blur(9px);
+}
+
+.glide-pointer-glow[data-interactive="true"] .glide-pointer-glow__core::after {
+  border-color: rgba(246, 130, 31, 0.34);
+  box-shadow: 0 0 12px rgba(246, 130, 31, 0.28);
 }
 
 /* Monospace for code-ish surfaces (these tags carry no inline font-family). */
@@ -101,19 +207,6 @@ samp {
   font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo,
     Consolas, monospace;
   font-feature-settings: "calt" 0;
-}
-
-/* ---------------------------------------------------------------------------
- * Wordmark — the gradient catches a slow moving sheen. The gradient itself is
- * set inline (with background-size:200%); we only animate its position here.
- * ------------------------------------------------------------------------- */
-.glide-brand {
-  animation: brandSheen 7s linear infinite;
-}
-@keyframes brandSheen {
-  to {
-    background-position: 200% center;
-  }
 }
 
 /* ---------------------------------------------------------------------------
@@ -135,41 +228,43 @@ button {
   cursor: pointer;
 }
 button:not(:disabled):hover {
-  filter: brightness(1.09) saturate(1.05);
+  filter: brightness(1.06);
 }
 button:not(:disabled):active {
-  transform: translateY(1px) scale(0.99);
+  transform: translateY(1px);
 }
 button:disabled {
   cursor: not-allowed;
   opacity: 0.5;
 }
 
-/* Cards / panels that opt into a hover lift + glow (class added in JSX). */
+/* Cards opt into a quiet border response without floating above the workspace. */
 .glide-lift {
   transition: transform 0.2s cubic-bezier(0.22, 1, 0.36, 1),
     box-shadow 0.2s ease, border-color 0.2s ease;
 }
 .glide-lift:hover {
-  transform: translateY(-3px);
-  border-color: rgba(236, 72, 153, 0.35);
-  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.5),
-    0 0 0 1px rgba(236, 72, 153, 0.12), 0 0 26px rgba(249, 115, 22, 0.12);
+  border-color: rgba(148, 163, 184, 0.26) !important;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.2) !important;
+}
+
+.glide-glass-card:hover::after {
+  opacity: 0.5;
 }
 
 /* Text fields get a branded focus glow (beats the non-important inline border). */
 input:focus,
 textarea:focus {
   outline: none;
-  border-color: var(--magenta) !important;
-  box-shadow: 0 0 0 3px var(--ring), 0 0 22px rgba(236, 72, 153, 0.18);
+  border-color: rgba(246, 130, 31, 0.72) !important;
+  box-shadow: 0 0 0 3px var(--ring), inset 0 1px 0 rgba(255, 255, 255, 0.035);
 }
 
 /* Keyboard-only focus ring for everything else. */
 :focus-visible {
-  outline: 2px solid #fb7185;
+  outline: 2px solid #f6821f;
   outline-offset: 2px;
-  border-radius: 10px;
+  border-radius: 6px;
 }
 :focus:not(:focus-visible) {
   outline: none;
@@ -180,7 +275,7 @@ textarea:focus {
   opacity: 1;
 }
 ::selection {
-  background: rgba(236, 72, 153, 0.4);
+  background: rgba(246, 130, 31, 0.34);
   color: #fff;
 }
 
@@ -197,13 +292,13 @@ textarea:focus {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: linear-gradient(180deg, #35415c, #2a3348);
+  background: linear-gradient(180deg, rgba(148, 163, 184, 0.52), rgba(51, 65, 85, 0.72));
   border-radius: 999px;
   border: 2px solid transparent;
   background-clip: padding-box;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: linear-gradient(180deg, #f97316, #ec4899);
+  background: rgba(246, 130, 31, 0.76);
   background-clip: padding-box;
 }
 
@@ -211,7 +306,7 @@ textarea:focus {
 @keyframes glideIn {
   from {
     opacity: 0;
-    transform: translateY(8px) scale(0.98);
+    transform: translateY(4px);
   }
   to {
     opacity: 1;
@@ -219,11 +314,11 @@ textarea:focus {
   }
 }
 
-/* Soft pop for cards appearing (queue items, stat cards). */
+/* Short fade for newly appearing queue and stat cards. */
 @keyframes glidePop {
   from {
     opacity: 0;
-    transform: translateY(6px) scale(0.985);
+    transform: translateY(3px);
   }
   to {
     opacity: 1;
@@ -231,27 +326,15 @@ textarea:focus {
   }
 }
 
-/* A pending item quietly pulses its warm edge so it reads as "waiting on you". */
-@keyframes pendingPulse {
-  0%,
-  100% {
-    box-shadow: 0 2px 14px rgba(0, 0, 0, 0.35),
-      inset 3px 0 0 rgba(251, 191, 36, 0.7);
-  }
-  50% {
-    box-shadow: 0 2px 14px rgba(0, 0, 0, 0.35),
-      inset 3px 0 0 rgba(251, 191, 36, 1), -1px 0 18px rgba(251, 191, 36, 0.28);
-  }
-}
+/* The approval rail is static so queued changes read as work, not decoration. */
 .glide-pending {
-  animation: pendingPulse 3.2s ease-in-out infinite;
+  box-shadow: inset 2px 0 0 rgba(214, 168, 75, 0.82) !important;
 }
 .glide-pending--applying {
-  animation-duration: 1.35s;
+  box-shadow: inset 2px 0 0 rgba(96, 165, 250, 0.82) !important;
 }
 .glide-pending--failed {
-  animation: none;
-  box-shadow: 0 2px 14px rgba(0, 0, 0, 0.35), inset 3px 0 0 rgba(244, 63, 94, 0.9);
+  box-shadow: inset 2px 0 0 rgba(244, 63, 94, 0.9) !important;
 }
 
 /* Animated "thinking…" indicator — three bouncing dots (replaces the text). */
@@ -262,7 +345,7 @@ textarea:focus {
   width: 7px;
   height: 7px;
   border-radius: 999px;
-  background: linear-gradient(135deg, var(--flare), var(--magenta));
+  background: var(--flare);
   animation: glideBounce 1.2s infinite ease-in-out both;
 }
 .glide-dots span:nth-child(1) {
@@ -276,15 +359,253 @@ textarea:focus {
   80%,
   100% {
     opacity: 0.35;
-    transform: translateY(0) scale(0.8);
+    transform: translateY(0) scale(0.84);
   }
   40% {
     opacity: 1;
-    transform: translateY(-5px) scale(1);
+    transform: translateY(-3px) scale(1);
+  }
+}
+
+/* ---------------------------------------------------------------------------
+ * Responsive flight deck. Desktop keeps chat and controls side-by-side; smaller
+ * screens turn them into one scrollable column with a bounded chat workspace.
+ * ------------------------------------------------------------------------- */
+@media (max-width: 980px) {
+  .glide-header {
+    flex-wrap: wrap;
+    flex-shrink: 0;
+  }
+
+  .glide-header-left,
+  .glide-header-right {
+    min-width: 0;
+  }
+
+  .glide-workspace {
+    flex-direction: column !important;
+    overflow-y: auto !important;
+    padding: 10px !important;
+    gap: 10px !important;
+  }
+
+  .glide-chat {
+    flex: 0 0 clamp(560px, 72dvh, 760px) !important;
+    width: 100%;
+    min-height: 560px;
+  }
+
+  .glide-sidebar {
+    width: 100% !important;
+    flex: none !important;
+    overflow: visible !important;
+  }
+
+  .glide-admin-shell {
+    overflow-y: auto !important;
+  }
+
+  .glide-admin-shell .glide-admin-content {
+    flex: none !important;
+    min-height: auto !important;
+    overflow: visible !important;
+  }
+
+  .glide-admin-stats {
+    display: grid !important;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+
+  .glide-stat-card {
+    min-width: 0 !important;
+  }
+}
+
+@media (max-width: 700px) {
+  .glide-header {
+    margin: 8px 8px 0 !important;
+    padding: 10px 12px !important;
+    gap: 8px 12px;
+    border-radius: 10px !important;
+  }
+
+  .glide-header-left {
+    flex: 1 1 auto;
+    gap: 8px !important;
+  }
+
+  .glide-header-right {
+    width: 100%;
+    justify-content: flex-end;
+    gap: 7px !important;
+    padding-top: 8px;
+    border-top: 1px solid rgba(219, 234, 254, 0.08);
+  }
+
+  .glide-user {
+    display: none !important;
+  }
+
+  .glide-safety-pill {
+    padding: 4px 8px !important;
+  }
+
+  .glide-safety-read-dot,
+  .glide-safety-read,
+  .glide-safety-divider {
+    display: none !important;
+  }
+
+  .glide-room-pill {
+    max-width: min(64vw, 260px);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .glide-room-pill input {
+    width: min(28vw, 110px) !important;
+  }
+
+  .glide-warn-bar {
+    margin: 8px 8px 0 !important;
+    padding: 9px 12px !important;
+  }
+
+  .glide-workspace {
+    padding: 8px !important;
+    gap: 8px !important;
+  }
+
+  .glide-chat,
+  .glide-sidebar {
+    border-radius: 12px !important;
+  }
+
+  .glide-chat {
+    flex-basis: 68dvh !important;
+    min-height: min(500px, 68dvh);
+  }
+
+  .glide-messages {
+    padding: 18px 12px 8px !important;
+    gap: 13px !important;
+  }
+
+  .glide-bubble {
+    max-width: 88% !important;
+  }
+
+  .glide-composer {
+    flex-wrap: wrap;
+    margin: 7px !important;
+    padding: 8px !important;
+    border-radius: 10px !important;
+  }
+
+  .glide-composer textarea {
+    flex: 1 0 100% !important;
+    min-height: 62px;
+  }
+
+  .glide-composer button {
+    flex: 1 1 0;
+    min-height: 42px;
+    padding: 0 16px !important;
+  }
+
+  .glide-intro-card {
+    padding: 18px !important;
+  }
+
+  .glide-wizard-card {
+    padding: 20px !important;
+  }
+
+  .glide-admin-stats {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    margin: 8px 8px 0 !important;
+    padding: 8px !important;
+    gap: 8px !important;
+  }
+
+  .glide-tab-bar {
+    margin: 8px 8px 0 !important;
+    flex-wrap: nowrap !important;
+    overflow-x: auto;
+    padding-bottom: 7px !important;
+  }
+
+  .glide-tab-bar button {
+    flex: none;
+    white-space: nowrap;
+  }
+
+  .glide-admin-content {
+    padding: 8px 8px 24px !important;
+    gap: 10px !important;
+  }
+
+  .glide-panel {
+    padding: 14px !important;
+    border-radius: 9px !important;
+  }
+
+  .glide-join {
+    padding: 14px !important;
+  }
+
+  .glide-join-card {
+    width: calc(100vw - 28px) !important;
+    max-width: 410px !important;
+    padding: 30px 24px !important;
+    border-radius: 14px !important;
+  }
+}
+
+@media (max-width: 420px) {
+  .glide-header-right {
+    justify-content: space-between;
+  }
+
+  .glide-header-right > span,
+  .glide-header-right > a {
+    font-size: 10px !important;
+  }
+
+  .glide-chat {
+    min-height: min(480px, 68dvh);
+  }
+
+  .glide-bubble {
+    max-width: calc(100% - 40px) !important;
+  }
+
+  .glide-admin-stats {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+
+@media (max-width: 980px) and (max-height: 620px) {
+  .glide-chat {
+    flex-basis: calc(100dvh - 96px) !important;
+    min-height: 280px;
+  }
+
+  .glide-messages {
+    padding-top: 12px !important;
+  }
+
+  .glide-header {
+    margin-top: 6px !important;
   }
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .glide-pointer-glow {
+    display: none;
+  }
+
   *,
   *::before,
   *::after {

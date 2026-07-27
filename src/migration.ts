@@ -18,7 +18,34 @@
 
 const TIMEOUT_MS = 20_000;
 /** Cap on a config fetched from a URL so a giant export can't blow Worker memory. */
-const MAX_CONFIG_BYTES = 2_000_000;
+export const MAX_CONFIG_BYTES = 2_000_000;
+/** Cap uploaded Terraform file fan-out as well as total content bytes. */
+export const MAX_CONFIG_FILES = 50;
+/** Keep file metadata from bypassing the aggregate upload bound. */
+export const MAX_CONFIG_FILENAME_BYTES = 512;
+
+export function configSizeError(config: string, label = "Config"): string | undefined {
+  const bytes = new TextEncoder().encode(config).byteLength;
+  return bytes > MAX_CONFIG_BYTES
+    ? `${label} is too large (${bytes} bytes; max ${MAX_CONFIG_BYTES}). Trim it or split phases.`
+    : undefined;
+}
+
+export function configFilesSizeError(files: Array<{ filename: string; content: string }>): string | undefined {
+  let bytes = 0;
+  const encoder = new TextEncoder();
+  for (const file of files) {
+    const filenameBytes = encoder.encode(file.filename).byteLength;
+    if (filenameBytes > MAX_CONFIG_FILENAME_BYTES) {
+      return `A config filename is too long (${filenameBytes} bytes; max ${MAX_CONFIG_FILENAME_BYTES}).`;
+    }
+    bytes += filenameBytes + encoder.encode(file.content).byteLength;
+    if (bytes > MAX_CONFIG_BYTES) {
+      return `Uploaded configs are too large (${bytes} bytes; max ${MAX_CONFIG_BYTES}). Trim them or split phases.`;
+    }
+  }
+  return undefined;
+}
 
 export type MigrationConfigFormat = "json" | "xml" | "terraform" | "panos" | "auto";
 
@@ -173,6 +200,8 @@ export function buildConfigData(
   format: MigrationConfigFormat,
   filename?: string,
 ): { ok: true; data: unknown; format: Exclude<MigrationConfigFormat, "auto"> } | { ok: false; message: string } {
+  const sizeError = configSizeError(config);
+  if (sizeError) return { ok: false, message: sizeError };
   const resolved = format === "auto" ? sniffFormat(config) : format;
   switch (resolved) {
     case "json": {
@@ -216,13 +245,27 @@ export async function fetchConfigFromUrl(
     if (!resp.ok) {
       return { ok: false, message: `Fetching the config URL returned HTTP ${resp.status}.` };
     }
-    const text = await resp.text();
-    if (text.length > MAX_CONFIG_BYTES) {
-      return {
-        ok: false,
-        message: `Config is too large (${text.length} bytes; max ${MAX_CONFIG_BYTES}). Trim it or split phases.`,
-      };
+    const contentLength = Number(resp.headers.get("content-length"));
+    if (Number.isFinite(contentLength) && contentLength > MAX_CONFIG_BYTES) {
+      return { ok: false, message: `Config is too large (${contentLength} bytes; max ${MAX_CONFIG_BYTES}). Trim it or split phases.` };
     }
+    if (!resp.body) return { ok: true, text: "" };
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    const chunks: string[] = [];
+    let bytes = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      bytes += value.byteLength;
+      if (bytes > MAX_CONFIG_BYTES) {
+        await reader.cancel().catch(() => undefined);
+        return { ok: false, message: `Config is too large (more than ${MAX_CONFIG_BYTES} bytes). Trim it or split phases.` };
+      }
+      chunks.push(decoder.decode(value, { stream: true }));
+    }
+    chunks.push(decoder.decode());
+    const text = chunks.join("");
     return { ok: true, text };
   } catch (err) {
     return {
@@ -340,6 +383,22 @@ export interface SnapshotRowDTO {
 
 export interface SnapshotFullDTO extends SnapshotRowDTO {
   snapshot_data: string; // JSON blob of full zone state
+}
+
+/** Bind a restore to the account and zone recorded with the snapshot. */
+export function resolveSnapshotTarget(
+  snapshot: Pick<SnapshotRowDTO, "account_id" | "zone_id">,
+  activeAccountId: string,
+):
+  | { ok: true; accountId: string; zoneId: string }
+  | { ok: false; message: string } {
+  if (!snapshot.account_id || snapshot.account_id !== activeAccountId) {
+    return { ok: false, message: "The snapshot does not belong to the active Cloudflare account." };
+  }
+  if (!/^[a-f0-9]{32}$/i.test(snapshot.zone_id)) {
+    return { ok: false, message: "The snapshot contains an invalid zone id." };
+  }
+  return { ok: true, accountId: snapshot.account_id, zoneId: snapshot.zone_id };
 }
 
 /** Capture the current zone state into switchflare's snapshot store (read-only on CF). */

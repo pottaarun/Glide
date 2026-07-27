@@ -35,7 +35,7 @@ import "./index.css";
 
 import type {
   ActionResult,
-  DocsIndexState,
+  BusinessProfile,
   GlideMessageMetadata,
   GlideState,
   GuidanceDoc,
@@ -45,8 +45,15 @@ import type {
   PendingAction,
   SetupType,
 } from "../shared";
-import { isActionApplying, pendingActionStatus } from "../action-lifecycle";
+import { isActionApplying, isActionOutcomeUncertain, pendingActionStatus } from "../action-lifecycle";
 import { containsCloudflareApiToken, persistedDeliveryStatus } from "../chat-delivery";
+import { MAX_CONFIG_BYTES, MAX_CONFIG_FILENAME_BYTES, MAX_CONFIG_FILES } from "../migration";
+import {
+  isRecommendationQueueable,
+  recommendConfigurations,
+  recommendationToPending,
+  type Recommendation,
+} from "../recommendations";
 
 const CHAT_CONNECTION_ERROR = "Glide's live connection closed before the message was sent.";
 
@@ -203,6 +210,104 @@ function setupLabel(s?: SetupType): string {
   return s === "full" ? "Full (primary)" : s === "partial" ? "Partial (CNAME)" : "to be decided";
 }
 
+// ---------------------------------------------------------------------------
+// Business profile — the "nature of the business" discovery answers that drive
+// Glide's tailored recommendations. Option keys mirror recommendations.ts and
+// the update_business_profile tool schema on the server.
+// ---------------------------------------------------------------------------
+
+interface Opt {
+  id: string;
+  label: string;
+}
+
+const INDUSTRY_OPTIONS: Opt[] = [
+  { id: "ecommerce", label: "E-commerce" },
+  { id: "saas", label: "SaaS" },
+  { id: "fintech", label: "Fintech / finance" },
+  { id: "healthcare", label: "Healthcare" },
+  { id: "media", label: "Media / publishing" },
+  { id: "gaming", label: "Gaming" },
+  { id: "government", label: "Government" },
+  { id: "education", label: "Education" },
+  { id: "nonprofit", label: "Nonprofit" },
+  { id: "marketing", label: "Marketing site" },
+  { id: "api_platform", label: "API platform" },
+  { id: "other", label: "Other" },
+];
+
+const APP_TYPE_OPTIONS: Opt[] = [
+  { id: "website", label: "Website" },
+  { id: "web_app", label: "Web app" },
+  { id: "api", label: "API" },
+  { id: "mobile_backend", label: "Mobile backend" },
+  { id: "static_site", label: "Static site" },
+  { id: "ugc", label: "User content / community" },
+];
+
+const AUDIENCE_OPTIONS: Opt[] = [
+  { id: "global", label: "Global" },
+  { id: "regional", label: "Regional" },
+  { id: "internal", label: "Internal / employees" },
+];
+
+const TRAFFIC_OPTIONS: Opt[] = [
+  { id: "low", label: "Low" },
+  { id: "steady", label: "Steady" },
+  { id: "spiky", label: "Spiky (launches/sales)" },
+  { id: "high_volume", label: "High volume" },
+];
+
+const SENSITIVE_OPTIONS: Opt[] = [
+  { id: "pii", label: "Personal data (PII)" },
+  { id: "payments", label: "Payments / cards" },
+  { id: "health", label: "Health data (PHI)" },
+  { id: "credentials", label: "Credentials" },
+  { id: "financial", label: "Financial data" },
+];
+
+const COMPLIANCE_OPTIONS: Opt[] = [
+  { id: "pci_dss", label: "PCI DSS" },
+  { id: "hipaa", label: "HIPAA" },
+  { id: "gdpr", label: "GDPR" },
+  { id: "soc2", label: "SOC 2" },
+  { id: "iso27001", label: "ISO 27001" },
+  { id: "fedramp", label: "FedRAMP" },
+];
+
+const CONCERN_OPTIONS: Opt[] = [
+  { id: "bots", label: "Bots" },
+  { id: "ddos", label: "DDoS" },
+  { id: "scraping", label: "Scraping" },
+  { id: "credential_stuffing", label: "Account takeover" },
+  { id: "card_testing", label: "Card testing" },
+  { id: "fraud", label: "Fraud / abuse" },
+  { id: "latency", label: "Latency" },
+  { id: "downtime", label: "Downtime" },
+  { id: "cost", label: "Origin cost" },
+];
+
+function optLabel(options: Opt[], id: string): string {
+  return options.find((o) => o.id === id)?.label ?? id.replace(/_/g, " ");
+}
+
+/** Whether a profile has any captured signal worth showing. */
+function hasProfileSignal(p?: BusinessProfile): boolean {
+  if (!p) return false;
+  return Boolean(
+    p.industry ||
+      p.appTypes.length ||
+      p.audience ||
+      p.trafficProfile ||
+      p.hasLogin !== undefined ||
+      p.hasApi !== undefined ||
+      p.sensitiveData.length ||
+      p.compliance.length ||
+      p.concerns.length ||
+      p.notes,
+  );
+}
+
 /** Infer the migration tool's config format from an uploaded file's name. */
 function formatFromName(filename: string): "json" | "xml" | "terraform" | "panos" | "auto" {
   const ext = filename.toLowerCase().split(".").pop() ?? "";
@@ -349,6 +454,81 @@ function isSystemEvent(message: UIMessage): boolean {
   return (message.metadata as GlideMessageMetadata | undefined)?.systemEvent === "action_result";
 }
 
+/** A subtle, non-interactive light bloom that follows fine pointers only. */
+function PointerGlow() {
+  const glowRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const glow = glowRef.current;
+    if (
+      !glow ||
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches
+    ) {
+      return;
+    }
+
+    let frame: number | null = null;
+    let currentX = 0;
+    let currentY = 0;
+    let targetX = 0;
+    let targetY = 0;
+    let started = false;
+
+    const draw = () => {
+      currentX += (targetX - currentX) * 0.24;
+      currentY += (targetY - currentY) * 0.24;
+      glow.style.transform = `translate3d(${currentX}px, ${currentY}px, 0)`;
+      if (Math.abs(targetX - currentX) > 0.1 || Math.abs(targetY - currentY) > 0.1) {
+        frame = requestAnimationFrame(draw);
+      } else {
+        frame = null;
+      }
+    };
+
+    const onPointerMove = (event: PointerEvent) => {
+      if (event.pointerType !== "mouse") {
+        hide();
+        return;
+      }
+      targetX = event.clientX;
+      targetY = event.clientY;
+      if (!started) {
+        currentX = targetX;
+        currentY = targetY;
+        started = true;
+      }
+      if (glow.dataset.visible !== "true") glow.dataset.visible = "true";
+      const interactive = String(
+        event.target instanceof Element &&
+          Boolean(event.target.closest("button, a, input, textarea, select, summary, [role='button']")),
+      );
+      if (glow.dataset.interactive !== interactive) glow.dataset.interactive = interactive;
+      if (frame === null) frame = requestAnimationFrame(draw);
+    };
+
+    const hide = () => {
+      glow.dataset.visible = "false";
+      glow.dataset.interactive = "false";
+    };
+
+    document.addEventListener("pointermove", onPointerMove, { passive: true });
+    document.documentElement.addEventListener("pointerleave", hide);
+    window.addEventListener("blur", hide);
+    return () => {
+      document.removeEventListener("pointermove", onPointerMove);
+      document.documentElement.removeEventListener("pointerleave", hide);
+      window.removeEventListener("blur", hide);
+      if (frame !== null) cancelAnimationFrame(frame);
+    };
+  }, []);
+
+  return (
+    <div ref={glowRef} className="glide-pointer-glow" data-visible="false" aria-hidden="true">
+      <span className="glide-pointer-glow__core" />
+    </div>
+  );
+}
+
 function ToolChip({ tool: rendered }: { tool: RenderedTool }) {
   const display: Record<RenderedToolStatus, { icon: string; label: string; color?: string }> = {
     unknown: { icon: "⚙", label: "Tool call" },
@@ -372,10 +552,11 @@ function ToolChip({ tool: rendered }: { tool: RenderedTool }) {
 function Join({ onJoin }: { onJoin: (name: string) => void }) {
   const [value, setValue] = useState("");
   return (
-    <div style={S.joinWrap}>
-      <div style={S.joinCard}>
+    <div style={S.joinWrap} className="glide-join">
+      <div style={S.joinCard} className="glide-glass glide-join-card">
+        <img src="/cloudflare-logo-white.png" alt="Cloudflare" style={S.cfLogoJoin} />
         <h1 style={S.brand} className="glide-brand">Glide</h1>
-        <p style={S.tagline}>Chat your Cloudflare config into existence — together.</p>
+        <p style={S.tagline}>Guided Cloudflare configuration with reviewable changes.</p>
         <form
           onSubmit={(e) => {
             e.preventDefault();
@@ -486,6 +667,9 @@ function Room({ name }: { name: string }) {
 
   const chat = useAgentChat({
     agent: chatAgent,
+    // Coalesce fast stream bursts so per-chunk store updates cannot trip
+    // React's nested-update guard (minified error #185).
+    experimental_throttle: 100,
     // Don't block the initial render on the HTTP /get-messages fetch. In the
     // browser that `use()` promise suspends <Room> and never resolves, wedging
     // the UI on the Suspense fallback ("Loading room…"). History and live
@@ -740,12 +924,12 @@ function Room({ name }: { name: string }) {
   }, [inviteEmail, name, room, roomLink, runRpc]);
 
   const apply = useCallback(
-    async (id: string) => {
+    async (id: string, confirmUncertain = false) => {
       setBusyIds((prev) => new Set(prev).add(id));
       try {
         const result = await runRpc<ActionResult>(
           "applyAction",
-          [id, name],
+          [id, name, confirmUncertain],
           { timeout: APPLY_RPC_TIMEOUT_MS },
         );
         if (result?.status === "failed") {
@@ -836,6 +1020,45 @@ function Room({ name }: { name: string }) {
     setFormOpen(false);
   }, [runRpc, name]);
 
+  // Persist "nature of the business" answers from the opt-in wizard step.
+  const patchBusinessProfile = useCallback(
+    (patch: Partial<BusinessProfile>) => runRpc("updateBusinessProfile", [patch, name]),
+    [runRpc, name],
+  );
+
+  // Clear the captured business profile so discovery can start over.
+  const resetBusinessProfile = useCallback(() => {
+    if (
+      !window.confirm(
+        "Clear the captured business profile for this room? Glide will re-ask the discovery questions. Pending approvals and chat history are kept.",
+      )
+    )
+      return;
+    void runRpc("resetBusinessProfile", [name]);
+  }, [runRpc, name]);
+
+  // One-click queue a tailored recommendation. The server rebuilds the exact API
+  // call from its own catalog, targeting the room's default zone.
+  const queueRecommendation = useCallback(
+    (recId: string) =>
+      runRpc<{ ok: boolean; message: string; id?: string }>("queueRecommendation", [
+        recId,
+        state?.defaultZone?.id ?? "",
+        name,
+      ]),
+    [runRpc, name, state?.defaultZone?.id],
+  );
+
+  // Hand a recommendation that needs setup (discovery, a plan, or a dashboard
+  // step) to Glide in chat rather than queuing a half-formed action.
+  const askAboutRecommendation = useCallback(
+    (rec: Recommendation) => {
+      const text = `Help me set up this Cloudflare recommendation: "${rec.title}". ${rec.rationale} Walk me through it one step at a time and queue what's needed for me to Apply.`;
+      void chat.sendMessage({ text, metadata: { name } satisfies GlideMessageMetadata });
+    },
+    [chat, name],
+  );
+
   const onboarding = state?.onboarding;
   // Form is opt-in: only show when the user explicitly opens it.
   const showWizard = !!state && formOpen && !onboarding?.completed;
@@ -852,19 +1075,41 @@ function Room({ name }: { name: string }) {
       setNotice("Add a Cloudflare API token before applying queued changes.");
       return;
     }
-    const ids = pending.filter((action) => !isActionApplying(action)).map((action) => action.id);
-    if (!ids.length) return;
+    const uncertainCount = pending.filter(isActionOutcomeUncertain).length;
+    const ids = pending
+      .filter((action) => !isActionApplying(action) && !isActionOutcomeUncertain(action))
+      .map((action) => action.id);
+    if (!ids.length) {
+      if (uncertainCount) {
+        setNotice("Apply all skipped changes with uncertain outcomes. Verify each live configuration before retrying it individually.");
+      }
+      return;
+    }
+    if (!window.confirm(`Apply ${ids.length} reviewed change${ids.length === 1 ? "" : "s"}?`)) return;
     setBusyIds((prev) => new Set([...prev, ...ids]));
     try {
       const results = await runRpc<ActionResult[]>(
         "applyAll",
-        [name],
+        [ids, name],
         { timeout: APPLY_RPC_TIMEOUT_MS * ids.length },
       );
-      const failures = results?.filter((result) => result.status === "failed") ?? [];
-      if (failures.length) {
+      if (!results) {
         setNotice(
-          `${failures.length} action${failures.length === 1 ? "" : "s"} failed and remain queued for retry.`,
+          "Glide could not confirm the bulk Apply outcome. Verify the live configuration and pending queue before retrying.",
+        );
+        return;
+      }
+      const failures = results.filter((result) => result.status === "failed");
+      const serverSkipped = Math.max(0, ids.length - results.length);
+      if (failures.length || uncertainCount || serverSkipped) {
+        const skipped = uncertainCount
+          ? ` ${uncertainCount} uncertain action${uncertainCount === 1 ? " was" : "s were"} skipped pending live verification.`
+          : "";
+        const changed = serverSkipped
+          ? ` ${serverSkipped} reviewed action${serverSkipped === 1 ? " was" : "s were"} skipped because the queue changed before Apply.`
+          : "";
+        setNotice(
+          `${failures.length ? `${failures.length} action${failures.length === 1 ? "" : "s"} failed and remain queued for retry.` : ""}${skipped}${changed}`.trim(),
         );
       }
     } finally {
@@ -877,11 +1122,12 @@ function Room({ name }: { name: string }) {
   }, [name, pending, runRpc, state?.tokenConfigured]);
 
   return (
-    <div style={S.shell}>
-      <header style={S.header}>
-        <div style={S.headerLeft}>
+    <div style={S.shell} className="glide-shell">
+      <header style={S.header} className="glide-header glide-glass">
+        <div style={S.headerLeft} className="glide-header-left">
+          <img src="/cloudflare-mark.png" alt="Cloudflare" style={S.cfMark} />
           <span style={S.brandSm} className="glide-brand">Glide</span>
-          <span style={S.roomPill}>
+          <span style={S.roomPill} className="glide-room-pill">
             #
             <input
               value={room}
@@ -890,13 +1136,20 @@ function Room({ name }: { name: string }) {
               aria-label="Room name"
             />
           </span>
-          <span style={S.safetyPill} title="Reads run automatically. Writes always wait for your approval.">
-            <span style={S.safetyDotRead} /> reads run
-            <span style={S.safetyDivider}>·</span>
-            <span style={S.safetyDotWrite} /> writes wait
+          <span
+            style={S.safetyPill}
+            className="glide-safety-pill"
+            title="Reads run automatically. Writes always wait for your approval."
+            aria-label="Reads run automatically; writes require approval."
+          >
+            <span style={S.safetyDotRead} className="glide-safety-read-dot" />
+            <span className="glide-safety-read">reads run</span>
+            <span style={S.safetyDivider} className="glide-safety-divider">·</span>
+            <span style={S.safetyDotWrite} />
+            <span>writes wait</span>
           </span>
         </div>
-        <div style={S.headerRight}>
+        <div style={S.headerRight} className="glide-header-right">
           <span
             style={{
               ...S.badge,
@@ -921,34 +1174,36 @@ function Room({ name }: { name: string }) {
           <a href={`/admin#${encodeURIComponent(room)}`} style={S.headerLink} title="Open the read-only admin dashboard for this room">
             Admin →
           </a>
-          <span style={S.you}>{name}</span>
+          <span style={S.you} className="glide-user">{name}</span>
         </div>
       </header>
 
       {state &&
         (state.tokenValid === false ? (
-          <div style={S.warnBar}>
+          <div style={S.warnBar} className="glide-warn-bar">
             The saved Cloudflare API token failed verification. Review or replace it in{" "}
             <strong>Connection → Change</strong> before account discovery or Apply.
           </div>
         ) : !state.tokenConfigured ? (
-          <div style={S.warnBar}>
+          <div style={S.warnBar} className="glide-warn-bar">
             No Cloudflare API token yet. You can chat and queue changes, but Apply is blocked until you
             add one in <strong>Connection → Set token</strong> (right sidebar). It’s stored encrypted.
           </div>
         ) : null)}
 
-      <div style={S.body}>
+      <div style={S.body} className="glide-workspace">
         {/* Chat column */}
-        <main style={S.chatCol}>
+        <main style={S.chatCol} className="glide-chat glide-glass">
           {showWizard && (
             <div style={S.wizPane}>
               <OnboardingWizard
                 onboarding={onboarding}
+                businessProfile={state?.businessProfile}
                 tokenConfigured={!!state?.tokenConfigured}
                 migrationToolConfigured={state?.migrationToolConfigured}
                 migrationPlan={state?.migrationPlan}
                 onPatch={patchOnboarding}
+                onProfile={patchBusinessProfile}
                 onPreview={previewMigration}
                 onSaveToken={(t) => runRpc<{ ok: boolean; message: string }>("setCloudflareToken", [t])}
                 onFinish={finishOnboarding}
@@ -957,11 +1212,11 @@ function Room({ name }: { name: string }) {
             </div>
           )}
 
-          <div ref={scrollRef} style={S.messages}>
+          <div ref={scrollRef} style={S.messages} className="glide-messages">
             {visibleMessages.length === 0 &&
               (showWizard ? (
                 <div style={S.empty}>
-                  <p style={{ margin: 0, fontWeight: 600 }}>Questions? Ask Glide here anytime 👇</p>
+                  <p style={{ margin: 0, fontWeight: 600 }}>Ask Glide while you configure</p>
                   <p style={{ marginTop: 6, color: "#9ca3af" }}>
                     The guided form is above — or just chat. Ask things like “what's the difference between
                     Full and Partial DNS?” or “what token permissions do I need?”.
@@ -969,7 +1224,7 @@ function Room({ name }: { name: string }) {
                 </div>
               ) : onboarding?.completed ? (
                 <div style={S.empty}>
-                  <p style={{ margin: 0, fontWeight: 600 }}>Say hello 👋</p>
+                  <p style={{ margin: 0, fontWeight: 600 }}>Start a conversation</p>
                   <p style={{ marginTop: 6, color: "#9ca3af" }}>
                     Try: “find the zone example.com and list its DNS records”, or “block traffic from RU on
                     example.com”. Reads run instantly; changes wait for someone to Apply.
@@ -981,7 +1236,7 @@ function Room({ name }: { name: string }) {
                 // The checklist/progress on the right reflects what's captured; offer
                 // to continue in chat or Reset to truly start over.
                 <div style={S.empty}>
-                  <p style={{ margin: 0, fontWeight: 600 }}>Onboarding in progress 👉</p>
+                  <p style={{ margin: 0, fontWeight: 600 }}>Onboarding in progress</p>
                   <p style={{ marginTop: 6, color: "#9ca3af" }}>
                     Your answers so far are in the checklist on the right. Ask Glide “what's next?” to
                     continue, open <strong>Use form</strong> to edit answers, or hit <strong>Reset</strong>{" "}
@@ -1005,7 +1260,7 @@ function Room({ name }: { name: string }) {
                       {m.role === "user" ? who.charAt(0).toUpperCase() : "G"}
                     </div>
                   )}
-                  <div style={{ ...S.bubble, ...(m.role === "user" ? S.userBubble : S.aiBubble), ...(mine ? S.mineBubble : null) }}>
+                  <div className="glide-bubble" style={{ ...S.bubble, ...(m.role === "user" ? S.userBubble : S.aiBubble), ...(mine ? S.mineBubble : null) }}>
                     <div style={S.msgWho}>{m.role === "user" ? who : "Glide"}</div>
                     {text && <div style={S.msgText}>{text}</div>}
                     {tools.map((tool) => (
@@ -1040,7 +1295,7 @@ function Room({ name }: { name: string }) {
             {busy && (
               <div style={{ ...S.msgRow, justifyContent: "flex-start" }}>
                 <div style={{ ...S.avatar, ...S.avatarAi }}>G</div>
-                <div style={{ ...S.bubble, ...S.aiBubble }}>
+                <div className="glide-bubble" style={{ ...S.bubble, ...S.aiBubble }}>
                   <div style={S.msgWho}>Glide</div>
                   {stalled ? (
                     <div style={S.stallHint}>
@@ -1079,7 +1334,7 @@ function Room({ name }: { name: string }) {
             </div>
           )}
 
-          <div style={S.composer}>
+          <div style={S.composer} className="glide-composer glide-glass-card">
             <textarea
               value={draft}
               onChange={(e) => setDraft(e.target.value)}
@@ -1111,7 +1366,7 @@ function Room({ name }: { name: string }) {
         </main>
 
         {/* Sidebar */}
-        <aside style={S.sidebar}>
+        <aside style={S.sidebar} className="glide-sidebar glide-glass">
           {notice && <div style={S.errorBox}>{notice}</div>}
 
           <Section title="Connection">
@@ -1230,6 +1485,44 @@ function Room({ name }: { name: string }) {
             )}
           </Section>
 
+          {hasProfileSignal(state?.businessProfile) ? (
+            <Section
+              title="Business profile"
+              action={
+                <button style={S.miniBtn} onClick={resetBusinessProfile} title="Clear the captured business profile">
+                  Reset
+                </button>
+              }
+            >
+              <BusinessProfilePanel profile={state!.businessProfile!} />
+              <p style={{ margin: "10px 0 0", color: "#6b7280", fontSize: 12.5 }}>
+                Ask Glide for <b>tailored recommendations</b> based on this — it proposes settings you Apply.
+              </p>
+            </Section>
+          ) : (
+            <Section title="Business profile">
+              <Muted>
+                Glide asks about your business — industry, logins/API, data sensitivity, compliance, and top
+                concerns — to recommend the right performance & security settings. Answer in chat and it shows here.
+              </Muted>
+            </Section>
+          )}
+
+          {hasProfileSignal(state?.businessProfile) && (
+            <Section title="Recommendations">
+              <RecommendationsPanel
+                profile={state!.businessProfile!}
+                goals={onboarding?.goals}
+                setupType={onboarding?.setupType}
+                zoneId={state?.defaultZone?.id}
+                pending={pending}
+                results={state?.recentResults ?? []}
+                onQueue={queueRecommendation}
+                onAsk={askAboutRecommendation}
+              />
+            </Section>
+          )}
+
           {(state?.defaultAccountId || state?.defaultZone) && (
             <Section title="Defaults">
               {state?.defaultAccountId && <KV k="account" v={state.defaultAccountId} />}
@@ -1237,26 +1530,13 @@ function Room({ name }: { name: string }) {
             </Section>
           )}
 
-          <Section
-            title={`Pending approvals${pending.length ? ` · ${pending.length}` : ""}`}
-            action={
-              pending.length > 1 ? (
-                <button style={S.miniBtn} disabled={anyActionApplying} onClick={() => void applyAll()}>
-                  {anyActionApplying
-                    ? "Applying…"
-                    : state?.tokenConfigured
-                      ? "Apply all"
-                      : "Set token first"}
-                </button>
-              ) : undefined
-            }
-          >
+          <Section title={`Pending approvals${pending.length ? ` · ${pending.length}` : ""}`}>
             {pending.length === 0 && <Muted>Nothing queued. Ask Glide to make a change.</Muted>}
             {pending.map((a: PendingAction) => {
               const status = pendingActionStatus(a);
               const applying = busyIds.has(a.id) || isActionApplying(a);
               const failed = status === "failed" || (status === "applying" && !applying);
-              const uncertain = failed && a.error?.startsWith("Outcome uncertain:");
+              const uncertain = isActionOutcomeUncertain(a);
               const statusLabel = applying
                 ? "applying"
                 : uncertain
@@ -1278,6 +1558,8 @@ function Room({ name }: { name: string }) {
                   </div>
                   <div style={S.actionSummary}>{a.summary}</div>
                   <code style={S.path}>{a.path}</code>
+                  {failed && a.error && <div style={{ ...S.errorBox, marginTop: 8 }}>{a.error}</div>}
+                  <div style={S.actionMeta}>by {a.createdBy}</div>
                   {a.body !== undefined && (
                     <details style={S.bodyDetails}>
                       <summary style={S.bodySummary}>Request body</summary>
@@ -1290,8 +1572,6 @@ function Room({ name }: { name: string }) {
                       )}
                     </details>
                   )}
-                  {failed && a.error && <div style={{ ...S.errorBox, marginTop: 8 }}>{a.error}</div>}
-                  <div style={S.actionMeta}>by {a.createdBy}</div>
                   <div style={S.actionBtns}>
                     <button
                       style={{ ...S.applyBtn, opacity: applying ? 0.6 : 1 }}
@@ -1310,7 +1590,7 @@ function Room({ name }: { name: string }) {
                         ) {
                           return;
                         }
-                        void apply(a.id);
+                        void apply(a.id, uncertain);
                       }}
                     >
                       {applying
@@ -1321,7 +1601,7 @@ function Room({ name }: { name: string }) {
                             ? "Retry anyway"
                             : failed
                               ? "Retry"
-                            : "Apply"}
+                              : "Apply"}
                     </button>
                     <button
                       style={S.rejectBtn}
@@ -1334,6 +1614,17 @@ function Room({ name }: { name: string }) {
                 </div>
               );
             })}
+            {pending.length > 1 && (
+              <div style={{ ...S.actionBtns, marginTop: 10 }}>
+                <button style={S.miniBtn} disabled={anyActionApplying} onClick={() => void applyAll()}>
+                  {anyActionApplying
+                    ? "Applying…"
+                    : state?.tokenConfigured
+                      ? "Apply reviewed changes"
+                      : "Set token first"}
+                </button>
+              </div>
+            )}
           </Section>
 
           {state?.migrationPlan && (
@@ -1494,7 +1785,6 @@ function Room({ name }: { name: string }) {
                           setSnapBusy(s.id);
                           const res = await runRpc<{ ok: boolean; message: string }>("restoreSnapshot", [
                             s.id,
-                            s.zoneId,
                             name,
                           ]);
                           setSnapBusy(undefined);
@@ -1583,7 +1873,7 @@ function Room({ name }: { name: string }) {
 
 function Section({ title, action, children }: { title: string; action?: React.ReactNode; children: React.ReactNode }) {
   return (
-    <section style={S.section} className="glide-lift">
+    <section style={S.section} className="glide-lift glide-glass-card">
       <div style={S.sectionHead}>
         <h3 style={S.sectionTitle}>{title}</h3>
         {action}
@@ -1621,9 +1911,9 @@ function GuidedIntro({
 }) {
   return (
     <div style={S.introWrap}>
-      <div style={S.introBubble}>
+      <div style={S.introBubble} className="glide-glass-card glide-intro-card">
         <div style={S.msgWho}>Glide</div>
-        <div style={S.introTitle}>👋 Let's get you onto Cloudflare.</div>
+        <div style={S.introTitle}>Set up Cloudflare with Glide.</div>
         <div style={S.introText}>
           I'll guide you one question at a time and tick off the checklist on the right as we go. To start —
           are you <b>migrating from another provider</b>, or <b>starting fresh</b>?
@@ -1697,6 +1987,193 @@ function OnboardingPanel({
   );
 }
 
+/**
+ * Read-only summary of the captured "nature of the business" profile. Shown in
+ * the sidebar and admin so the team can see what Glide learned and used to shape
+ * its recommendations. Chat is where the profile is captured and recommendations
+ * are proposed; this just reflects the synced state.
+ */
+function BusinessProfilePanel({ profile }: { profile: BusinessProfile }) {
+  const tags = (options: Opt[], ids: string[]) =>
+    ids.length ? (
+      <div style={S.phaseTags}>
+        {ids.map((id) => (
+          <span key={id} style={S.phaseTag}>
+            {optLabel(options, id)}
+          </span>
+        ))}
+      </div>
+    ) : null;
+  return (
+    <>
+      {(profile.industryLabel || profile.industry) && (
+        <KV k="industry" v={profile.industryLabel ?? optLabel(INDUSTRY_OPTIONS, profile.industry!)} />
+      )}
+      {profile.audience && <KV k="audience" v={optLabel(AUDIENCE_OPTIONS, profile.audience)} />}
+      {profile.trafficProfile && <KV k="traffic" v={optLabel(TRAFFIC_OPTIONS, profile.trafficProfile)} />}
+      {profile.hasLogin !== undefined && <KV k="logins" v={profile.hasLogin ? "yes" : "no"} />}
+      {profile.hasApi !== undefined && <KV k="API" v={profile.hasApi ? "yes" : "no"} />}
+      {profile.appTypes.length > 0 && (
+        <>
+          <div style={S.kvKeyStandalone}>app</div>
+          {tags(APP_TYPE_OPTIONS, profile.appTypes)}
+        </>
+      )}
+      {profile.sensitiveData.length > 0 && (
+        <>
+          <div style={S.kvKeyStandalone}>sensitive data</div>
+          {tags(SENSITIVE_OPTIONS, profile.sensitiveData)}
+        </>
+      )}
+      {profile.compliance.length > 0 && (
+        <>
+          <div style={S.kvKeyStandalone}>compliance</div>
+          {tags(COMPLIANCE_OPTIONS, profile.compliance)}
+        </>
+      )}
+      {profile.concerns.length > 0 && (
+        <>
+          <div style={S.kvKeyStandalone}>concerns</div>
+          {tags(CONCERN_OPTIONS, profile.concerns)}
+        </>
+      )}
+    </>
+  );
+}
+
+function priColor(pri: Recommendation["priority"]): string {
+  return pri === "high" ? "#fb923c" : pri === "medium" ? "#fbbf24" : "#94a3b8";
+}
+
+/**
+ * Tailored-recommendations panel. Runs the (pure, client-safe) recommendation
+ * engine against the room's synced business profile and renders the results
+ * grouped by priority. Concrete zone-setting / cf_write items get a one-click
+ * **Queue** button (routed through the `queueRecommendation` RPC, which rebuilds
+ * the call server-side); everything else offers **Ask Glide**, which hands the
+ * setup to chat so the model can do the required discovery first. Items already
+ * queued or applied are shown as such. When `onQueue` is omitted the panel is
+ * read-only (used in the /admin dashboard).
+ */
+function RecommendationsPanel({
+  profile,
+  goals,
+  setupType,
+  zoneId,
+  pending,
+  results,
+  onQueue,
+  onAsk,
+}: {
+  profile: BusinessProfile;
+  goals?: string[];
+  setupType?: SetupType;
+  zoneId?: string;
+  pending: PendingAction[];
+  results: ActionResult[];
+  onQueue?: (recId: string) => Promise<{ ok: boolean; message: string; id?: string } | undefined>;
+  onAsk?: (rec: Recommendation) => void;
+}) {
+  const set = useMemo(
+    () => recommendConfigurations(profile, { goals, setupType }),
+    [profile, goals, setupType],
+  );
+  const [busyId, setBusyId] = useState<string>();
+  const [msg, setMsg] = useState<string>();
+  const readOnly = !onQueue;
+
+  const statusOf = (rec: Recommendation): "applied" | "queued" | "open" => {
+    const target = zoneId ? recommendationToPending(rec, zoneId) : null;
+    if (target) {
+      if (results.some((r) => r.status === "applied" && r.summary === target.summary)) return "applied";
+      if (pending.some((p) => p.method === target.method && p.path === target.path)) return "queued";
+    }
+    return "open";
+  };
+
+  const handleQueue = async (rec: Recommendation) => {
+    if (!onQueue) return;
+    setBusyId(rec.id);
+    setMsg(undefined);
+    const res = await onQueue(rec.id);
+    setBusyId(undefined);
+    if (res && !res.ok) setMsg(res.message);
+  };
+
+  const order: Array<Recommendation["priority"]> = ["high", "medium", "low"];
+  return (
+    <>
+      <Muted>
+        Tailored to your business profile — each is a proposal Glide queues for you to Apply, never an automatic
+        change.
+      </Muted>
+      {!readOnly && !zoneId && (
+        <div style={S.recNote}>Set a target zone (ask Glide to find your zone) to one-click queue these.</div>
+      )}
+      {msg && <div style={S.recMsg}>{msg}</div>}
+      {order.map((pri) => {
+        const items = set.recommendations.filter((r) => r.priority === pri);
+        if (!items.length) return null;
+        return (
+          <div key={pri} style={{ marginTop: 10 }}>
+            <div style={S.recGroupLabel}>
+              {pri} priority · {items.length}
+            </div>
+            {items.map((rec) => {
+              const st = statusOf(rec);
+              const queueable = isRecommendationQueueable(rec);
+              return (
+                <div key={rec.id} style={S.recRow} className="glide-lift">
+                  <div style={S.recTitleRow}>
+                    <span style={{ ...S.recDot, background: priColor(pri) }} />
+                    <span style={S.recTitle}>{rec.title}</span>
+                  </div>
+                  <div style={S.recMeta}>
+                    {rec.product} · {rec.category}
+                  </div>
+                  <div style={S.recWhy}>{rec.rationale}</div>
+                  <div style={S.recActionRow}>
+                    {st === "applied" ? (
+                      <span style={S.recApplied}>Applied ✓</span>
+                    ) : st === "queued" ? (
+                      <span style={S.recQueued}>Queued ✓</span>
+                    ) : readOnly ? (
+                      <span style={S.recProposal}>{queueable ? "one-click in the room" : "Glide-guided"}</span>
+                    ) : queueable ? (
+                      <button
+                        style={{ ...S.recQueueBtn, ...(!zoneId || busyId === rec.id ? S.recBtnDisabled : null) }}
+                        disabled={!zoneId || busyId === rec.id}
+                        onClick={() => void handleQueue(rec)}
+                        title={zoneId ? "Queue this change for a human to Apply" : "Set a target zone first"}
+                      >
+                        {busyId === rec.id ? "Queuing…" : "Queue"}
+                      </button>
+                    ) : (
+                      <button style={S.recAskBtn} onClick={() => onAsk?.(rec)} title="Have Glide set this up in chat">
+                        Ask Glide
+                      </button>
+                    )}
+                    {rec.action.reviewRequired && queueable && st === "open" && (
+                      <span style={S.recFlag} title="Review the queued change before you Apply it">
+                        review
+                      </span>
+                    )}
+                    {rec.docs[0] && (
+                      <a href={rec.docs[0]} target="_blank" rel="noreferrer" style={S.recDoc}>
+                        Docs ↗
+                      </a>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        );
+      })}
+    </>
+  );
+}
+
 function MigrationPlanPanel({ plan }: { plan: MigrationPlan }) {
   const queued = plan.rules.filter((r) => r.queued).length;
   return (
@@ -1720,10 +2197,12 @@ function MigrationPlanPanel({ plan }: { plan: MigrationPlan }) {
 
 interface WizardProps {
   onboarding?: OnboardingState;
+  businessProfile?: BusinessProfile;
   tokenConfigured: boolean;
   migrationToolConfigured?: boolean;
   migrationPlan?: MigrationPlan;
   onPatch: (patch: Record<string, unknown>) => Promise<unknown>;
+  onProfile: (patch: Partial<BusinessProfile>) => Promise<unknown>;
   onPreview: (args: {
     provider: string;
     config?: string;
@@ -1765,6 +2244,10 @@ const WIZARD_COPY: Record<string, { title: string; why: string }> = {
     title: "Choose your DNS setup",
     why: "Full setup makes Cloudflare your authoritative DNS (recommended, required on Free/Pro). Partial (CNAME) keeps your current DNS and proxies select subdomains (Business/Enterprise).",
   },
+  profile: {
+    title: "Tell Glide about your business",
+    why: "This is optional but powerful: it lets Glide recommend the performance & security settings that actually fit you — e.g. PCI-aware TLS for payments, rate limits for logins, caching for a global audience. You can also just answer these in chat.",
+  },
   token: {
     title: "Connect a Cloudflare API token",
     why: "Needed to read your account and to Apply queued changes. It's stored AES-256-GCM encrypted at rest and never shown again. You can skip for now and add it later.",
@@ -1805,10 +2288,12 @@ function Chip({ on, label, onClick }: { on: boolean; label: string; onClick: () 
 
 function OnboardingWizard({
   onboarding,
+  businessProfile,
   tokenConfigured,
   migrationToolConfigured,
   migrationPlan,
   onPatch,
+  onProfile,
   onPreview,
   onSaveToken,
   onFinish,
@@ -1819,6 +2304,16 @@ function OnboardingWizard({
   const [goals, setGoals] = useState<string[]>(onboarding?.goals ?? []);
   const [domain, setDomain] = useState(onboarding?.domain ?? "");
   const [setupType, setSetupType] = useState<SetupType | undefined>(onboarding?.setupType);
+  // Optional business-profile answers (drive Glide's tailored recommendations).
+  const [industry, setIndustry] = useState<string | undefined>(businessProfile?.industry);
+  const [appTypes, setAppTypes] = useState<string[]>(businessProfile?.appTypes ?? []);
+  const [audience, setAudience] = useState<string | undefined>(businessProfile?.audience);
+  const [trafficProfile, setTrafficProfile] = useState<string | undefined>(businessProfile?.trafficProfile);
+  const [hasLogin, setHasLogin] = useState<boolean | undefined>(businessProfile?.hasLogin);
+  const [hasApi, setHasApi] = useState<boolean | undefined>(businessProfile?.hasApi);
+  const [sensitiveData, setSensitiveData] = useState<string[]>(businessProfile?.sensitiveData ?? []);
+  const [compliance, setCompliance] = useState<string[]>(businessProfile?.compliance ?? []);
+  const [concerns, setConcerns] = useState<string[]>(businessProfile?.concerns ?? []);
   const [configText, setConfigText] = useState("");
   const [configUrl, setConfigUrl] = useState("");
   const [configFiles, setConfigFiles] = useState<Array<{ filename: string; content: string }>>([]);
@@ -1834,12 +2329,12 @@ function OnboardingWizard({
   const stepKeys = useMemo(() => {
     if (!path) return ["branch"];
     if (path === "migrate") {
-      const keys = ["branch", "provider", "scope", "domain", "config"];
+      const keys = ["branch", "provider", "scope", "domain", "config", "profile"];
       if (!tokenConfigured) keys.push("token");
       keys.push("review");
       return keys;
     }
-    const keys = ["branch", "scope", "domain", "setup"];
+    const keys = ["branch", "scope", "domain", "setup", "profile"];
     if (!tokenConfigured) keys.push("token");
     keys.push("review");
     return keys;
@@ -1877,9 +2372,13 @@ function OnboardingWizard({
   const toggleGoal = (id: string) =>
     setGoals((g) => (g.includes(id) ? g.filter((x) => x !== id) : [...g, id]));
 
+  const toggleIn = (setter: React.Dispatch<React.SetStateAction<string[]>>, id: string) =>
+    setter((list) => (list.includes(id) ? list.filter((x) => x !== id) : [...list, id]));
+
   const clearFiles = () => {
     setConfigFiles([]);
     setConfigText("");
+    setConfigUrl("");
     setFileLabel(undefined);
     setConfigFormat("auto");
     setPreviewMsg(undefined);
@@ -1887,10 +2386,26 @@ function OnboardingWizard({
 
   const handleFiles = async (list: FileList | null) => {
     if (!list || !list.length) return;
+    const offered = Array.from(list);
+    const allTf = offered.every((f) => /\.(tf|tfvars|hcl)$/i.test(f.name));
+    const selected = offered.length > 1 && allTf ? offered : offered.slice(0, 1);
+    const filenameBytes = selected.map((file) => new TextEncoder().encode(file.name).byteLength);
+    const totalBytes = selected.reduce((sum, file, index) => sum + file.size + filenameBytes[index], 0);
+    const filenameTooLong = filenameBytes.some((bytes) => bytes > MAX_CONFIG_FILENAME_BYTES);
+    if (selected.length > MAX_CONFIG_FILES || filenameTooLong || totalBytes > MAX_CONFIG_BYTES) {
+      clearFiles();
+      setPreviewMsg(
+        selected.length > MAX_CONFIG_FILES
+          ? `Choose at most ${MAX_CONFIG_FILES} Terraform files.`
+          : filenameTooLong
+            ? `Each config filename must be at most ${MAX_CONFIG_FILENAME_BYTES} bytes.`
+          : `Config files must total at most ${MAX_CONFIG_BYTES} bytes.`,
+      );
+      return;
+    }
     const read = await Promise.all(
-      Array.from(list).map(async (f) => ({ filename: f.name, content: await f.text() })),
+      selected.map(async (f) => ({ filename: f.name, content: await f.text() })),
     );
-    const allTf = read.every((r) => /\.(tf|tfvars|hcl)$/i.test(r.filename));
     if (read.length > 1 && allTf) {
       // A whole Terraform directory — the tool merges them.
       setConfigFiles(read);
@@ -1905,8 +2420,8 @@ function OnboardingWizard({
       setConfigUrl("");
       setConfigFormat(formatFromName(f.filename));
       setFileLabel(
-        read.length > 1
-          ? `${f.filename} (+${read.length - 1} ignored — only multiple .tf files are merged)`
+        offered.length > 1
+          ? `${f.filename} (+${offered.length - 1} ignored — only multiple .tf files are merged)`
           : f.filename,
       );
     }
@@ -1922,6 +2437,18 @@ function OnboardingWizard({
     else if (key === "scope") await onPatch({ goals });
     else if (key === "domain") await onPatch({ domain: domain.trim() });
     else if (key === "setup") await onPatch({ setupType });
+    else if (key === "profile")
+      await onProfile({
+        industry,
+        appTypes,
+        audience: audience as BusinessProfile["audience"],
+        trafficProfile: trafficProfile as BusinessProfile["trafficProfile"],
+        hasLogin,
+        hasApi,
+        sensitiveData,
+        compliance,
+        concerns,
+      });
     else if (key === "config") {
       const hasConfig = !!(configText.trim() || configUrl.trim() || configFiles.length);
       if (hasConfig && providerKey) {
@@ -1964,7 +2491,9 @@ function OnboardingWizard({
     const goalsTxt = goals.map(goalLabel).join(", ");
     if (path === "migrate") {
       const prov = PROVIDER_OPTIONS.find((p) => p.key === providerKey)?.label ?? "my current provider";
-      const previewed = onboarding?.configProvided || configText || configUrl;
+      const previewed = Boolean(
+        onboarding?.configProvided || configText || configUrl || configFiles.length,
+      );
       kickoff =
         `I'm migrating from ${prov} to Cloudflare for ${domain || "my domain"}. ` +
         `I want to migrate: ${goalsTxt || "my configuration"}. DNS setup: ${setupLabel(setupType)}. ` +
@@ -1976,6 +2505,21 @@ function OnboardingWizard({
         `I'm setting up ${domain || "my domain"} fresh on Cloudflare with a ${setupLabel(setupType)} DNS setup. ` +
         `I want to set up: ${goalsTxt || "the basics"}. Walk me through it step by step and queue changes for me to Apply.`;
     }
+    const profileFilled = Boolean(
+      industry ||
+        appTypes.length ||
+        audience ||
+        trafficProfile ||
+        hasLogin ||
+        hasApi ||
+        sensitiveData.length ||
+        compliance.length ||
+        concerns.length,
+    );
+    if (profileFilled) {
+      kickoff +=
+        " I've shared details about our business — please recommend the Cloudflare performance and security settings that fit us and offer to queue the important ones.";
+    }
     onFinish(kickoff);
   };
 
@@ -1985,11 +2529,12 @@ function OnboardingWizard({
   if (goals.length) summaryChips.push({ k: "scope", v: `${goals.length} selected` });
   if (domain.trim()) summaryChips.push({ k: "domain", v: domain.trim() });
   if (setupType) summaryChips.push({ k: "DNS", v: setupLabel(setupType) });
+  if (industry) summaryChips.push({ k: "industry", v: optLabel(INDUSTRY_OPTIONS, industry) });
   if (tokenConfigured) summaryChips.push({ k: "token", v: "connected ✓" });
 
   return (
     <div style={S.wizWrap}>
-      <div style={S.wizCard}>
+      <div style={S.wizCard} className="glide-glass glide-wizard-card">
         <div style={S.wizHead}>
           <div>
             <div style={S.wizBrand}>Guided setup</div>
@@ -2085,7 +2630,7 @@ function OnboardingWizard({
                 </button>
                 {fileLabel && (
                   <span style={S.fileLabel}>
-                    📄 {fileLabel}
+                    {fileLabel}
                     <button style={S.clearFile} onClick={clearFiles}>
                       clear
                     </button>
@@ -2147,6 +2692,101 @@ function OnboardingWizard({
             </div>
           )}
 
+          {key === "profile" && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+              <div>
+                <div style={S.wizGroupLabel}>Industry</div>
+                <div style={S.chipWrap}>
+                  {INDUSTRY_OPTIONS.map((o) => (
+                    <Chip
+                      key={o.id}
+                      on={industry === o.id}
+                      label={o.label}
+                      onClick={() => setIndustry(industry === o.id ? undefined : o.id)}
+                    />
+                  ))}
+                </div>
+              </div>
+              <div>
+                <div style={S.wizGroupLabel}>
+                  What kind of app? <span style={S.wizGroupHint}>(select all that apply)</span>
+                </div>
+                <div style={S.chipWrap}>
+                  {APP_TYPE_OPTIONS.map((o) => (
+                    <Chip key={o.id} on={appTypes.includes(o.id)} label={o.label} onClick={() => toggleIn(setAppTypes, o.id)} />
+                  ))}
+                </div>
+              </div>
+              <div>
+                <div style={S.wizGroupLabel}>Access patterns</div>
+                <div style={S.chipWrap}>
+                  <Chip on={hasLogin === true} label="Users log in" onClick={() => setHasLogin(hasLogin ? undefined : true)} />
+                  <Chip on={hasApi === true} label="Exposes an API" onClick={() => setHasApi(hasApi ? undefined : true)} />
+                </div>
+              </div>
+              <div>
+                <div style={S.wizGroupLabel}>Audience</div>
+                <div style={S.chipWrap}>
+                  {AUDIENCE_OPTIONS.map((o) => (
+                    <Chip
+                      key={o.id}
+                      on={audience === o.id}
+                      label={o.label}
+                      onClick={() => setAudience(audience === o.id ? undefined : o.id)}
+                    />
+                  ))}
+                </div>
+              </div>
+              <div>
+                <div style={S.wizGroupLabel}>Traffic</div>
+                <div style={S.chipWrap}>
+                  {TRAFFIC_OPTIONS.map((o) => (
+                    <Chip
+                      key={o.id}
+                      on={trafficProfile === o.id}
+                      label={o.label}
+                      onClick={() => setTrafficProfile(trafficProfile === o.id ? undefined : o.id)}
+                    />
+                  ))}
+                </div>
+              </div>
+              <div>
+                <div style={S.wizGroupLabel}>
+                  Sensitive data <span style={S.wizGroupHint}>(select all that apply)</span>
+                </div>
+                <div style={S.chipWrap}>
+                  {SENSITIVE_OPTIONS.map((o) => (
+                    <Chip key={o.id} on={sensitiveData.includes(o.id)} label={o.label} onClick={() => toggleIn(setSensitiveData, o.id)} />
+                  ))}
+                </div>
+              </div>
+              <div>
+                <div style={S.wizGroupLabel}>
+                  Compliance <span style={S.wizGroupHint}>(if any)</span>
+                </div>
+                <div style={S.chipWrap}>
+                  {COMPLIANCE_OPTIONS.map((o) => (
+                    <Chip key={o.id} on={compliance.includes(o.id)} label={o.label} onClick={() => toggleIn(setCompliance, o.id)} />
+                  ))}
+                </div>
+              </div>
+              <div>
+                <div style={S.wizGroupLabel}>
+                  Top concerns <span style={S.wizGroupHint}>(select all that apply)</span>
+                </div>
+                <div style={S.chipWrap}>
+                  {CONCERN_OPTIONS.map((o) => (
+                    <Chip key={o.id} on={concerns.includes(o.id)} label={o.label} onClick={() => toggleIn(setConcerns, o.id)} />
+                  ))}
+                </div>
+              </div>
+              <div style={S.wizHintRow}>
+                All optional — skip anything you're unsure about. Glide uses this to tailor which settings it
+                recommends, and you can refine it anytime in chat.
+              </div>
+            </div>
+          )}
+
           {key === "token" && (
             <div>
               {tokenConfigured ? (
@@ -2187,6 +2827,19 @@ function OnboardingWizard({
                 {goals.length > 0 && <KV k="Scope" v={goals.map(goalLabel).join(", ")} />}
                 {domain.trim() && <KV k="Domain" v={domain.trim()} />}
                 {setupType && <KV k="DNS setup" v={setupLabel(setupType)} />}
+                {industry && <KV k="Industry" v={optLabel(INDUSTRY_OPTIONS, industry)} />}
+                {(sensitiveData.length > 0 || compliance.length > 0 || concerns.length > 0) && (
+                  <KV
+                    k="Profile"
+                    v={[
+                      sensitiveData.length ? `${sensitiveData.length} data type(s)` : "",
+                      compliance.length ? compliance.map((c) => optLabel(COMPLIANCE_OPTIONS, c)).join(", ") : "",
+                      concerns.length ? `${concerns.length} concern(s)` : "",
+                    ]
+                      .filter(Boolean)
+                      .join(" · ")}
+                  />
+                )}
                 <KV k="Token" v={tokenConfigured ? "connected ✓" : "not set (add later to Apply)"} />
                 {migrationPlan && <KV k="Migration plan" v={`${migrationPlan.totalRules} item(s) parsed`} />}
               </div>
@@ -2423,7 +3076,7 @@ function DocMarkdown({ src }: { src: string }) {
 
 // --- Admin building blocks --------------------------------------------------
 
-type AdminTab = "comms" | "actions" | "guidance" | "cfdocs" | "docs" | "onboarding";
+type AdminTab = "comms" | "actions" | "guidance" | "docs" | "onboarding";
 
 function Panel({
   title,
@@ -2435,7 +3088,7 @@ function Panel({
   children: React.ReactNode;
 }) {
   return (
-    <section style={S.panel}>
+    <section style={S.panel} className="glide-panel glide-glass-card">
       <div style={S.panelHead}>
         <h3 style={S.panelTitle}>{title}</h3>
         {meta}
@@ -2448,7 +3101,7 @@ function Panel({
 function StatCard({ label, value, tone }: { label: string; value: number | string; tone?: string }) {
   const numStyle = tone ? { ...S.statNum, color: tone } : { ...S.statNum, ...brandText };
   return (
-    <div style={S.statCard} className="glide-lift">
+    <div style={S.statCard} className="glide-lift glide-glass-card glide-stat-card">
       <div style={numStyle} className={tone ? undefined : "glide-brand"}>{value}</div>
       <div style={S.statLabel}>{label}</div>
     </div>
@@ -2526,7 +3179,7 @@ function GuidanceTab({
       {notice && <div style={S.guidanceNotice}>{notice}</div>}
 
       {draft ? (
-        <div style={S.guidanceEditor}>
+        <div style={S.guidanceEditor} className="glide-glass-card">
           <label style={S.label}>Title</label>
           <input
             autoFocus
@@ -2573,7 +3226,7 @@ function GuidanceTab({
       <div style={{ marginTop: 16 }}>
         {docs.length === 0 && <Muted>No guidance yet. Add a note above to steer Glide's questions.</Muted>}
         {docs.map((d) => (
-          <div key={d.id} style={S.docRow}>
+          <div key={d.id} style={S.docRow} className="glide-glass-card">
             <div style={{ padding: "12px 16px" }}>
               <div style={S.guidanceRowTop}>
                 <span style={S.docTitle}>{d.title}</span>
@@ -2616,8 +3269,9 @@ function GuidanceTab({
 function AdminPickRoom({ onPick }: { onPick: (room: string) => void }) {
   const [value, setValue] = useState("");
   return (
-    <div style={S.joinWrap}>
-      <div style={{ ...S.joinCard, width: 460 }}>
+    <div style={S.joinWrap} className="glide-join">
+      <div style={{ ...S.joinCard, width: 460 }} className="glide-glass glide-join-card">
+        <img src="/cloudflare-logo-white.png" alt="Cloudflare" style={S.cfLogoJoin} />
         <h1 style={{ ...S.brand, fontSize: 30 }} className="glide-brand">Glide · Admin</h1>
         <p style={S.tagline}>
           Enter a room id to inspect its comms, actions, docs, and status. The room id is the value
@@ -2665,7 +3319,7 @@ function AdminGate() {
   return (
     <Suspense
       fallback={
-        <div style={{ ...S.shell, alignItems: "center", justifyContent: "center" }}>
+        <div style={{ ...S.shell, alignItems: "center", justifyContent: "center" }} className="glide-shell">
           <span style={{ color: "#9ca3af", fontSize: 15 }}>Loading admin…</span>
         </div>
       }
@@ -2676,151 +3330,6 @@ function AdminGate() {
 }
 
 /** The room-scoped admin dashboard: comms, actions, dev docs, onboarding & migration. */
-const DOCS_STATUS_LABEL: Record<DocsIndexState["status"], string> = {
-  idle: "Not indexed yet",
-  enumerating: "Discovering pages…",
-  indexing: "Indexing pages…",
-  done: "Up to date",
-  error: "Error",
-  cancelled: "Cancelled",
-};
-
-const DOCS_STATUS_TONE: Record<DocsIndexState["status"], { background: string; color: string }> = {
-  idle: { background: "#374151", color: "#d1d5db" },
-  enumerating: { background: "#0c4a6e", color: "#7dd3fc" },
-  indexing: { background: "#0c4a6e", color: "#7dd3fc" },
-  done: { background: "#064e3b", color: "#6ee7b7" },
-  error: { background: "#7f1d1d", color: "#fecaca" },
-  cancelled: { background: "#374151", color: "#d1d5db" },
-};
-
-/**
- * Admin "Cloudflare docs" tab: trigger and monitor the background job that
- * scrapes the full Cloudflare developer docs into the SHARED semantic index used
- * by every room's chat. Progress lives in synced state, so this reflects the job
- * live and keeps updating even if you navigate away and come back.
- */
-function CfDocsTab({
-  docsIndex,
-  onStart,
-  onCancel,
-  onClear,
-}: {
-  docsIndex?: DocsIndexState;
-  onStart: () => Promise<unknown>;
-  onCancel: () => Promise<unknown>;
-  onClear: () => Promise<unknown>;
-}) {
-  const [busy, setBusy] = useState(false);
-  const [notice, setNotice] = useState<string>();
-
-  const st = docsIndex;
-  const status = st?.status ?? "idle";
-  const running = status === "enumerating" || status === "indexing";
-  const processed = st ? st.pagesIndexed + st.pagesFailed : 0;
-  const pct =
-    st && st.pagesTotal > 0
-      ? Math.min(100, Math.round((processed / st.pagesTotal) * 100))
-      : status === "done"
-        ? 100
-        : 0;
-  const hasProgress = !!st && (running || st.pagesTotal > 0 || status === "done");
-
-  const act = async (fn: () => Promise<unknown>, confirmMsg?: string) => {
-    if (busy) return;
-    if (confirmMsg && !window.confirm(confirmMsg)) return;
-    setBusy(true);
-    setNotice(undefined);
-    try {
-      const res = (await fn()) as { message?: string } | undefined;
-      if (res?.message) setNotice(res.message);
-    } catch (err) {
-      setNotice(err instanceof Error ? err.message : String(err));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  return (
-    <Panel
-      title="Cloudflare docs"
-      meta={<span style={S.panelMeta}>shared semantic index · all rooms</span>}
-    >
-      <p style={S.hint}>
-        Scrape the complete Cloudflare developer documentation, embed every page, and store it in the
-        shared semantic index. Once indexed, Glide retrieves the most relevant excerpts for each
-        message — across <strong>every</strong> room — to ground its answers. The job runs in the
-        background and survives you closing this tab.
-      </p>
-
-      {notice && <div style={S.guidanceNotice}>{notice}</div>}
-
-      <div style={{ display: "flex", alignItems: "center", gap: 10, margin: "12px 0" }}>
-        <span style={{ ...S.badge, ...DOCS_STATUS_TONE[status] }}>{DOCS_STATUS_LABEL[status]}</span>
-        {running && st?.currentProduct && <span style={S.listMeta}>{st.currentProduct}</span>}
-        {st?.updatedAt && <span style={S.listMeta}>· updated {relTime(st.updatedAt)}</span>}
-      </div>
-
-      {hasProgress && (
-        <>
-          <div style={S.progressWrap}>
-            <div style={{ ...S.progressBar, width: `${pct}%` }} />
-          </div>
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0 16px", margin: "4px 0 12px" }}>
-            <div style={S.kv}>
-              <span style={S.kvKey}>Products</span>
-              <span style={S.kvVal}>{st?.productsEnumerated ?? 0}/{st?.productsTotal ?? 0}</span>
-            </div>
-            <div style={S.kv}>
-              <span style={S.kvKey}>Pages indexed</span>
-              <span style={S.kvVal}>{st?.pagesIndexed ?? 0}/{st?.pagesTotal ?? 0}</span>
-            </div>
-            <div style={S.kv}>
-              <span style={S.kvKey}>Chunks</span>
-              <span style={S.kvVal}>{st?.chunksUpserted ?? 0}</span>
-            </div>
-            <div style={S.kv}>
-              <span style={S.kvKey}>Failed</span>
-              <span style={S.kvVal}>{st?.pagesFailed ?? 0}</span>
-            </div>
-          </div>
-        </>
-      )}
-
-      {status === "error" && st?.error && <div style={S.errorBox}>{st.error}</div>}
-
-      <div style={S.guidanceBtnRow}>
-        {!running && (
-          <button style={S.guidanceSaveBtn} disabled={busy} onClick={() => void act(onStart)}>
-            {busy ? "Working…" : status === "idle" ? "Start indexing" : "Reindex"}
-          </button>
-        )}
-        {running && (
-          <button style={S.rejectBtnSm} disabled={busy} onClick={() => void act(onCancel)}>
-            {busy ? "Cancelling…" : "Cancel"}
-          </button>
-        )}
-        {!running && !!st && (st.pagesIndexed > 0 || st.pagesTotal > 0) && (
-          <button
-            style={S.miniBtn}
-            disabled={busy}
-            onClick={() =>
-              void act(onClear, "Remove all indexed Cloudflare docs from the shared store?")
-            }
-          >
-            Clear index
-          </button>
-        )}
-      </div>
-
-      <p style={S.hint}>
-        The full docs are ~100 products and thousands of pages, so a first run takes a while and uses
-        Workers AI embeddings. The store is shared by all rooms — index once, then re-run occasionally
-        to refresh. Requires a Vectorize index (semantic search) to be configured.
-      </p>
-    </Panel>
-  );
-}
 
 function AdminRoom({ room, name }: { room: string; name: string }) {
   const [state, setState] = useState<GlideState>();
@@ -2832,7 +3341,12 @@ function AdminRoom({ room, name }: { room: string; name: string }) {
     name: room,
     onStateUpdate: (s) => setState(s),
   });
-  const chat = useAgentChat({ agent, getInitialMessages: null, body: () => ({ name }) });
+  const chat = useAgentChat({
+    agent,
+    getInitialMessages: null,
+    body: () => ({ name }),
+    experimental_throttle: 100,
+  });
   const messages = chat.messages.filter((message) => !isSystemEvent(message));
 
   const chatLink = `/#${encodeURIComponent(room)}`;
@@ -2851,20 +3365,20 @@ function AdminRoom({ room, name }: { room: string; name: string }) {
     { id: "comms", label: "Comms", count: messages.length },
     { id: "actions", label: "Actions", count: pending.length },
     { id: "guidance", label: "Guidance", count: guidance.length },
-    { id: "cfdocs", label: "Cloudflare docs", count: state?.docsIndex?.chunksUpserted },
     { id: "docs", label: "Dev docs", count: docsManifest.docs.length },
     { id: "onboarding", label: "Onboarding & migration" },
   ];
 
   return (
-    <div style={S.shell}>
-      <header style={S.header}>
-        <div style={S.headerLeft}>
+    <div style={S.shell} className="glide-shell glide-admin-shell">
+      <header style={S.header} className="glide-header glide-glass">
+        <div style={S.headerLeft} className="glide-header-left">
+          <img src="/cloudflare-mark.png" alt="Cloudflare" style={S.cfMark} />
           <span style={S.brandSm} className="glide-brand">Glide</span>
           <span style={S.adminTag}>Admin</span>
-          <span style={S.roomPill}>#{room}</span>
+          <span style={S.roomPill} className="glide-room-pill">#{room}</span>
         </div>
-        <div style={S.headerRight}>
+        <div style={S.headerRight} className="glide-header-right">
           {state ? (
             state.tokenConfigured ? (
               <span style={{ ...S.badge, background: "#064e3b", color: "#6ee7b7" }}>token ✓</span>
@@ -2878,7 +3392,7 @@ function AdminRoom({ room, name }: { room: string; name: string }) {
         </div>
       </header>
 
-      <div style={S.adminStats}>
+      <div style={S.adminStats} className="glide-admin-stats glide-glass">
         <StatCard label="Messages" value={messages.length} />
         <StatCard label="Pending" value={pending.length} tone={pending.length ? "#fbbf24" : undefined} />
         <StatCard label="Applied" value={applied} tone={applied ? "#4ade80" : undefined} />
@@ -2889,7 +3403,7 @@ function AdminRoom({ room, name }: { room: string; name: string }) {
         <StatCard label="Docs" value={docsManifest.docs.length} />
       </div>
 
-      <div style={S.tabBar}>
+      <div style={S.tabBar} className="glide-tab-bar glide-glass">
         {tabs.map((t) => (
           <button
             key={t.id}
@@ -2902,7 +3416,7 @@ function AdminRoom({ room, name }: { room: string; name: string }) {
         ))}
       </div>
 
-      <div style={S.adminContent}>
+      <div style={S.adminContent} className="glide-admin-content">
         {!state && <div style={S.adminLoading}>Connecting to room #{room}…</div>}
 
         {tab === "comms" && (
@@ -3011,15 +3525,6 @@ function AdminRoom({ room, name }: { room: string; name: string }) {
           />
         )}
 
-        {tab === "cfdocs" && (
-          <CfDocsTab
-            docsIndex={state?.docsIndex}
-            onStart={() => agent.call("startDocsReindex", [name])}
-            onCancel={() => agent.call("cancelDocsReindex")}
-            onClear={() => agent.call("clearDocsIndex")}
-          />
-        )}
-
         {tab === "docs" && (
           <Panel
             title={`Dev docs · ${docsManifest.docs.length}`}
@@ -3032,7 +3537,7 @@ function AdminRoom({ room, name }: { room: string; name: string }) {
             {docsManifest.docs.map((d) => {
               const open = openDoc === d.id;
               return (
-                <div key={d.id} style={S.docRow}>
+                <div key={d.id} style={S.docRow} className="glide-glass-card">
                   <div style={S.docHeadRow} onClick={() => setOpenDoc(open ? null : d.id)}>
                     <div style={{ flex: 1, minWidth: 0 }}>
                       <div style={S.docTitle}>{d.title}</div>
@@ -3111,6 +3616,30 @@ function AdminRoom({ room, name }: { room: string; name: string }) {
                     </>
                   )}
                 </>
+              )}
+            </Panel>
+
+            <Panel title="Business profile">
+              {hasProfileSignal(state?.businessProfile) ? (
+                <>
+                  <BusinessProfilePanel profile={state!.businessProfile!} />
+                  <div style={{ marginTop: 14 }}>
+                    <div style={S.recGroupLabel}>Tailored recommendations</div>
+                    <RecommendationsPanel
+                      profile={state!.businessProfile!}
+                      goals={onboarding?.goals}
+                      setupType={onboarding?.setupType}
+                      zoneId={state?.defaultZone?.id}
+                      pending={state?.pendingActions ?? []}
+                      results={state?.recentResults ?? []}
+                    />
+                  </div>
+                </>
+              ) : (
+                <Muted>
+                  No business profile captured yet. Glide asks about the team's industry, app type, data
+                  sensitivity, compliance, and concerns in chat, then recommends tailored settings.
+                </Muted>
               )}
             </Panel>
 
@@ -3200,8 +3729,8 @@ class ErrorBoundary extends Component<{ children: ReactNode }, { error: Error | 
     const { error } = this.state;
     if (!error) return this.props.children;
     return (
-      <div style={S.joinWrap}>
-        <div style={{ ...S.joinCard, width: 520 }}>
+      <div style={S.joinWrap} className="glide-join">
+        <div style={{ ...S.joinCard, width: 520 }} className="glide-glass glide-join-card">
           <h1 style={{ ...S.brand, fontSize: 28 }}>Glide hit an error</h1>
           <p style={S.tagline}>The chat client failed to render. Details below.</p>
           <pre style={S.bodyPre}>{error.message}</pre>
@@ -3247,7 +3776,7 @@ function App() {
   return (
     <Suspense
       fallback={
-        <div style={{ ...S.shell, alignItems: "center", justifyContent: "center" }}>
+        <div style={{ ...S.shell, alignItems: "center", justifyContent: "center" }} className="glide-shell">
           <span style={{ color: "#9ca3af", fontSize: 15 }}>Loading room…</span>
         </div>
       }
@@ -3270,26 +3799,29 @@ function Root() {
     window.addEventListener("popstate", onNav);
     return () => window.removeEventListener("popstate", onNav);
   }, []);
-  return admin ? <AdminGate /> : <App />;
+  return (
+    <>
+      <PointerGlow />
+      {admin ? <AdminGate /> : <App />}
+    </>
+  );
 }
 
 // ---------------------------------------------------------------------------
 // Styles
 // ---------------------------------------------------------------------------
 
-// Signature gradients — the dawn-sky wordmark sheen and the primary-action
-// flare. `DISPLAY` is the characterful face reserved for wordmarks, hero
-// titles, and data numerals; body/UI stays on Inter.
-const GRAD_BRAND = "linear-gradient(120deg,#fb923c 0%,#f97316 20%,#ec4899 58%,#a855f7 100%)";
-const GRAD_CTA = "linear-gradient(135deg,#f97316 0%,#ec4899 100%)";
+// Cloudflare orange is reserved for identity and actions. Operational state
+// uses semantic colors; surfaces stay neutral so the data remains dominant.
+const GRAD_BRAND = "linear-gradient(110deg,#fdba74 0%,#f6821f 64%,#d96b12 100%)";
+const GRAD_CTA = "#f6821f";
 const DISPLAY = '"Space Grotesk", "Inter", ui-sans-serif, system-ui, sans-serif';
 const MONO = '"JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace';
 
-// Reusable "gliding gradient text" recipe for wordmarks (animated via the
-// `glide-brand` class, which pans the oversized background).
+// Restrained gradient text recipe for product identity.
 const brandText: React.CSSProperties = {
   background: GRAD_BRAND,
-  backgroundSize: "200% auto",
+  backgroundSize: "100% auto",
   WebkitBackgroundClip: "text",
   backgroundClip: "text",
   WebkitTextFillColor: "transparent",
@@ -3297,74 +3829,76 @@ const brandText: React.CSSProperties = {
 };
 
 const S: Record<string, React.CSSProperties> = {
-  joinWrap: { minHeight: "100vh", display: "grid", placeItems: "center", padding: 20, background: "radial-gradient(1100px 620px at 50% -8%, rgba(249,115,22,.18) 0%, transparent 55%), radial-gradient(900px 600px at 85% 110%, rgba(139,92,246,.20) 0%, transparent 55%), #070b16" },
-  joinCard: { width: 400, padding: 38, borderRadius: 24, background: "rgba(15,23,42,.72)", border: "1px solid rgba(148,163,184,.16)", backdropFilter: "blur(18px)", WebkitBackdropFilter: "blur(18px)", boxShadow: "0 30px 80px rgba(0,0,0,.6), inset 0 1px 0 rgba(255,255,255,.05)" },
-  brand: { ...brandText, margin: 0, fontSize: 48, fontWeight: 700, letterSpacing: -1 },
-  tagline: { marginTop: 8, marginBottom: 28, color: "#93a3b8", fontSize: 14.5, lineHeight: 1.55 },
-  label: { display: "block", fontSize: 12, color: "#93a3b8", marginBottom: 6, fontWeight: 600 },
-  input: { width: "100%", boxSizing: "border-box", padding: "12px 14px", borderRadius: 12, border: "1px solid #24304c", background: "rgba(7,11,22,.75)", color: "#f8fafc", fontSize: 15, outline: "none" },
-  primaryBtn: { marginTop: 18, width: "100%", padding: "14px", borderRadius: 12, border: 0, background: GRAD_CTA, color: "#fff", fontWeight: 800, fontSize: 15, cursor: "pointer", fontFamily: DISPLAY, letterSpacing: 0.2, boxShadow: "0 12px 30px rgba(236,72,153,.32), 0 3px 10px rgba(249,115,22,.28)" },
+  joinWrap: { minHeight: "100dvh", display: "grid", placeItems: "center", padding: 20, position: "relative" },
+  joinCard: { width: 410, maxWidth: "100%", padding: 36, borderRadius: 16, background: "rgba(17,23,34,.88)", border: "1px solid rgba(148,163,184,.2)", backdropFilter: "blur(20px)", WebkitBackdropFilter: "blur(20px)", boxShadow: "0 24px 64px rgba(0,0,0,.42), inset 0 1px 0 rgba(255,255,255,.055)" },
+  brand: { ...brandText, margin: 0, fontSize: 42, fontWeight: 700, letterSpacing: -1.2 },
+  cfLogoJoin: { height: 32, width: "auto", display: "block", marginBottom: 18 },
+  cfMark: { height: 22, width: "auto", display: "block", flexShrink: 0 },
+  tagline: { marginTop: 8, marginBottom: 28, color: "#94a3b8", fontSize: 14, lineHeight: 1.55 },
+  label: { display: "block", fontSize: 12, color: "#94a3b8", marginBottom: 7, fontWeight: 600 },
+  input: { width: "100%", boxSizing: "border-box", padding: "12px 13px", borderRadius: 8, border: "1px solid rgba(148,163,184,.24)", background: "rgba(9,12,17,.72)", color: "#f8fafc", fontSize: 15, outline: "none", boxShadow: "inset 0 1px 0 rgba(255,255,255,.025)" },
+  primaryBtn: { marginTop: 18, width: "100%", padding: "13px", borderRadius: 8, border: "1px solid #f6821f", background: GRAD_CTA, color: "#1a1008", fontWeight: 800, fontSize: 14, cursor: "pointer", fontFamily: DISPLAY, letterSpacing: 0.1, boxShadow: "0 6px 16px rgba(0,0,0,.22)" },
 
-  shell: { display: "flex", flexDirection: "column", height: "100vh", background: "transparent", color: "#e5e7eb", fontFamily: "Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif" },
-  header: { display: "flex", alignItems: "center", justifyContent: "space-between", padding: "12px 18px", borderBottom: "1px solid rgba(148,163,184,.12)", background: "rgba(9,13,24,.62)", backdropFilter: "blur(14px)", WebkitBackdropFilter: "blur(14px)" },
+  shell: { display: "flex", flexDirection: "column", height: "100dvh", background: "transparent", color: "#e5e7eb", fontFamily: "Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif", overflow: "hidden" },
+  header: { display: "flex", alignItems: "center", justifyContent: "space-between", padding: "10px 14px", margin: "10px 12px 0", border: "1px solid rgba(148,163,184,.16)", borderRadius: 12, background: "rgba(17,23,34,.82)", backdropFilter: "blur(18px)", WebkitBackdropFilter: "blur(18px)", boxShadow: "0 10px 30px rgba(0,0,0,.22), inset 0 1px 0 rgba(255,255,255,.04)", zIndex: 10 },
   headerLeft: { display: "flex", alignItems: "center", gap: 12 },
   headerRight: { display: "flex", alignItems: "center", gap: 10 },
-  brandSm: { ...brandText, fontWeight: 700, fontSize: 20, letterSpacing: -0.4 },
-  safetyPill: { display: "inline-flex", alignItems: "center", gap: 6, fontSize: 11, fontWeight: 600, color: "#cbd5e1", background: "rgba(15,23,42,.6)", border: "1px solid rgba(148,163,184,.16)", borderRadius: 999, padding: "4px 11px", letterSpacing: 0.2, whiteSpace: "nowrap" },
-  safetyDotRead: { width: 6, height: 6, borderRadius: 999, background: "#22c55e", boxShadow: "0 0 7px rgba(34,197,94,.8)" },
-  safetyDotWrite: { width: 6, height: 6, borderRadius: 999, background: "#fbbf24", boxShadow: "0 0 7px rgba(251,191,36,.8)" },
+  brandSm: { ...brandText, fontWeight: 700, fontSize: 19, letterSpacing: -0.45 },
+  safetyPill: { display: "inline-flex", alignItems: "center", gap: 6, fontSize: 11, fontWeight: 600, color: "#cbd5e1", background: "rgba(148,163,184,.055)", border: "1px solid rgba(148,163,184,.14)", borderRadius: 6, padding: "4px 9px", letterSpacing: 0.15, whiteSpace: "nowrap" },
+  safetyDotRead: { width: 6, height: 6, borderRadius: 999, background: "#22c55e" },
+  safetyDotWrite: { width: 6, height: 6, borderRadius: 999, background: "#d6a84b" },
   safetyDivider: { color: "#475569", margin: "0 1px" },
-  roomPill: { display: "inline-flex", alignItems: "center", gap: 2, background: "rgba(7,11,22,.6)", border: "1px solid rgba(148,163,184,.16)", borderRadius: 999, padding: "5px 12px", color: "#93a3b8", fontSize: 14 },
+  roomPill: { display: "inline-flex", alignItems: "center", gap: 2, background: "rgba(9,12,17,.55)", border: "1px solid rgba(148,163,184,.16)", borderRadius: 7, padding: "4px 10px", color: "#94a3b8", fontSize: 14 },
   roomInput: { background: "transparent", border: 0, color: "#f8fafc", fontSize: 14, width: 92, outline: "none", fontWeight: 600 },
-  badge: { fontSize: 11, fontWeight: 700, padding: "3px 9px", borderRadius: 999, textTransform: "uppercase", letterSpacing: 0.5 },
+  badge: { fontSize: 10, fontWeight: 700, padding: "3px 7px", borderRadius: 5, textTransform: "uppercase", letterSpacing: 0.55 },
   you: { fontSize: 13, color: "#cbd5e1", fontWeight: 600 },
-  warnBar: { padding: "9px 18px", background: "linear-gradient(90deg, rgba(120,53,15,.85), rgba(88,28,80,.55))", color: "#fed7aa", fontSize: 13, borderBottom: "1px solid rgba(249,115,22,.3)" },
+  warnBar: { padding: "9px 14px", margin: "8px 12px 0", background: "rgba(246,130,31,.09)", color: "#fed7aa", fontSize: 13, border: "1px solid rgba(246,130,31,.24)", borderRadius: 8, backdropFilter: "blur(14px)", WebkitBackdropFilter: "blur(14px)" },
 
-  body: { display: "flex", flex: 1, minHeight: 0 },
-  chatCol: { display: "flex", flexDirection: "column", flex: 1, minWidth: 0 },
-  messages: { flex: "2 1 0", minHeight: 0, overflowY: "auto", padding: "24px 24px 8px", display: "flex", flexDirection: "column", gap: 16 },
+  body: { display: "flex", flex: 1, minHeight: 0, gap: 10, padding: 10, overflow: "hidden" },
+  chatCol: { display: "flex", flexDirection: "column", flex: 1, minWidth: 0, overflow: "hidden", borderRadius: 14, border: "1px solid rgba(148,163,184,.15)", background: "rgba(17,23,34,.68)", backdropFilter: "blur(18px)", WebkitBackdropFilter: "blur(18px)", boxShadow: "0 14px 36px rgba(0,0,0,.24), inset 0 1px 0 rgba(255,255,255,.035)" },
+  messages: { flex: "2 1 0", minHeight: 0, overflowY: "auto", padding: "22px 22px 10px", display: "flex", flexDirection: "column", gap: 14 },
   empty: { margin: "auto", maxWidth: 480, textAlign: "center", color: "#cbd5e1", fontSize: 14, lineHeight: 1.6 },
   msgRow: { display: "flex", alignItems: "flex-start", gap: 10 },
-  avatar: { width: 32, height: 32, borderRadius: 999, display: "grid", placeItems: "center", fontSize: 12.5, fontWeight: 800, flexShrink: 0, color: "#fff", boxShadow: "0 3px 12px rgba(0,0,0,.4)", userSelect: "none", fontFamily: DISPLAY },
-  avatarAi: { background: GRAD_CTA, color: "#fff", boxShadow: "0 3px 14px rgba(236,72,153,.4)" },
-  avatarUser: { background: "linear-gradient(135deg,#38bdf8,#6366f1)", color: "#fff" },
-  avatarMine: { background: "linear-gradient(135deg,#fb923c,#f43f5e)", color: "#fff" },
-  bubble: { maxWidth: "78%", padding: "11px 15px", borderRadius: 16, fontSize: 14, lineHeight: 1.55, boxShadow: "0 4px 18px rgba(0,0,0,.32)", backdropFilter: "blur(10px)", WebkitBackdropFilter: "blur(10px)", animation: "glideIn .3s cubic-bezier(.22,1,.36,1)" },
-  aiBubble: { background: "rgba(19,29,51,.72)", border: "1px solid rgba(148,163,184,.14)", borderTopLeftRadius: 5, borderLeft: "2px solid rgba(249,115,22,.55)" },
-  userBubble: { background: "rgba(24,35,59,.72)", border: "1px solid rgba(148,163,184,.16)", borderTopRightRadius: 5 },
-  mineBubble: { background: "linear-gradient(135deg, rgba(124,45,90,.5), rgba(120,53,15,.42))", border: "1px solid rgba(236,72,153,.32)" },
+  avatar: { width: 30, height: 30, borderRadius: 7, display: "grid", placeItems: "center", fontSize: 12, fontWeight: 800, flexShrink: 0, color: "#f8fafc", border: "1px solid rgba(148,163,184,.2)", boxShadow: "0 3px 10px rgba(0,0,0,.25)", userSelect: "none", fontFamily: DISPLAY },
+  avatarAi: { background: GRAD_CTA, color: "#1a1008", borderColor: "rgba(246,130,31,.55)" },
+  avatarUser: { background: "#263244", color: "#e2e8f0" },
+  avatarMine: { background: "#9a4b13", color: "#fff7ed", borderColor: "rgba(246,130,31,.38)" },
+  bubble: { maxWidth: "78%", padding: "10px 14px", borderRadius: 10, fontSize: 14, lineHeight: 1.55, boxShadow: "0 5px 18px rgba(0,0,0,.18)", animation: "glideIn .22s ease-out" },
+  aiBubble: { background: "rgba(23,31,44,.88)", border: "1px solid rgba(148,163,184,.14)", borderTopLeftRadius: 3, borderLeft: "2px solid rgba(246,130,31,.8)" },
+  userBubble: { background: "rgba(29,39,55,.88)", border: "1px solid rgba(148,163,184,.17)", borderTopRightRadius: 3 },
+  mineBubble: { background: "rgba(74,42,23,.78)", border: "1px solid rgba(246,130,31,.26)" },
   msgWho: { fontSize: 11, fontWeight: 700, color: "#93a3b8", marginBottom: 4, letterSpacing: 0.3, textTransform: "uppercase" },
   msgText: { whiteSpace: "pre-wrap", wordBreak: "break-word", color: "#f1f5f9" },
-  toolChip: { marginTop: 8, marginRight: 6, display: "inline-flex", alignItems: "center", gap: 6, fontSize: 12, fontWeight: 700, color: "#f9a8d4", background: "rgba(236,72,153,.12)", border: "1px solid rgba(236,72,153,.35)", borderRadius: 999, padding: "3px 11px" },
+  toolChip: { marginTop: 8, marginRight: 6, display: "inline-flex", alignItems: "center", gap: 6, fontSize: 12, fontWeight: 700, color: "#93c5fd", background: "rgba(96,165,250,.08)", border: "1px solid rgba(96,165,250,.2)", borderRadius: 6, padding: "3px 8px" },
   typing: { display: "inline-flex", alignItems: "center", height: 14 },
 
   // Chat-led onboarding opener (GuidedIntro)
   introWrap: { margin: "auto 0", width: "100%", maxWidth: 580, display: "flex", justifyContent: "flex-start" },
-  introBubble: { width: "100%", boxSizing: "border-box", background: "rgba(19,29,51,.72)", border: "1px solid rgba(148,163,184,.14)", borderLeft: "2px solid rgba(249,115,22,.55)", borderRadius: 18, borderTopLeftRadius: 5, padding: "20px 22px", backdropFilter: "blur(10px)", WebkitBackdropFilter: "blur(10px)", boxShadow: "0 8px 28px rgba(0,0,0,.35)" },
+  introBubble: { width: "100%", boxSizing: "border-box", background: "rgba(23,31,44,.86)", border: "1px solid rgba(148,163,184,.15)", borderLeft: "2px solid #f6821f", borderRadius: 12, borderTopLeftRadius: 4, padding: "20px 22px", boxShadow: "0 12px 34px rgba(0,0,0,.22)" },
   introTitle: { fontSize: 19, fontWeight: 700, color: "#f8fafc", marginBottom: 8, fontFamily: DISPLAY, letterSpacing: -0.2 },
   introText: { fontSize: 14.5, lineHeight: 1.6, color: "#cbd5e1", marginBottom: 16 },
   introChoices: { display: "flex", gap: 10, flexWrap: "wrap" },
-  introChoice: { padding: "11px 18px", borderRadius: 11, border: "1px solid transparent", background: GRAD_CTA, color: "#fff", fontWeight: 700, fontSize: 14, cursor: "pointer", boxShadow: "0 8px 22px rgba(236,72,153,.28)", fontFamily: DISPLAY },
+  introChoice: { padding: "10px 16px", borderRadius: 8, border: "1px solid #f6821f", background: GRAD_CTA, color: "#1a1008", fontWeight: 700, fontSize: 14, cursor: "pointer", boxShadow: "0 4px 12px rgba(0,0,0,.2)", fontFamily: DISPLAY },
   introFoot: { marginTop: 16, fontSize: 12, color: "#64748b", lineHeight: 1.5 },
-  introLink: { background: "transparent", border: 0, color: "#38bdf8", fontSize: 12, cursor: "pointer", textDecoration: "underline", padding: 0 },
+  introLink: { background: "transparent", border: 0, color: "#60a5fa", fontSize: 12, cursor: "pointer", textDecoration: "underline", padding: 0 },
 
-  composer: { display: "flex", gap: 10, padding: 14, borderTop: "1px solid rgba(148,163,184,.12)", background: "rgba(9,13,24,.62)", backdropFilter: "blur(14px)", WebkitBackdropFilter: "blur(14px)" },
+  composer: { display: "flex", gap: 9, padding: 9, margin: "7px 8px 8px", border: "1px solid rgba(148,163,184,.16)", borderRadius: 11, background: "rgba(17,23,34,.9)", backdropFilter: "blur(16px)", WebkitBackdropFilter: "blur(16px)", boxShadow: "0 8px 24px rgba(0,0,0,.2), inset 0 1px 0 rgba(255,255,255,.035)" },
   connectionNotice: { padding: "8px 14px", background: "rgba(245,158,11,.10)", borderTop: "1px solid rgba(245,158,11,.25)", color: "#fcd34d", fontSize: 12.5 },
   deliveryNotice: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, padding: "9px 14px", background: "rgba(244,63,94,.10)", borderTop: "1px solid rgba(244,63,94,.28)", color: "#fecdd3", fontSize: 12.5 },
   deliveryRetryBtn: { flexShrink: 0, border: "1px solid rgba(244,63,94,.45)", background: "rgba(244,63,94,.16)", color: "#fff", borderRadius: 8, padding: "5px 10px", cursor: "pointer", fontWeight: 700 },
-  textarea: { flex: 1, resize: "none", padding: "12px 15px", borderRadius: 13, border: "1px solid #24304c", background: "rgba(7,11,22,.7)", color: "#f8fafc", fontSize: 14, lineHeight: 1.5, fontFamily: "inherit", outline: "none" },
-  sendBtn: { alignSelf: "stretch", padding: "0 24px", borderRadius: 13, border: 0, background: GRAD_CTA, color: "#fff", fontWeight: 800, fontSize: 14, cursor: "pointer", fontFamily: DISPLAY, letterSpacing: 0.3, boxShadow: "0 8px 22px rgba(236,72,153,.3)" },
-  stopBtn: { alignSelf: "stretch", padding: "0 18px", borderRadius: 13, border: "1px solid rgba(244,63,94,.5)", background: "rgba(244,63,94,.14)", color: "#fecdd3", fontWeight: 700, fontSize: 14, cursor: "pointer", fontFamily: DISPLAY, letterSpacing: 0.3 },
+  textarea: { flex: 1, resize: "none", padding: "11px 13px", borderRadius: 8, border: "1px solid rgba(148,163,184,.18)", background: "rgba(9,12,17,.62)", color: "#f8fafc", fontSize: 14, lineHeight: 1.5, fontFamily: "inherit", outline: "none" },
+  sendBtn: { alignSelf: "stretch", padding: "0 22px", borderRadius: 8, border: "1px solid #f6821f", background: GRAD_CTA, color: "#1a1008", fontWeight: 800, fontSize: 14, cursor: "pointer", fontFamily: DISPLAY, letterSpacing: 0.2, boxShadow: "0 4px 12px rgba(0,0,0,.2)" },
+  stopBtn: { alignSelf: "stretch", padding: "0 18px", borderRadius: 8, border: "1px solid rgba(244,63,94,.45)", background: "rgba(244,63,94,.1)", color: "#fecdd3", fontWeight: 700, fontSize: 14, cursor: "pointer", fontFamily: DISPLAY, letterSpacing: 0.2 },
   stallHint: { fontSize: 13, color: "#cbd5e1", lineHeight: 1.5 },
 
-  sidebar: { width: 344, flexShrink: 0, borderLeft: "1px solid rgba(148,163,184,.1)", background: "rgba(9,13,24,.45)", backdropFilter: "blur(14px)", WebkitBackdropFilter: "blur(14px)", overflowY: "auto", padding: 16, display: "flex", flexDirection: "column", gap: 14 },
+  sidebar: { width: 356, flexShrink: 0, border: "1px solid rgba(148,163,184,.15)", borderRadius: 14, background: "rgba(17,23,34,.68)", backdropFilter: "blur(18px)", WebkitBackdropFilter: "blur(18px)", boxShadow: "0 14px 36px rgba(0,0,0,.22), inset 0 1px 0 rgba(255,255,255,.035)", overflowY: "auto", padding: 11, display: "flex", flexDirection: "column", gap: 10 },
   errorBox: { background: "rgba(244,63,94,.14)", border: "1px solid rgba(244,63,94,.5)", color: "#fecdd3", padding: "9px 12px", borderRadius: 10, fontSize: 13 },
-  section: { background: "rgba(15,23,42,.55)", border: "1px solid rgba(148,163,184,.12)", borderRadius: 14, padding: "13px 14px", boxShadow: "0 2px 12px rgba(0,0,0,.22)" },
+  section: { flexShrink: 0, background: "rgba(23,31,44,.68)", border: "1px solid rgba(148,163,184,.13)", borderRadius: 9, padding: "12px 13px", boxShadow: "inset 0 1px 0 rgba(255,255,255,.025)" },
   sectionHead: { display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 },
   sectionTitle: { margin: 0, fontSize: 11.5, fontWeight: 700, color: "#a5b4c9", textTransform: "uppercase", letterSpacing: 0.8, fontFamily: DISPLAY },
-  miniBtn: { fontSize: 12, fontWeight: 600, border: "1px solid rgba(236,72,153,.35)", background: "rgba(236,72,153,.12)", color: "#f9a8d4", borderRadius: 8, padding: "3px 10px", cursor: "pointer" },
+  miniBtn: { fontSize: 12, fontWeight: 600, border: "1px solid rgba(148,163,184,.22)", background: "rgba(148,163,184,.07)", color: "#cbd5e1", borderRadius: 6, padding: "3px 9px", cursor: "pointer" },
 
-  actionCard: { position: "relative", background: "rgba(17,26,46,.7)", border: "1px solid rgba(148,163,184,.14)", borderRadius: 12, padding: 12, marginBottom: 10, boxShadow: "0 2px 14px rgba(0,0,0,.3)", overflow: "hidden", animation: "glidePop .28s cubic-bezier(.22,1,.36,1)" },
+  actionCard: { position: "relative", background: "rgba(20,27,39,.88)", border: "1px solid rgba(148,163,184,.14)", borderRadius: 8, padding: 12, marginBottom: 9, boxShadow: "inset 2px 0 0 rgba(214,168,75,.78)", overflow: "hidden", animation: "glidePop .2s ease-out" },
   actionTop: { display: "flex", alignItems: "center", gap: 8, marginBottom: 6 },
   method: { fontSize: 10, fontWeight: 800, color: "#fff", padding: "2px 7px", borderRadius: 5, letterSpacing: 0.5, boxShadow: "0 1px 6px rgba(0,0,0,.35)" },
   product: { fontSize: 12, color: "#a5b4c9", fontWeight: 600 },
@@ -3376,11 +3910,12 @@ const S: Record<string, React.CSSProperties> = {
   bodyNote: { marginTop: 6, fontSize: 11, color: "#fbbf24", lineHeight: 1.45 },
   actionMeta: { fontSize: 11, color: "#64748b", margin: "6px 0" },
   actionBtns: { display: "flex", gap: 8 },
-  applyBtn: { flex: 1, padding: "8px 0", borderRadius: 9, border: 0, background: "linear-gradient(135deg,#22c55e,#16a34a)", color: "#fff", fontWeight: 700, cursor: "pointer", boxShadow: "0 6px 16px rgba(34,197,94,.28)" },
-  rejectBtn: { flex: 1, padding: "8px 0", borderRadius: 9, border: "1px solid rgba(148,163,184,.22)", background: "rgba(148,163,184,.06)", color: "#cbd5e1", cursor: "pointer" },
+  applyBtn: { flex: 1, padding: "8px 0", borderRadius: 6, border: "1px solid #f6821f", background: "#f6821f", color: "#1a1008", fontWeight: 800, cursor: "pointer" },
+  rejectBtn: { flex: 1, padding: "8px 0", borderRadius: 6, border: "1px solid rgba(148,163,184,.2)", background: "rgba(148,163,184,.055)", color: "#cbd5e1", cursor: "pointer" },
 
   kv: { display: "flex", justifyContent: "space-between", gap: 10, fontSize: 13, padding: "5px 0", borderBottom: "1px solid rgba(148,163,184,.1)" },
   kvKey: { color: "#93a3b8" },
+  kvKeyStandalone: { color: "#93a3b8", fontSize: 13, margin: "8px 0 5px" },
   kvVal: { color: "#f1f5f9", textAlign: "right", wordBreak: "break-all", fontWeight: 500 },
 
   resultRow: { display: "flex", gap: 8, alignItems: "flex-start", padding: "6px 0" },
@@ -3391,29 +3926,47 @@ const S: Record<string, React.CSSProperties> = {
   tokenStatus: { display: "flex", alignItems: "center", gap: 8, marginBottom: 10 },
   hint: { margin: "8px 0 0", fontSize: 11, color: "#64748b", lineHeight: 1.5 },
   guidanceNotice: { margin: "10px 0", padding: "9px 12px", borderRadius: 9, background: "rgba(9,13,24,.55)", border: "1px solid rgba(148,163,184,.14)", color: "#cbd5e1", fontSize: 12 },
-  guidanceEditor: { border: "1px solid rgba(148,163,184,.14)", borderRadius: 13, padding: 16, background: "rgba(9,13,24,.55)", margin: "8px 0" },
-  guidanceTextarea: { width: "100%", boxSizing: "border-box", resize: "vertical", minHeight: 150, padding: "12px 14px", borderRadius: 12, border: "1px solid #24304c", background: "rgba(7,11,22,.7)", color: "#f8fafc", fontSize: 14, lineHeight: 1.5, fontFamily: "inherit", outline: "none" },
+  guidanceEditor: { border: "1px solid rgba(148,163,184,.14)", borderRadius: 9, padding: 14, background: "rgba(9,12,17,.5)", margin: "8px 0" },
+  guidanceTextarea: { width: "100%", boxSizing: "border-box", resize: "vertical", minHeight: 150, padding: "12px 14px", borderRadius: 8, border: "1px solid #2a3442", background: "rgba(9,12,17,.72)", color: "#f8fafc", fontSize: 14, lineHeight: 1.5, fontFamily: "inherit", outline: "none" },
   guidanceCheck: { display: "flex", alignItems: "center", gap: 8, marginTop: 12, fontSize: 13, color: "#cbd5e1", cursor: "pointer" },
   guidanceBtnRow: { display: "flex", gap: 10, marginTop: 16, alignItems: "center" },
-  guidanceSaveBtn: { padding: "10px 18px", borderRadius: 10, border: 0, background: GRAD_CTA, color: "#fff", fontWeight: 800, fontSize: 14, cursor: "pointer", fontFamily: DISPLAY, boxShadow: "0 8px 20px rgba(236,72,153,.28)" },
+  guidanceSaveBtn: { padding: "10px 18px", borderRadius: 7, border: "1px solid #f6821f", background: GRAD_CTA, color: "#1a1008", fontWeight: 800, fontSize: 14, cursor: "pointer", fontFamily: DISPLAY },
   guidanceRowTop: { display: "flex", alignItems: "center", gap: 10 },
   guidanceBody: { marginTop: 6, fontSize: 13, color: "#cbd5e1", lineHeight: 1.5, whiteSpace: "pre-wrap", wordBreak: "break-word" },
   guidanceActions: { display: "flex", alignItems: "center", gap: 8, marginTop: 12 },
   rejectBtnSm: { fontSize: 12, border: "1px solid #7f1d1d", background: "transparent", color: "#fca5a5", borderRadius: 6, padding: "2px 8px", cursor: "pointer" },
   inviteRow: { display: "flex", gap: 8 },
-  miniPrimary: { flexShrink: 0, padding: "0 15px", borderRadius: 10, border: 0, background: GRAD_CTA, color: "#fff", fontWeight: 800, cursor: "pointer", fontFamily: DISPLAY, boxShadow: "0 6px 16px rgba(236,72,153,.28)" },
+  miniPrimary: { flexShrink: 0, padding: "0 15px", borderRadius: 7, border: "1px solid #f6821f", background: GRAD_CTA, color: "#1a1008", fontWeight: 800, cursor: "pointer", fontFamily: DISPLAY },
   linkRow: { display: "flex", alignItems: "center", gap: 8, marginTop: 6 },
   linkCode: { flex: 1, fontSize: 11, color: "#7dd3fc", background: "rgba(7,11,22,.7)", borderRadius: 6, padding: "6px 8px", wordBreak: "break-all", border: "1px solid rgba(56,189,248,.14)" },
   inviteItem: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, padding: "6px 0", borderBottom: "1px solid rgba(148,163,184,.1)" },
   inviteBy: { fontSize: 11, color: "#64748b", flexShrink: 0 },
 
   progressWrap: { position: "relative", height: 7, borderRadius: 999, background: "rgba(148,163,184,.16)", overflow: "hidden", margin: "10px 0 12px" },
-  progressBar: { height: "100%", borderRadius: 999, background: GRAD_BRAND, backgroundSize: "200% auto", transition: "width .4s cubic-bezier(.22,1,.36,1)", boxShadow: "0 0 12px rgba(236,72,153,.5)" },
+  progressBar: { height: "100%", borderRadius: 999, background: "#f6821f", transition: "width .3s ease-out" },
   checklist: { display: "flex", flexDirection: "column", gap: 7 },
   checkItem: { display: "flex", alignItems: "flex-start", gap: 8, fontSize: 13, cursor: "pointer", lineHeight: 1.4 },
 
   phaseTags: { display: "flex", flexWrap: "wrap", gap: 6, marginTop: 8 },
-  phaseTag: { fontSize: 11, color: "#c4b5fd", background: "rgba(139,92,246,.12)", border: "1px solid rgba(139,92,246,.3)", borderRadius: 7, padding: "2px 8px", fontWeight: 600 },
+  phaseTag: { fontSize: 11, color: "#93c5fd", background: "rgba(96,165,250,.08)", border: "1px solid rgba(96,165,250,.2)", borderRadius: 5, padding: "2px 7px", fontWeight: 600 },
+  recNote: { marginTop: 8, fontSize: 12, color: "#fcd34d", background: "rgba(251,191,36,.06)", border: "1px solid rgba(251,191,36,.18)", borderRadius: 8, padding: "7px 10px", lineHeight: 1.45 },
+  recMsg: { marginTop: 8, fontSize: 12.5, color: "#7dd3fc", background: "rgba(56,189,248,.07)", border: "1px solid rgba(56,189,248,.2)", borderRadius: 8, padding: "8px 10px", whiteSpace: "pre-wrap" },
+  recGroupLabel: { fontSize: 11, fontWeight: 700, letterSpacing: 0.5, textTransform: "uppercase", color: "#93a3b8", margin: "2px 0 6px" },
+  recRow: { border: "1px solid rgba(148,163,184,.14)", borderRadius: 9, padding: "9px 11px", marginBottom: 8, background: "rgba(9,12,17,.4)" },
+  recTitleRow: { display: "flex", alignItems: "center", gap: 8 },
+  recDot: { width: 8, height: 8, borderRadius: 999, flexShrink: 0 },
+  recTitle: { fontSize: 13.5, fontWeight: 600, color: "#f1f5f9", lineHeight: 1.35 },
+  recMeta: { fontSize: 11, color: "#8595a8", margin: "3px 0 0 16px", textTransform: "capitalize" },
+  recWhy: { fontSize: 12, color: "#9aa7b8", lineHeight: 1.45, margin: "6px 0 0 16px" },
+  recActionRow: { display: "flex", alignItems: "center", gap: 10, margin: "9px 0 0 16px", flexWrap: "wrap" },
+  recQueueBtn: { padding: "5px 14px", borderRadius: 6, border: "1px solid #f6821f", background: "#f6821f", color: "#1a1008", fontWeight: 800, fontSize: 12.5, cursor: "pointer" },
+  recAskBtn: { padding: "5px 12px", borderRadius: 6, border: "1px solid rgba(148,163,184,.24)", background: "rgba(148,163,184,.07)", color: "#cbd5e1", fontWeight: 600, fontSize: 12.5, cursor: "pointer" },
+  recBtnDisabled: { opacity: 0.5, cursor: "not-allowed" },
+  recApplied: { fontSize: 12.5, fontWeight: 700, color: "#6ee7b7" },
+  recQueued: { fontSize: 12.5, fontWeight: 700, color: "#fbbf24" },
+  recProposal: { fontSize: 12, color: "#8595a8", fontStyle: "italic" },
+  recFlag: { fontSize: 10, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.5, color: "#fca5a5", background: "rgba(248,113,113,.08)", border: "1px solid rgba(248,113,113,.22)", borderRadius: 4, padding: "1px 6px" },
+  recDoc: { fontSize: 12, color: "#7dd3fc", textDecoration: "none", fontWeight: 600 },
   checkBox: { marginTop: 10, fontSize: 12, lineHeight: 1.5, border: "1px solid rgba(148,163,184,.14)", borderRadius: 8, padding: "8px 10px", whiteSpace: "pre-wrap" },
   snapRow: { display: "flex", alignItems: "center", gap: 8, padding: "8px 0", borderBottom: "1px solid rgba(148,163,184,.1)" },
   snapZone: { fontSize: 13, color: "#e5e7eb", wordBreak: "break-all" },
@@ -3427,65 +3980,67 @@ const S: Record<string, React.CSSProperties> = {
   // Split layout: the wizard lives in a bounded top pane; the chat sits below it.
   wizPane: { display: "flex", flexDirection: "column", flex: "3 1 0", minHeight: 0, borderBottom: "1px solid rgba(148,163,184,.12)" },
   wizWrap: { flex: 1, overflowY: "auto", display: "flex", justifyContent: "center", alignItems: "flex-start", padding: "28px 20px" },
-  wizCard: { width: "100%", maxWidth: 640, background: "rgba(15,23,42,.72)", border: "1px solid rgba(148,163,184,.16)", borderRadius: 20, padding: 26, backdropFilter: "blur(18px)", WebkitBackdropFilter: "blur(18px)", boxShadow: "0 24px 70px rgba(0,0,0,.5), inset 0 1px 0 rgba(255,255,255,.05)" },
+  wizCard: { width: "100%", maxWidth: 640, background: "rgba(17,23,34,.92)", border: "1px solid rgba(148,163,184,.18)", borderRadius: 14, padding: 24, backdropFilter: "blur(20px)", WebkitBackdropFilter: "blur(20px)", boxShadow: "0 20px 54px rgba(0,0,0,.34), inset 0 1px 0 rgba(255,255,255,.045)" },
   wizHead: { display: "flex", alignItems: "flex-start", justifyContent: "space-between", marginBottom: 12 },
   wizBrand: { ...brandText, fontSize: 13, fontWeight: 700, letterSpacing: 1, textTransform: "uppercase" },
   wizStepMeta: { fontSize: 12, color: "#93a3b8", marginTop: 3 },
   wizSkip: { background: "transparent", border: 0, color: "#64748b", fontSize: 12, cursor: "pointer", textDecoration: "underline" },
   wizProgress: { height: 7, borderRadius: 999, background: "rgba(148,163,184,.16)", overflow: "hidden", marginBottom: 18 },
-  wizProgressBar: { height: "100%", background: GRAD_BRAND, backgroundSize: "200% auto", transition: "width .4s cubic-bezier(.22,1,.36,1)", boxShadow: "0 0 12px rgba(236,72,153,.5)" },
+  wizProgressBar: { height: "100%", background: "#f6821f", transition: "width .3s ease-out" },
   wizTitle: { margin: "0 0 10px", fontSize: 24, fontWeight: 700, color: "#f8fafc", lineHeight: 1.22, fontFamily: DISPLAY, letterSpacing: -0.4 },
   wizWhy: { display: "flex", gap: 9, alignItems: "flex-start", background: "rgba(56,189,248,.07)", border: "1px solid rgba(56,189,248,.2)", borderRadius: 11, padding: "11px 13px", fontSize: 13, color: "#cbd5e1", lineHeight: 1.5, marginBottom: 18 },
   wizWhyIcon: { color: "#38bdf8", fontWeight: 800, flexShrink: 0 },
   wizBody: { minHeight: 120, marginBottom: 16 },
-  wizInput: { width: "100%", boxSizing: "border-box", padding: "12px 14px", borderRadius: 11, border: "1px solid #24304c", background: "rgba(7,11,22,.7)", color: "#f8fafc", fontSize: 15, outline: "none" },
+  wizInput: { width: "100%", boxSizing: "border-box", padding: "12px 14px", borderRadius: 8, border: "1px solid #2a3442", background: "rgba(9,12,17,.72)", color: "#f8fafc", fontSize: 15, outline: "none" },
   wizNote: { fontSize: 13, color: "#fed7aa", background: "rgba(120,53,15,.4)", border: "1px solid rgba(249,115,22,.35)", borderRadius: 9, padding: "9px 12px", marginBottom: 10 },
   wizMutedRow: { textAlign: "center", color: "#64748b", fontSize: 12 },
   wizHintRow: { fontSize: 12, color: "#64748b", marginTop: 8 },
+  wizGroupLabel: { fontSize: 13, fontWeight: 600, color: "#cbd5e1", marginBottom: 8 },
+  wizGroupHint: { fontSize: 12, fontWeight: 400, color: "#64748b" },
   wizPreviewMsg: { marginTop: 10, fontSize: 13, color: "#7dd3fc", background: "rgba(56,189,248,.07)", border: "1px solid rgba(56,189,248,.2)", borderRadius: 9, padding: "9px 12px", whiteSpace: "pre-wrap" },
   uploadRow: { display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" },
-  uploadBtn: { padding: "12px 18px", borderRadius: 11, border: "1px dashed rgba(236,72,153,.45)", background: "rgba(236,72,153,.08)", color: "#f9a8d4", fontWeight: 700, fontSize: 14, cursor: "pointer" },
+  uploadBtn: { padding: "12px 18px", borderRadius: 8, border: "1px dashed rgba(96,165,250,.35)", background: "rgba(96,165,250,.06)", color: "#93c5fd", fontWeight: 700, fontSize: 14, cursor: "pointer" },
   fileLabel: { display: "inline-flex", alignItems: "center", gap: 8, fontSize: 13, color: "#e5e7eb", background: "rgba(7,11,22,.7)", border: "1px solid rgba(148,163,184,.14)", borderRadius: 8, padding: "6px 10px", wordBreak: "break-all" },
   clearFile: { background: "transparent", border: 0, color: "#64748b", fontSize: 12, cursor: "pointer", textDecoration: "underline" },
   formatHint: { fontSize: 12, color: "#93a3b8", marginTop: 8, lineHeight: 1.5 },
 
   choiceGrid: { display: "grid", gridTemplateColumns: "1fr", gap: 12 },
-  choiceCard: { textAlign: "left", display: "flex", flexDirection: "column", gap: 6, padding: "16px 18px", borderRadius: 13, border: "1px solid #24304c", background: "rgba(7,11,22,.55)", color: "#e5e7eb", cursor: "pointer", transition: "border-color .18s, background .18s, box-shadow .18s, transform .12s" },
-  choiceCardOn: { borderColor: "#ec4899", background: "linear-gradient(135deg, rgba(249,115,22,.14), rgba(236,72,153,.14))", boxShadow: "0 0 0 1px rgba(236,72,153,.35), 0 10px 28px rgba(236,72,153,.18)" },
+  choiceCard: { textAlign: "left", display: "flex", flexDirection: "column", gap: 6, padding: "15px 17px", borderRadius: 9, border: "1px solid rgba(148,163,184,.17)", background: "rgba(23,31,44,.7)", color: "#e5e7eb", cursor: "pointer", transition: "border-color .18s, background .18s, box-shadow .18s", boxShadow: "inset 0 1px 0 rgba(255,255,255,.025)" },
+  choiceCardOn: { borderColor: "rgba(246,130,31,.72)", background: "rgba(246,130,31,.09)", boxShadow: "inset 3px 0 0 #f6821f" },
   choiceTitle: { fontSize: 16, fontWeight: 700, color: "#f8fafc", fontFamily: DISPLAY, letterSpacing: -0.2 },
   choiceDesc: { fontSize: 13, color: "#93a3b8", lineHeight: 1.45 },
 
   chipWrap: { display: "flex", flexWrap: "wrap", gap: 10 },
-  chip: { padding: "9px 15px", borderRadius: 999, border: "1px solid #24304c", background: "rgba(7,11,22,.55)", color: "#e5e7eb", fontSize: 14, cursor: "pointer", transition: "border-color .18s, background .18s, color .18s" },
-  chipOn: { borderColor: "#ec4899", background: "linear-gradient(135deg, rgba(249,115,22,.18), rgba(236,72,153,.18))", color: "#fbcfe8", fontWeight: 700 },
+  chip: { padding: "8px 13px", borderRadius: 7, border: "1px solid #2a3442", background: "rgba(9,12,17,.5)", color: "#e5e7eb", fontSize: 14, cursor: "pointer", transition: "border-color .18s, background .18s, color .18s" },
+  chipOn: { borderColor: "rgba(246,130,31,.7)", background: "rgba(246,130,31,.1)", color: "#fed7aa", fontWeight: 700 },
 
   reviewList: { display: "flex", flexDirection: "column", gap: 2, marginBottom: 12 },
 
   wizSummary: { display: "flex", flexWrap: "wrap", gap: 8, padding: "12px 0", borderTop: "1px solid rgba(148,163,184,.12)", marginBottom: 4 },
-  wizSummaryChip: { fontSize: 12, color: "#e5e7eb", background: "rgba(7,11,22,.6)", border: "1px solid rgba(148,163,184,.14)", borderRadius: 999, padding: "4px 11px" },
+  wizSummaryChip: { fontSize: 12, color: "#e5e7eb", background: "rgba(9,12,17,.58)", border: "1px solid rgba(148,163,184,.14)", borderRadius: 6, padding: "4px 9px" },
 
   wizFooter: { display: "flex", alignItems: "center", gap: 10, paddingTop: 8 },
-  wizBack: { padding: "11px 20px", borderRadius: 11, border: "1px solid rgba(148,163,184,.2)", background: "rgba(148,163,184,.06)", color: "#cbd5e1", fontWeight: 600, cursor: "pointer" },
-  wizPrimary: { padding: "11px 24px", borderRadius: 11, border: 0, background: GRAD_CTA, color: "#fff", fontWeight: 800, fontSize: 15, cursor: "pointer", fontFamily: DISPLAY, letterSpacing: 0.2, boxShadow: "0 10px 26px rgba(236,72,153,.3)" },
-  wizPrimarySm: { padding: "9px 17px", borderRadius: 9, border: 0, background: "linear-gradient(135deg,#22c55e,#16a34a)", color: "#fff", fontWeight: 700, cursor: "pointer", boxShadow: "0 6px 16px rgba(34,197,94,.28)" },
+  wizBack: { padding: "11px 20px", borderRadius: 7, border: "1px solid rgba(148,163,184,.2)", background: "rgba(148,163,184,.055)", color: "#cbd5e1", fontWeight: 600, cursor: "pointer" },
+  wizPrimary: { padding: "11px 24px", borderRadius: 7, border: "1px solid #f6821f", background: GRAD_CTA, color: "#1a1008", fontWeight: 800, fontSize: 15, cursor: "pointer", fontFamily: DISPLAY, letterSpacing: 0.1 },
+  wizPrimarySm: { padding: "9px 17px", borderRadius: 7, border: "1px solid #16a34a", background: "#15803d", color: "#fff", fontWeight: 700, cursor: "pointer" },
 
   // Admin dashboard (/admin)
-  adminTag: { fontSize: 11, fontWeight: 800, textTransform: "uppercase", letterSpacing: 0.7, color: "#fbcfe8", background: "rgba(236,72,153,.16)", border: "1px solid rgba(236,72,153,.4)", borderRadius: 999, padding: "3px 10px", fontFamily: DISPLAY },
-  headerLink: { fontSize: 13, fontWeight: 700, color: "#f9a8d4", textDecoration: "none", border: "1px solid rgba(236,72,153,.35)", background: "rgba(236,72,153,.1)", borderRadius: 9, padding: "5px 12px" },
+  adminTag: { fontSize: 10, fontWeight: 800, textTransform: "uppercase", letterSpacing: 0.7, color: "#fed7aa", background: "rgba(246,130,31,.1)", border: "1px solid rgba(246,130,31,.28)", borderRadius: 5, padding: "3px 8px", fontFamily: DISPLAY },
+  headerLink: { fontSize: 13, fontWeight: 700, color: "#fed7aa", textDecoration: "none", border: "1px solid rgba(246,130,31,.26)", background: "rgba(246,130,31,.075)", borderRadius: 6, padding: "5px 10px" },
 
-  adminStats: { display: "flex", flexWrap: "wrap", gap: 12, padding: "18px", borderBottom: "1px solid rgba(148,163,184,.1)", background: "rgba(9,13,24,.4)" },
-  statCard: { flex: "1 1 120px", minWidth: 110, background: "rgba(15,23,42,.6)", border: "1px solid rgba(148,163,184,.12)", borderRadius: 14, padding: "14px 16px", boxShadow: "0 2px 12px rgba(0,0,0,.24)", animation: "glidePop .3s cubic-bezier(.22,1,.36,1)" },
+  adminStats: { display: "flex", flexWrap: "wrap", gap: 9, padding: 10, margin: "10px 12px 0", border: "1px solid rgba(148,163,184,.14)", borderRadius: 12, background: "rgba(17,23,34,.68)", backdropFilter: "blur(18px)", WebkitBackdropFilter: "blur(18px)", boxShadow: "0 10px 30px rgba(0,0,0,.2), inset 0 1px 0 rgba(255,255,255,.03)" },
+  statCard: { flex: "1 1 120px", minWidth: 110, background: "rgba(23,31,44,.72)", border: "1px solid rgba(148,163,184,.13)", borderRadius: 8, padding: "13px 15px", boxShadow: "inset 0 1px 0 rgba(255,255,255,.025)", animation: "glidePop .2s ease-out" },
   statNum: { fontSize: 30, fontWeight: 700, lineHeight: 1.05, letterSpacing: -1, fontFamily: DISPLAY },
   statLabel: { marginTop: 5, fontSize: 11, fontWeight: 700, color: "#93a3b8", textTransform: "uppercase", letterSpacing: 0.6 },
 
-  tabBar: { display: "flex", gap: 8, padding: "12px 18px", borderBottom: "1px solid rgba(148,163,184,.1)", background: "rgba(9,13,24,.5)", backdropFilter: "blur(12px)", WebkitBackdropFilter: "blur(12px)", flexWrap: "wrap" },
-  tab: { padding: "8px 15px", borderRadius: 999, border: "1px solid transparent", background: "rgba(148,163,184,.06)", color: "#93a3b8", fontSize: 13, fontWeight: 700, cursor: "pointer" },
-  tabOn: { background: "linear-gradient(135deg, rgba(249,115,22,.18), rgba(236,72,153,.18))", border: "1px solid rgba(236,72,153,.4)", color: "#fbcfe8" },
+  tabBar: { display: "flex", gap: 5, padding: 6, margin: "10px 12px 0", border: "1px solid rgba(148,163,184,.14)", borderRadius: 10, background: "rgba(17,23,34,.7)", backdropFilter: "blur(18px)", WebkitBackdropFilter: "blur(18px)", boxShadow: "0 8px 24px rgba(0,0,0,.18)", flexWrap: "wrap" },
+  tab: { padding: "7px 12px", borderRadius: 5, border: "1px solid transparent", background: "transparent", color: "#94a3b8", fontSize: 13, fontWeight: 700, cursor: "pointer" },
+  tabOn: { background: "rgba(246,130,31,.09)", border: "1px solid rgba(246,130,31,.26)", color: "#fed7aa", boxShadow: "inset 0 -2px 0 #f6821f" },
 
-  adminContent: { flex: 1, minHeight: 0, overflowY: "auto", padding: "20px 18px 40px", display: "flex", flexDirection: "column", gap: 16 },
+  adminContent: { flex: 1, minHeight: 0, overflowY: "auto", padding: "14px 14px 32px", display: "flex", flexDirection: "column", gap: 14 },
   adminLoading: { color: "#9ca3af", fontSize: 14, textAlign: "center", padding: "20px 0" },
 
-  panel: { background: "rgba(15,23,42,.55)", border: "1px solid rgba(148,163,184,.12)", borderRadius: 16, padding: 18, backdropFilter: "blur(12px)", WebkitBackdropFilter: "blur(12px)", boxShadow: "0 4px 20px rgba(0,0,0,.24)" },
+  panel: { background: "rgba(20,27,39,.76)", border: "1px solid rgba(148,163,184,.14)", borderRadius: 10, padding: 17, boxShadow: "0 8px 26px rgba(0,0,0,.16), inset 0 1px 0 rgba(255,255,255,.025)" },
   panelHead: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, marginBottom: 12 },
   panelTitle: { margin: 0, fontSize: 14, fontWeight: 700, color: "#f1f5f9", letterSpacing: -0.2, fontFamily: DISPLAY },
   panelMeta: { fontSize: 11, color: "#64748b", fontWeight: 600 },
@@ -3499,7 +4054,7 @@ const S: Record<string, React.CSSProperties> = {
   listRow: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, padding: "8px 0", borderBottom: "1px solid rgba(148,163,184,.1)" },
   listMeta: { fontSize: 11, color: "#64748b", flexShrink: 0 },
 
-  docRow: { border: "1px solid rgba(148,163,184,.12)", borderRadius: 12, marginBottom: 10, overflow: "hidden", background: "rgba(17,26,46,.55)" },
+  docRow: { border: "1px solid rgba(148,163,184,.13)", borderRadius: 8, marginBottom: 9, overflow: "hidden", background: "rgba(23,31,44,.62)", boxShadow: "inset 0 1px 0 rgba(255,255,255,.02)" },
   docHeadRow: { display: "flex", alignItems: "flex-start", gap: 12, padding: "13px 15px", cursor: "pointer" },
   docTitle: { fontSize: 14, fontWeight: 700, color: "#f8fafc" },
   docPath: { fontSize: 11, color: "#7dd3fc", wordBreak: "break-all" },
@@ -3507,7 +4062,7 @@ const S: Record<string, React.CSSProperties> = {
   docMetaCol: { display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 3, flexShrink: 0, textAlign: "right" },
   docWhen: { fontSize: 12, color: "#e5e7eb", fontWeight: 600 },
   docSize: { fontSize: 11, color: "#64748b" },
-  docToggle: { fontSize: 11, fontWeight: 700, color: "#f9a8d4", marginTop: 2 },
+  docToggle: { fontSize: 11, fontWeight: 700, color: "#fdba74", marginTop: 2 },
   docBody: { borderTop: "1px solid rgba(148,163,184,.12)", padding: "6px 16px 16px", background: "rgba(7,11,22,.5)", maxHeight: 520, overflowY: "auto" },
 
   // Minimal Markdown renderer (dev-docs viewer)
@@ -3516,11 +4071,11 @@ const S: Record<string, React.CSSProperties> = {
   mdH2: { fontSize: 16, fontWeight: 700, color: "#f8fafc", margin: "16px 0 8px", lineHeight: 1.3, fontFamily: DISPLAY, letterSpacing: -0.2 },
   mdH3: { fontSize: 14, fontWeight: 700, color: "#e5e7eb", margin: "14px 0 6px", fontFamily: DISPLAY },
   mdP: { margin: "0 0 10px" },
-  mdCodeInline: { fontFamily: MONO, fontSize: 12, color: "#fbcfe8", background: "rgba(236,72,153,.1)", border: "1px solid rgba(236,72,153,.22)", borderRadius: 5, padding: "1px 5px" },
+  mdCodeInline: { fontFamily: MONO, fontSize: 12, color: "#fdba74", background: "rgba(246,130,31,.075)", border: "1px solid rgba(246,130,31,.18)", borderRadius: 4, padding: "1px 5px" },
   mdPre: { margin: "0 0 12px", padding: "11px 13px", background: "rgba(7,11,22,.7)", border: "1px solid rgba(148,163,184,.14)", borderRadius: 9, overflowX: "auto", fontFamily: MONO, fontSize: 12, lineHeight: 1.5, color: "#e5e7eb", whiteSpace: "pre" },
   mdList: { margin: "0 0 12px", paddingLeft: 22 },
   mdLi: { margin: "3px 0" },
-  mdQuote: { margin: "0 0 12px", padding: "6px 14px", borderLeft: "3px solid #ec4899", background: "rgba(236,72,153,.07)", color: "#cbd5e1", borderRadius: "0 8px 8px 0" },
+  mdQuote: { margin: "0 0 12px", padding: "6px 14px", borderLeft: "3px solid #f6821f", background: "rgba(246,130,31,.055)", color: "#cbd5e1", borderRadius: "0 6px 6px 0" },
   mdHr: { border: 0, borderTop: "1px solid rgba(148,163,184,.14)", margin: "16px 0" },
   mdA: { color: "#7dd3fc", textDecoration: "underline" },
   mdTableWrap: { overflowX: "auto", margin: "0 0 12px" },

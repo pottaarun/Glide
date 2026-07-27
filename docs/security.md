@@ -6,17 +6,20 @@ and the threat model's sharp edges.
 
 ## The core guarantee: reads run, writes wait
 
-> **The LLM can only _queue_ changes. A real Cloudflare write happens in exactly
-> one place — the `applyAction` RPC — triggered by a human clicking Apply.**
+> **The LLM can only _queue_ changes. An LLM-proposed Cloudflare write reaches
+> the API only through the server approval path after a human reviews it and
+> clicks Apply.**
 
 - Every "write" tool (`add_domain`, `create_dns_record`, `set_zone_setting`,
   `create_waf_custom_rule`, `cf_write`, `queue_migration_rules`) calls
   `queuePending()` (`src/server.ts:2274`), which only appends a `PendingAction`
   to synced state. None of them touch Cloudflare.
-- `applyAction()` (`src/server.ts:2956`) is the **only** code path that calls a
-  mutating Cloudflare method (`cfRequest(action.method, …)` at
-  `src/server.ts:3001`). Search the codebase: there is no other `POST/PUT/PATCH/
-  DELETE` to the Cloudflare API.
+- `applyAction()` and its private `applyActionInternal()` are the **only** paths
+  that execute an LLM-queued `PendingAction` with
+  `cfRequest(action.method, action.path, …)`. `applyAll()` delegates to the same
+  internal path for an exact reviewed ID set; it is not a second write mechanism.
+- Snapshot restore is a separate, destructive migration operation. It is never an
+  LLM tool and is documented below under [Snapshot restores are human-only](#snapshot-restores-are-human-only).
 - The system prompt reinforces this (`src/system-prompt.ts:43`): the model is
   instructed never to claim a change is "done/live/created" until it's applied.
 
@@ -35,8 +38,8 @@ Implementation (`src/server.ts:723`–754):
 - `deriveAesKey()` — HKDF-SHA-256 with fixed salt `glide:token:salt:v1` and info
   `glide:token:aes-gcm:v1`, producing a 256-bit AES-GCM key.
 - `encryptSecret()` — random 12-byte IV; stored as `base64(iv):base64(ciphertext)`.
-- `decryptSecret()` — reverses it; on failure (corrupt/rotated key) Glide falls
-  back to `CF_API_TOKEN` rather than erroring.
+- `decryptSecret()` — reverses it; on failure (corrupt/rotated key) Glide fails
+  closed, logs only a structured failure classification, and requires re-entry.
 
 Properties:
 
@@ -45,7 +48,10 @@ Properties:
   `tokenLast4` (last 4 chars), and `tokenValid` (last authentication check).
 - Without `GLIDE_TOKEN_KEY`, **GUI token storage is disabled** —
   `setCloudflareToken` refuses and tells the operator to set the key
-  (`src/server.ts:1091`). Only `CF_API_TOKEN` is used in that case.
+  (`src/server.ts`).
+- A room can use only the token encrypted in that room's Durable Object. Glide has
+  no deployment-wide Cloudflare API token fallback, so one room cannot inherit an
+  operator credential by choosing or guessing another room name.
 - `setCloudflareToken` first tries `/user/tokens/verify`, then authenticated
   `/accounts` and `/zones` reads. The fallback matters because the verify endpoint
   is user-scoped and can reject a valid account-scoped token. It stores the token
@@ -53,16 +59,18 @@ Properties:
 - A reconnecting client calls `reverifyToken` once when a stored token is marked
   unverified, allowing old false negatives to self-correct without re-entry.
 
-> **Token resolution order** (`getToken()`, `src/server.ts:1073`): GUI-stored
-> token (decrypted) first, then the `CF_API_TOKEN` secret.
+> **Token resolution** (`getToken()`, `src/server.ts`): decrypt this room's stored
+> token or return no token. Missing/rotated keys and corrupt ciphertext never fall
+> through to another credential.
 
 ## Tokens are kept out of chat and logs
 
 The connection form is the only supported place for a room member to enter a
 Cloudflare API token. The normal chat path has three layers of protection:
 
-- Before sending, the client rejects recognizable `cfat_...` tokens and directs
-  the user to **Connection → Set token** or **Connection → Change**.
+- Before sending, the client rejects recognizable `cfat_...`, `cfut_...`, and
+  `cfk_...` tokens and directs the user to **Connection → Set token** or
+  **Connection → Change**.
 - `sanitizeMessageForPersistence()` replaces matching values with
   `[Cloudflare API token redacted]` before any text part is stored.
 - When a room wakes, `onStart()` applies the same sanitizer to historical messages
@@ -72,8 +80,7 @@ Structured `glideEvent` logs contain identifiers, counts, stages, and outcomes,
 not chat text or token values. `reportClientChatIssue` similarly accepts only a
 delivery classification, message id, and connection epoch.
 
-The recognizer is defense in depth, not a credential-revocation mechanism. It is
-deliberately scoped to Cloudflare API token strings beginning with `cfat_`; a
+The recognizer is defense in depth, not a credential-revocation mechanism. A
 different secret format or an obfuscated value can bypass it. If any secret is
 pasted into chat, browser logs, an issue, or another unintended location, revoke
 and rotate it even if Glide later displays a redacted transcript.
@@ -92,10 +99,10 @@ There is **no per-user authentication**. A room is identified by its URL hash, a
   guessable — only do that for non-sensitive use.
 - The **`/admin#<room>` dashboard** is under the same credential model: it addresses
   the room by the same URL hash, so anyone with the link can also open it. It is
-  **read-only** — it adds no Apply/Reject controls and no new write path (its only
-  mutations are team-guidance edits) — but it does surface the room's full history,
-  queue, onboarding, and migration state in one view. Its editable guidance and
-  docs-index controls do not write Cloudflare account configuration. Treat the
+  read-only for Cloudflare configuration: it adds no Apply/Reject controls or API
+  write path, though team guidance is editable. It surfaces the transcript,
+  capped recent outcomes, queue, onboarding, and migration state in one view. It
+  has no deployment-wide docs-index controls. Treat the
   `/admin` link with the same care as the room link.
 
 **Implication:** share room links only with people you trust to apply changes to
@@ -104,6 +111,9 @@ your Cloudflare account. If you need stronger isolation, put the Worker behind
 
 ## Defense-in-depth around Apply
 
+- **Review before controls.** Each approval card presents the method, product,
+  summary, path, request body, and any prior error before Apply/Reject. The user
+  reviews the actual queued request rather than approving a model sentence alone.
 - **Pre-mutation zone snapshot.** Before applying an action that targets a zone,
   `applyAction` captures a best-effort snapshot of key zone settings + rulesets
   (`snapshotZone()`, `src/cf-api.ts:252`) into the `glide_snapshots` table as a
@@ -114,12 +124,24 @@ your Cloudflare account. If you need stronger isolation, put the Worker behind
   after the action was queued. If that safety read fails, Apply refuses the write
   and retains the action; it never replaces the phase from an empty baseline.
 - **Apply lifecycle and resource fencing.** The server marks an action `applying`
-  before external I/O, rejects duplicate Apply calls, and serializes actions that
-  target the same phase-replacing ruleset resource. A watchdog converts an
-  interrupted attempt into an uncertain result that requires verification.
+  before external I/O and rejects duplicate Apply calls. `PUT`, `PATCH`, and
+  `DELETE` requests to the same canonical path share a lock even when their
+  methods differ; ruleset entrypoints use a zone/phase key, and zone creation uses
+  an account/domain key. A watchdog converts an interrupted attempt into an
+  uncertain result that requires verification.
 - **No blind write retries.** `cfRequest()` does not automatically retry
   non-idempotent writes. Network and 5xx failures may have reached Cloudflare, so
-  the UI requires explicit confirmation before retrying an uncertain outcome.
+  the UI requires explicit confirmation before retrying an uncertain outcome,
+  and the server rejects that individual retry unless the confirmation flag is
+  present.
+- **Bulk approval is an immutable reviewed snapshot.** The client confirms and
+  sends the exact visible action IDs. The server applies only their intersection
+  with the current safe queue, so newly queued work is never swept in. Applying,
+  stale-interrupted, and uncertain actions are excluded from bulk apply.
+- **Zone creation is deduplicated and specialized.** `add_domain` performs an
+  exact account-filtered existence check and central queue deduplication by
+  account plus normalized domain. `cf_write` refuses `POST /zones`, so a model
+  cannot bypass these checks with the generic builder.
 - **Server-owned synced state.** `validateStateChange()` rejects direct browser
   state writes. Clients can propose/apply changes only through the callable RPCs;
   `applyAction` also runtime-validates persisted action method/path fields.
@@ -128,7 +150,9 @@ your Cloudflare account. If you need stronger isolation, put the Worker behind
   (`resolveActor()`, `src/server.ts:1773`).
 - **Friendly permission errors.** A failed write returns the exact token
   permission to add (`permissionHint()`, `src/cf-api.ts:59`), so operators grant
-  least privilege rather than over-scoping.
+  least privilege rather than over-scoping. New-zone creation specifically
+  requires Zone > Zone > Edit over All zones/domains; Account API Tokens need a
+  separate zone/domain-scoped policy rather than an Entire Account policy.
 - **Visible, retryable failures.** Failed actions remain in Pending approvals with
   their error. A durable scheduled chat event informs Glide of Apply/Reject
   outcomes, so the conversation does not keep waiting on a completed decision.
@@ -149,17 +173,24 @@ Access challenge.
 
 The Cloudflare-docs indexer (`src/docs-scraper.ts`) fetches the **public**
 developer documentation, embeds it, and writes vectors to a **shared** Vectorize
-namespace (`__cfdocs__`). It contains no account data, no tokens, and nothing
+namespace (`__cfdocs_v2__`). It contains no account data, no tokens, and nothing
 room-specific — reindexing and retrieval never touch your Cloudflare account. The
-job is admin-triggered (or the weekly cron) and, like everything else, cannot make
-a change to your account: it has no write path to the Cloudflare API.
+job is owned by one fixed system Durable Object and triggered only by the weekly
+cron. Room clients cannot start, cancel, or clear this deployment-wide resource.
+Each rebuild removes the prior canonical run's known vectors before indexing, so
+removed pages and shorter pages do not leave stale chunks. The versioned `v2`
+namespace also prevents vectors created by the earlier room-controlled indexer
+from being queried. The job has no write path to your Cloudflare account.
 
 ## Snapshot restores are human-only
 
 `restoreSnapshot` reverts a zone to a captured snapshot, **removing changes made
 since**. It is never an LLM tool and never automated: the UI requires an explicit
 `window.confirm` (`src/client/main.tsx:1024`) before calling the RPC. The outcome
-is recorded in `recentResults`.
+is recorded in `recentResults`. The client supplies only the snapshot id; the
+server takes the account and zone from the stored snapshot, requires the active
+room account to match, and verifies that the room token can read that exact live
+zone before invoking the destructive restore.
 
 ## Input-size & resource limits
 
@@ -171,7 +202,8 @@ These limits bound resource use and protect the model's context window:
 | Read payload echoed to the model | ~6 000 chars | `MAX_READ_CHARS`, `src/server.ts:109` |
 | Synced action-result history | 25 | `MAX_RECENT_RESULTS`, `src/server.ts:107` |
 | Migration-plan rules in synced state | 300 | `MAX_PLAN_RULES`, `src/server.ts:113` |
-| URL-fetched config size | 2 000 000 bytes | `MAX_CONFIG_BYTES`, `src/migration.ts:21` |
+| Inline, uploaded, or URL-fetched config size | 2 000 000 UTF-8 bytes total | `MAX_CONFIG_BYTES`, `src/migration.ts` |
+| Uploaded config file count | 50 | `MAX_CONFIG_FILES`, `src/migration.ts` |
 | API GET retries / write retries | 3 / 0 | `cfRequest`, `src/cf-api.ts` |
 | `cfGetAll` page cap | 50 pages × 50 | `src/cf-api.ts:190` |
 
@@ -180,14 +212,17 @@ These limits bound resource use and protect the model's context window:
 | Concern | Mitigation | Residual risk |
 | --- | --- | --- |
 | LLM makes an unwanted change | Writes only queue; a human must Apply | A human can Apply a bad proposal — review the diff/body on the action card. |
+| Queue changes during bulk review | Client sends exact reviewed IDs; server intersects them with the current safe queue | A reviewed action can still become invalid before Cloudflare receives it; API errors remain visible and retryable. |
+| Lost or malformed write response causes a duplicate retry | No automatic write retry; network, 5xx, and malformed 2xx write outcomes are uncertain, excluded from bulk, and require explicit individual confirmation | The operator must inspect live state correctly before confirming Retry anyway. |
+| Duplicate zone proposal | Exact existing-zone lookup, central account/domain queue dedupe, and `cf_write` block for `POST /zones` | A token without read access cannot prove whether a zone exists; use correct Zone Read scope before queueing. |
 | Token theft from storage | AES-256-GCM at rest, key in a Worker secret; never synced/logged/returned | Anyone with both the DO storage **and** `GLIDE_TOKEN_KEY` could decrypt. |
-| Token pasted into chat | Client blocks recognizable `cfat_...` values; server redacts new and historical persisted text | Other secret formats or obfuscation can bypass pattern matching; revoke any exposed credential. |
+| Token pasted into chat | Client blocks recognizable `cfat_...`, `cfut_...`, and `cfk_...` values; server redacts new and historical persisted text | Other secret formats or obfuscation can bypass pattern matching; revoke any exposed credential. |
 | Sensitive text exposed through diagnostics | Structured chat events omit message text and token values | Platform-generated exception metadata may still need normal operator access controls and retention review. |
 | Unauthorized room access | 128-bit unguessable default room id | The link is the credential; sharing it grants Apply rights. Use custom names only for non-sensitive rooms, or front with Access. |
 | Dropping existing ruleset rules on Apply | Re-read + merge at apply time; pre-apply snapshot | Concurrent changes after the final read remain possible; review the result and snapshot. If the safety read fails, Glide refuses the write. |
 | A message appears sent during a disconnect | Send-time socket validation and server-authoritative transcript check | Delivery can be temporarily unconfirmed while both WebSocket and verification fetch are unavailable; wait for **live** before retrying. |
 | Migration tool causing writes | Only read-only endpoints are called; `/api/migrations/start` is never used | Trust boundary is the migration tool you connect. |
-| Destructive restore | Human-only, explicit confirm; never an LLM tool | A human can still confirm a destructive restore. |
+| Destructive restore | Human-only, explicit confirm, snapshot-recorded target, and live account/zone authorization; never an LLM tool | A human can still confirm a destructive restore for a zone their room token controls. |
 
 ## Operator recommendations
 
@@ -195,6 +230,8 @@ These limits bound resource use and protect the model's context window:
   GUI tokens are encrypted; rotate it by re-entering tokens if needed.
 - Scope the Cloudflare API token to **only** the permissions the team needs (see
   the table in [Setup](./setup.md#cloudflare-api-token-permissions)).
+- For new-zone creation, use the documented All zones/domains resource policy;
+  do not broaden unrelated account permissions to solve a `POST /zones` failure.
 - Enter tokens only in the Connection form. If one is exposed in chat or anywhere
   else, revoke and rotate it; redaction does not make the old value safe again.
 - Keep default (random) room ids for any room with a real token; share links only

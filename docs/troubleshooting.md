@@ -14,6 +14,10 @@ privacy-safe events Glide emits in production. For implementation detail, see
 | User message remains but no assistant reply appears | Wait for **live**, then click **Retry response**. This continues the persisted turn without adding a duplicate user message. |
 | Thinking indicator stops progressing | Click **Stop**. After 20 seconds without progress, Glide also unlocks the composer. |
 | Token says **unverified** | Open **Connection → Change**, verify its account/resource scope, and replace it if account and zone reads both fail. |
+| Add domain produced no approval | Check whether Glide found the zone already or returned an existing pending/failed approval. If it exists, review DNS instead of creating it again. |
+| `POST /zones` says permission denied | Add Zone > Zone > Edit in an **All zones/domains** resource policy. For Account API Tokens, this must be a separate zone/domain-scoped policy, not Entire Account. |
+| **Apply reviewed changes** skipped work | Refresh the queue. New, applying, stale-interrupted, or uncertain actions are deliberately excluded from the reviewed bulk snapshot. |
+| Action says **outcome uncertain** | Inspect the live Cloudflare resource first, then use the individual **Retry anyway** control only if the change is absent. |
 | A token was pasted outside the Connection form | Revoke and rotate it immediately, even if the transcript now shows a redaction marker. |
 
 ## Connection state
@@ -74,8 +78,44 @@ every product or resource. If one operation fails, use its permission hint and
 confirm that the token's account/zone resource scope includes the target.
 
 Enter tokens only under **Connection**. The chat client blocks recognizable
-`cfat_...` strings, and the server redacts matching values before persistence and
-when old rooms wake. Redaction is not revocation: rotate any exposed credential.
+`cfat_...`, `cfut_...`, and `cfk_...` strings, and the server redacts matching
+values before persistence and when old rooms wake. Redaction is not revocation:
+rotate any exposed credential.
+
+## Approvals and zone creation
+
+### Add domain did not queue
+
+`add_domain` intentionally returns without creating a new card in these cases:
+
+- The exact domain already exists in the resolved Cloudflare account. Glide saves
+  it as the room default; continue with DNS-record review.
+- A matching Add domain action is already pending, applying, or retained after a
+  failure. Use the existing card and its displayed pending id.
+- The account cannot be resolved safely, the selected legacy zone cannot be
+  verified, or the duplicate lookup fails. Fix the target/token instead of
+  asking Glide to queue blindly.
+
+If a genuinely new domain fails at Apply with a permission error, do not look for
+an internal `com.cloudflare.api.account.zone.create` permission. For an Account
+API Token, add a separate policy scoped to **All zones/domains** and grant **DNS &
+Zones > Zone > Edit**. For a user API token, use **Zone > Zone > Edit** with Zone
+Resources set to **All zones**. A domain that does not exist yet cannot be selected
+as a specific-zone resource.
+
+### Apply and Retry behavior
+
+**Apply reviewed changes** is snapshot-based. The browser sends only the IDs shown
+when you confirmed; the server never adds newly queued actions. It also excludes
+an action if another teammate started it, its prior attempt became stale, or its
+outcome is uncertain. Refresh and review again when the UI reports that the queue
+changed.
+
+An uncertain outcome means Cloudflare may have committed the write even though
+Glide did not receive a definitive response. Bulk apply never retries it. Inspect
+the live zone/account configuration first. If the requested state is absent, use
+the individual **Retry anyway** button and confirm the warning; otherwise reject
+or leave the historical result without sending a duplicate write.
 
 ## Structured chat events
 

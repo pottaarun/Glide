@@ -7,6 +7,8 @@
  * (never throws on API errors) so the LLM tools can surface friendly messages.
  */
 
+import { canonicalizeApiPath, canonicalizeDomainName } from "./api-path.ts";
+
 const CF_API_BASE = "https://api.cloudflare.com/client/v4";
 
 const PERMISSION_CF_CODES = new Set([9109, 10000]);
@@ -58,7 +60,12 @@ const PERMISSION_MAP: Array<[string, string]> = [
   ["/workers/scripts", "Workers Scripts — Edit (Account)"],
 ];
 
-export function permissionHint(path: string): string | undefined {
+export function permissionHint(path: string, method = "GET"): string | undefined {
+  if (path === "/zones") {
+    return method.toUpperCase() === "GET"
+      ? "Zone > Zone > Read, scoped to the target zones"
+      : "Zone > Zone > Edit, scoped to All zones/domains (Account API Tokens need a zone/domain-scoped policy; this permission is not shown under Entire Account)";
+  }
   for (const [pattern, rec] of PERMISSION_MAP) {
     if (path.includes(pattern)) return rec;
   }
@@ -91,6 +98,13 @@ interface CfEnvelope<T> {
   result_info?: Record<string, unknown>;
 }
 
+function isCfEnvelope<T>(value: unknown): value is CfEnvelope<T> {
+  if (!value || typeof value !== "object" || typeof (value as { success?: unknown }).success !== "boolean") {
+    return false;
+  }
+  return !(value as { success: boolean }).success || "result" in value;
+}
+
 /**
  * Core request with retry/backoff. `path` is relative to the CF API base.
  */
@@ -105,8 +119,17 @@ export async function cfRequest<T = unknown>(
       ok: false,
       status: 0,
       category: "auth",
-      message:
-        "No Cloudflare API token is configured. Add one in Connection > Set token, or configure the CF_API_TOKEN Worker secret.",
+      message: "No Cloudflare API token is configured. Add one in Connection > Set token.",
+    };
+  }
+
+  const canonicalPath = canonicalizeApiPath(path);
+  if (!canonicalPath) {
+    return {
+      ok: false,
+      status: 400,
+      category: "validation",
+      message: "Invalid Cloudflare API path.",
     };
   }
 
@@ -127,7 +150,7 @@ export async function cfRequest<T = unknown>(
       if (body !== undefined && method.toUpperCase() !== "GET") {
         init.body = JSON.stringify(body);
       }
-      const resp = await fetch(`${CF_API_BASE}${path}`, init);
+      const resp = await fetch(`${CF_API_BASE}${canonicalPath}`, init);
       const status = resp.status;
 
       // Retry only on transient/rate-limit statuses (and only while attempts remain)
@@ -135,15 +158,25 @@ export async function cfRequest<T = unknown>(
         continue;
       }
 
-      let data: CfEnvelope<T> | null = null;
+      let rawData: unknown = null;
       try {
-        data = (await resp.json()) as CfEnvelope<T>;
+        rawData = await resp.json();
       } catch {
         // Non-JSON response
       }
+      const data = isCfEnvelope<T>(rawData) ? rawData : null;
 
       if (resp.ok && data?.success) {
         return { ok: true, result: data.result, resultInfo: data.result_info };
+      }
+
+      if (resp.ok && !data) {
+        return {
+          ok: false,
+          status,
+          category: isGet ? "unknown" : "transient",
+          message: `Cloudflare returned HTTP ${status} without a valid API response envelope.`,
+        };
       }
 
       const cfErrors = data?.errors ?? [];
@@ -157,7 +190,7 @@ export async function cfRequest<T = unknown>(
         status,
         category,
         message: detail,
-        hint: category === "permission" ? permissionHint(path) : undefined,
+        hint: category === "permission" ? permissionHint(canonicalPath, method) : undefined,
         cfErrors,
       };
     } catch (err) {
@@ -235,18 +268,43 @@ export async function verifyToken(token: string): Promise<TokenStatus> {
 export interface AccountSummary { id: string; name: string }
 export interface ZoneSummary { id: string; name: string; status: string; account?: { id: string; name: string } }
 
+/** Pick a zone-creation account without letting an unproven legacy zone fall through to a stale default. */
+export function resolveTargetAccountId(input: {
+  explicitAccountId?: string;
+  selectedZoneMatches: boolean;
+  selectedZoneAccountId?: string;
+  defaultAccountId?: string;
+}): string | undefined {
+  const explicit = input.explicitAccountId?.trim();
+  if (explicit) return explicit;
+  if (input.selectedZoneMatches) return input.selectedZoneAccountId?.trim() || undefined;
+  return input.defaultAccountId?.trim() || undefined;
+}
+
 export const listAccounts = (token: string) =>
   cfGetAll<AccountSummary>("/accounts", token);
 
 export const listZones = (token: string, accountId?: string) =>
   cfGetAll<ZoneSummary>(accountId ? `/zones?account.id=${accountId}` : "/zones", token);
 
-export async function findZoneByName(token: string, name: string): Promise<CfResult<ZoneSummary>> {
-  const res = await cfGet<ZoneSummary[]>(`/zones?name=${encodeURIComponent(name)}`, token);
+export async function findZoneByName(
+  token: string,
+  name: string,
+  accountId?: string,
+): Promise<CfResult<ZoneSummary>> {
+  const domain = canonicalizeDomainName(name);
+  if (!domain) {
+    return { ok: false, status: 400, category: "validation", message: `"${name}" is not a valid bare domain.` };
+  }
+  const accountFilter = accountId ? `&account.id=${encodeURIComponent(accountId)}` : "";
+  const res = await cfGet<ZoneSummary[]>(
+    `/zones?name=${encodeURIComponent(domain)}${accountFilter}`,
+    token,
+  );
   if (!res.ok) return res;
   const zone = res.result?.[0];
   if (!zone) {
-    return { ok: false, status: 404, category: "not_found", message: `No zone named "${name}" found on this token.` };
+    return { ok: false, status: 404, category: "not_found", message: `No zone named "${domain}" found on this token.` };
   }
   return { ok: true, result: zone };
 }

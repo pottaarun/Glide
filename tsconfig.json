@@ -4,6 +4,7 @@
     "module": "ESNext",
     "moduleResolution": "Bundler",
     "allowArbitraryExtensions": true,
+    "allowImportingTsExtensions": true,
     "lib": ["ES2023", "DOM", "DOM.Iterable", "WebWorker"],
     "jsx": "react-jsx",
     "types": ["@cloudflare/workers-types"],

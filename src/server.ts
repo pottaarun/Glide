@@ -9,11 +9,11 @@
  * every CHANGE tool only QUEUES a {@link PendingAction}. The real Cloudflare API
  * write happens only when a human clicks Apply (the `applyAction` RPC below).
  *
- * The Cloudflare API token can be provided two ways:
- *   1. In the GUI — stored AES-256-GCM **encrypted at rest** in this DO's SQLite,
- *      keyed off the Worker-held `GLIDE_TOKEN_KEY` secret. Never synced, logged,
- *      or returned; only a masked last-4 is exposed for status.
- *   2. The `CF_API_TOKEN` Worker secret (fallback).
+ * The Cloudflare API token is entered in the GUI and stored AES-256-GCM
+ * **encrypted at rest** in this DO's SQLite, keyed off the Worker-held
+ * `GLIDE_TOKEN_KEY` secret. It is never synced, logged, or returned; only a
+ * masked last-4 is exposed for status. There is deliberately no deployment-wide
+ * token fallback: a room can use only the credential stored in that room.
  */
 
 import { AIChatAgent } from "@cloudflare/ai-chat";
@@ -26,12 +26,14 @@ import {
   streamText,
   tool,
   type StreamTextOnFinishCallback,
+  type ToolCallRepairFunction,
   type ToolSet,
   type UIMessage,
 } from "ai";
 import { createWorkersAI } from "workers-ai-provider";
 import { z } from "zod";
 
+import { canonicalizeApiPath, canonicalizeDomainName } from "./api-path";
 import {
   cfGet,
   cfGetAll,
@@ -39,14 +41,17 @@ import {
   findZoneByName,
   listAccounts,
   listZones,
+  resolveTargetAccountId,
   snapshotZone,
   verifyToken,
   type AccountSummary,
   type ZoneSummary,
 } from "./cf-api";
 import {
+  EMPTY_BUSINESS_PROFILE,
   INITIAL_GLIDE_STATE,
   type ActionResult,
+  type BusinessProfile,
   type DocChunk,
   type DocsIndexState,
   type GlideMessageMetadata,
@@ -66,8 +71,16 @@ import {
   type WriteMethod,
 } from "./shared";
 import {
+  formatRecommendationsForModel,
+  industryLabel,
+  recommendConfigurations,
+  recommendationToPending,
+} from "./recommendations";
+import {
   buildConfigData,
   captureZoneSnapshot,
+  configFilesSizeError,
+  configSizeError,
   diffReport,
   exportMigrationCsv,
   fetchConfigFromUrl,
@@ -75,25 +88,37 @@ import {
   getZoneSnapshot,
   listMigrationProviders,
   listZoneSnapshots,
+  MAX_CONFIG_FILES,
   migrationConfigured,
   preflightPermissions,
   previewProviderMigration,
+  resolveSnapshotTarget,
   restoreZoneSnapshot,
   validateConfig,
   type MigrationConfigFormat,
   type MigrationTransport,
 } from "./migration";
 import { buildSystemPrompt } from "./system-prompt";
-import { claimsNewQueuedAction, promisesToolAction, queueClaimCorrection } from "./chat-integrity";
+import {
+  claimsNewQueuedAction,
+  promisesToolAction,
+  queueClaimCorrection,
+  repairOnboardingToolInput,
+} from "./chat-integrity";
 import { redactCloudflareApiTokens } from "./chat-delivery";
 import {
   APPLY_ATTEMPT_STALE_MS,
+  actionResourceKey,
   formatActionResultEvent,
   isActionApplying,
+  isActionOutcomeUncertain,
   markActionApplying,
   markActionFailed,
   pendingActionStatus,
   recoverStaleActionAttempts,
+  rulesetEntrypointIdentity,
+  selectBulkApplyIds,
+  zoneCreationIdentity,
 } from "./action-lifecycle";
 import {
   GUIDANCE_TOP_K,
@@ -107,7 +132,7 @@ import {
 import {
   DOCS_ROOT_INDEX,
   DOCS_TOP_K,
-  deleteDocPage,
+  deleteDocPages,
   fetchDocText,
   indexDocPage,
   parseProductIndex,
@@ -115,7 +140,7 @@ import {
   retrieveDocChunks,
 } from "./docs-scraper";
 
-/** Keep this many finished results in synced state (full history lives in SQLite later). */
+/** Keep this many finished results in synced state. */
 const MAX_RECENT_RESULTS = 25;
 /** Cap raw read payloads echoed back to the model so a huge list can't blow the context. */
 const MAX_READ_CHARS = 6_000;
@@ -145,11 +170,15 @@ const DOCS_TICK_DELAY_SEC = 2;
 const DOCS_PAGE_PENDING = 0;
 const DOCS_PAGE_DONE = 1;
 const DOCS_PAGE_FAILED = 2;
+/** Retry transient product-index failures before declaring the refresh incomplete. */
+const DOCS_PRODUCT_ATTEMPTS = 3;
+/** Avoid repeatedly fetching the root index when first-use bootstrap hits an outage. */
+const DOCS_BOOTSTRAP_RETRY_MS = 15 * 60 * 1_000;
 /**
  * Stable, well-known DO name that drives the weekly docs-refresh cron. Using one
- * fixed instance keeps the crawl bookkeeping (work queue + progress) in a single
- * place that never collides with a real room; deterministic vector ids
- * (docs-scraper.ts) keep it idempotent even if a room reindexes concurrently.
+ * fixed instance keeps the crawl bookkeeping and global lock in a single place
+ * that never collides with a real room. Reindex controls are not callable from
+ * room clients; only Worker cron/bootstrap code invokes this instance directly.
  */
 const DOCS_SYSTEM_ROOM = "__system__";
 /** Cloudflare rate-limiting periods (seconds) we snap a parsed period to. */
@@ -171,25 +200,20 @@ function pendingActionValidationError(action: PendingAction): string | undefined
     return "Invalid action summary.";
   }
   if (!WRITE_METHODS.has(action.method)) return "Invalid write method.";
-  if (
-    typeof action.path !== "string" ||
-    !action.path.startsWith("/") ||
-    action.path.length > 2_000 ||
-    action.path.includes("://") ||
-    /[\r\n\0]/.test(action.path)
-  ) {
+  const canonicalPath = typeof action.path === "string" ? canonicalizeApiPath(action.path) : undefined;
+  if (!canonicalPath || canonicalPath !== action.path || action.path.length > 2_000) {
     return "Invalid Cloudflare API path.";
   }
-  return undefined;
-}
-
-/** Resource-level fence for read/merge/write operations that must not interleave. */
-function actionResourceKey(action: PendingAction): string | undefined {
-  if (action.mergeEntrypoint && action.zoneId) {
-    return `ruleset-entrypoint:${action.zoneId}:${action.mergeEntrypoint.phase}`;
-  }
-  if (action.method === "PUT" || action.method === "PATCH" || action.method === "DELETE") {
-    return `${action.method}:${action.path}`;
+  if (action.mergeEntrypoint) {
+    const target = rulesetEntrypointIdentity(action.path);
+    if (
+      !action.zoneId ||
+      !target ||
+      target.zoneId !== action.zoneId ||
+      target.phase !== action.mergeEntrypoint.phase
+    ) {
+      return "Ruleset merge metadata does not match the API path.";
+    }
   }
   return undefined;
 }
@@ -350,6 +374,102 @@ function inferOnboardingFromText(text: string): {
     const d = m[1].toLowerCase();
     if (!/(?:^|\.)cloudflare\.com$/.test(d)) out.domain = d;
   }
+
+  return out;
+}
+
+/**
+ * Deterministically recover "nature of the business" answers from a user's chat
+ * message, mirroring {@link inferOnboardingFromText}. The chat model often calls
+ * `update_business_profile` with empty arguments, so this backfill keeps the
+ * room's {@link BusinessProfile} — and therefore the recommendations — populated
+ * regardless of how the model formats its tool call.
+ *
+ * Conservative: it reports only high-confidence signals and NEVER sets a boolean
+ * to `false` (absence of a keyword is not a "no"), so callers only fill blanks
+ * and can't overwrite an explicit answer.
+ */
+function inferBusinessProfileFromText(text: string): Partial<BusinessProfile> {
+  const out: Partial<BusinessProfile> = {};
+  const t = ` ${text.toLowerCase()} `;
+  if (!t.trim()) return out;
+
+  // Industry / vertical (first match wins for the canonical key).
+  const industry: Array<[string, RegExp]> = [
+    ["ecommerce", /\b(e-?commerce|online store|storefront|shop(?:ping)?|retail|checkout|cart)\b/],
+    ["fintech", /\b(fintech|bank(?:ing)?|payments? company|lending|trading|brokerage|crypto|wallet)\b/],
+    ["healthcare", /\b(health\s?care|healthcare|medical|clinic|hospital|patient|telehealth|pharma)\b/],
+    ["saas", /\b(saas|b2b software|software as a service|dashboard app|platform for)\b/],
+    ["media", /\b(media|publish(?:er|ing)|news|blog|streaming|video platform|content site)\b/],
+    ["gaming", /\b(gaming|game studio|multiplayer|esports)\b/],
+    ["government", /\b(government|public sector|\.gov|municipal|federal agency)\b/],
+    ["education", /\b(education|university|school|\bedu\b|e-?learning|lms)\b/],
+    ["nonprofit", /\b(non-?profit|charity|ngo|foundation)\b/],
+    ["marketing", /\b(marketing site|brand site|landing page|campaign site|agency site)\b/],
+    ["api_platform", /\b(api platform|api-first|developer platform|public api)\b/],
+  ];
+  for (const [key, re] of industry) {
+    if (re.test(t)) {
+      out.industry = key;
+      break;
+    }
+  }
+
+  // App type(s).
+  const appTypes: string[] = [];
+  if (/\b(api|rest api|graphql|endpoints?)\b/.test(t)) appTypes.push("api");
+  if (/\b(mobile app|ios app|android app|mobile backend)\b/.test(t)) appTypes.push("mobile_backend");
+  if (/\b(static site|jamstack|marketing site|landing page|brochure)\b/.test(t)) appTypes.push("static_site");
+  if (/\b(web app|web application|spa|single-page|portal|dashboard)\b/.test(t)) appTypes.push("web_app");
+  if (/\b(user-generated|ugc|forum|community|marketplace|comments)\b/.test(t)) appTypes.push("ugc");
+  if (appTypes.length) out.appTypes = [...new Set(appTypes)];
+
+  // Audience reach.
+  if (/\b(global|worldwide|international|around the world|multi-?region)\b/.test(t)) out.audience = "global";
+  else if (/\b(internal|intranet|employees? only|behind (?:the )?vpn|private app)\b/.test(t)) out.audience = "internal";
+  else if (/\b(regional|local|single (?:country|region)|domestic)\b/.test(t)) out.audience = "regional";
+
+  // Traffic profile.
+  if (/\b(high[-\s]?volume|millions of|huge traffic|massive traffic)\b/.test(t)) out.trafficProfile = "high_volume";
+  else if (/\b(spiky|spikes|flash sale|product launch|bursty|black friday|goes viral)\b/.test(t)) out.trafficProfile = "spiky";
+  else if (/\b(steady|consistent|predictable)\b/.test(t)) out.trafficProfile = "steady";
+  else if (/\b(low traffic|small (?:site|audience)|just launched)\b/.test(t)) out.trafficProfile = "low";
+
+  // Login / API booleans (only ever set to true).
+  if (/\b(log ?in|logins?|sign ?in|sign ?up|authentication|user accounts?|sso)\b/.test(t)) out.hasLogin = true;
+  if (appTypes.includes("api") || /\bapi\b/.test(t)) out.hasApi = true;
+
+  // Sensitive data.
+  const sensitive: string[] = [];
+  if (/\b(credit cards?|card(?:holder)? data|payments?|checkout|pci)\b/.test(t)) sensitive.push("payments");
+  if (/\b(health|phi|medical records?|patient data|hipaa)\b/.test(t)) sensitive.push("health");
+  if (/\b(passwords?|credentials?|logins?)\b/.test(t)) sensitive.push("credentials");
+  if (/\b(pii|personal data|personal information|customer data|user data)\b/.test(t)) sensitive.push("pii");
+  if (/\b(financial data|account balances?|bank details?)\b/.test(t)) sensitive.push("financial");
+  if (sensitive.length) out.sensitiveData = [...new Set(sensitive)];
+
+  // Compliance regimes.
+  const compliance: string[] = [];
+  if (/\bpci(?:[-\s]?dss)?\b/.test(t)) compliance.push("pci_dss");
+  if (/\bhipaa\b/.test(t)) compliance.push("hipaa");
+  if (/\bgdpr\b/.test(t)) compliance.push("gdpr");
+  if (/\bsoc\s?2\b/.test(t)) compliance.push("soc2");
+  if (/\biso\s?27001\b/.test(t)) compliance.push("iso27001");
+  if (/\bfedramp\b/.test(t)) compliance.push("fedramp");
+  if (compliance.length) out.compliance = [...new Set(compliance)];
+
+  // Concerns / threats.
+  const concerns: string[] = [];
+  if (/\b(bots?|automated traffic|scrapers?)\b/.test(t)) concerns.push("bots");
+  if (/\b(ddos|denial of service|flood(?:ing)?)\b/.test(t)) concerns.push("ddos");
+  if (/\bscrap(?:e|ing)\b/.test(t)) concerns.push("scraping");
+  if (/\b(credential stuffing|account takeover|ato|brute[-\s]?force)\b/.test(t)) concerns.push("credential_stuffing");
+  if (/\b(card testing|carding|card fraud)\b/.test(t)) concerns.push("card_testing");
+  if (/\b(fraud|abuse)\b/.test(t)) concerns.push("fraud");
+  if (/\b(latency|slow|speed|performance|page load)\b/.test(t)) concerns.push("latency");
+  if (/\b(downtime|availability|uptime|outages?|reliability)\b/.test(t)) concerns.push("downtime");
+  if (/\b(egress|bandwidth cost|origin cost|hosting cost)\b/.test(t)) concerns.push("cost");
+  if (concerns.length) out.concerns = [...new Set(concerns)];
 
   return out;
 }
@@ -783,12 +903,14 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
   private currentActor = "a teammate";
   /** Server-created approvals in the current chat turn; model prose is checked against this source of truth. */
   private queuedActionsThisTurn: PendingAction[] = [];
+  /** Plaintext exists only in memory and lets persistence scrub this room's legacy unprefixed token exactly. */
+  private tokenForRedaction = "";
 
   protected sanitizeMessageForPersistence(message: UIMessage): UIMessage {
     let changed = false;
     const parts = message.parts.map((part) => {
       if (part.type !== "text") return part;
-      const text = redactCloudflareApiTokens(part.text);
+      const text = redactCloudflareApiTokens(part.text, this.tokenForRedaction);
       if (text === part.text) return part;
       changed = true;
       return { ...part, text };
@@ -841,6 +963,16 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
       status  INTEGER DEFAULT 0,
       chunks  INTEGER DEFAULT 0
     )`;
+    this.sql`CREATE TABLE IF NOT EXISTS glide_docs_previous_pages (
+      url    TEXT PRIMARY KEY,
+      chunks INTEGER DEFAULT 0
+    )`;
+    this.sql`CREATE TABLE IF NOT EXISTS glide_docs_product_attempts (
+      product  TEXT PRIMARY KEY,
+      attempts INTEGER DEFAULT 0
+    )`;
+
+    await this.getToken();
 
     // Tokens pasted into old chat turns predate the persistence sanitizer.
     // Scrub them as each room wakes; this is idempotent and does not touch the
@@ -855,7 +987,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
       this.logChatEvent("chat.secrets_redacted", { messageCount: redactedCount }, "warn");
     }
 
-    const tokenConfigured = this.hasStoredToken() || Boolean(this.env.CF_API_TOKEN);
+    const tokenConfigured = Boolean(await this.getToken());
     const migrationToolConfigured = migrationConfigured(this.migrationTransport());
     const pendingActions = recoverStaleActionAttempts(this.state.pendingActions);
     const recoveredAction = pendingActions.some((action, i) => action !== this.state.pendingActions[i]);
@@ -864,7 +996,13 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
       this.state.migrationToolConfigured !== migrationToolConfigured ||
       recoveredAction
     ) {
-      this.setState({ ...this.state, tokenConfigured, migrationToolConfigured, pendingActions });
+      this.setState({
+        ...this.state,
+        tokenConfigured,
+        migrationToolConfigured,
+        pendingActions,
+        ...(!tokenConfigured ? { tokenLast4: undefined, tokenValid: undefined } : {}),
+      });
     }
   }
 
@@ -945,6 +1083,19 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
       results: this.state.recentResults,
     });
     next.checklist = next.checklist.map((s) => (s.done || auto.has(s.id) ? { ...s, done: true } : s));
+    const unchanged =
+      next.active === ob.active &&
+      next.completed === ob.completed &&
+      next.path === ob.path &&
+      next.domain === ob.domain &&
+      next.setupType === ob.setupType &&
+      next.migratingFrom === ob.migratingFrom &&
+      next.migratingFromLabel === ob.migratingFromLabel &&
+      next.configProvided === ob.configProvided &&
+      next.dnsReviewed === ob.dnsReviewed &&
+      JSON.stringify(next.goals) === JSON.stringify(ob.goals) &&
+      JSON.stringify(next.checklist) === JSON.stringify(ob.checklist);
+    if (unchanged) return ob;
     this.setState({ ...this.state, onboarding: next });
     return next;
   }
@@ -1019,6 +1170,118 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
   async resetOnboarding(_by = "someone"): Promise<{ ok: true }> {
     this.setState({ ...this.state, onboarding: undefined });
     return { ok: true };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Business profile — the "nature of the business" discovery answers that drive
+  // tailored recommendations (see recommendations.ts). Kept at the room level so
+  // the advisor works during onboarding AND on-demand after go-live.
+  // ---------------------------------------------------------------------------
+
+  /** Ensure a business-profile object exists with its arrays initialised. */
+  private ensureBusinessProfile(): BusinessProfile {
+    return this.state.businessProfile ?? { ...EMPTY_BUSINESS_PROFILE };
+  }
+
+  /**
+   * Merge a partial profile into room state (REPLACE semantics: any field present
+   * in `patch` wins; omitted fields are kept; an explicit boolean `false` is
+   * honoured). The industry label is auto-derived. Callers that must not lose
+   * prior array answers (the model tool, the chat backfill) union the arrays
+   * themselves before calling. Capturing a profile changes NOTHING on the account.
+   */
+  private applyBusinessProfilePatch(patch: Partial<BusinessProfile>, by: string): BusinessProfile {
+    const cur = this.ensureBusinessProfile();
+    const next: BusinessProfile = {
+      industry: patch.industry ?? cur.industry,
+      industryLabel: patch.industry ? industryLabel(patch.industry) : cur.industryLabel,
+      appTypes: patch.appTypes ?? cur.appTypes,
+      audience: patch.audience ?? cur.audience,
+      trafficProfile: patch.trafficProfile ?? cur.trafficProfile,
+      hasLogin: patch.hasLogin ?? cur.hasLogin,
+      hasApi: patch.hasApi ?? cur.hasApi,
+      cacheableContent: patch.cacheableContent ?? cur.cacheableContent,
+      sensitiveData: patch.sensitiveData ?? cur.sensitiveData,
+      compliance: patch.compliance ?? cur.compliance,
+      concerns: patch.concerns ?? cur.concerns,
+      notes: patch.notes ?? cur.notes,
+      completed: patch.completed ?? cur.completed,
+      updatedBy: by,
+      ts: Date.now(),
+    };
+    const stable = (b: BusinessProfile) => JSON.stringify({ ...b, updatedBy: "", ts: 0 });
+    if (stable(cur) === stable(next)) return cur;
+    this.setState({ ...this.state, businessProfile: next });
+    return next;
+  }
+
+  /**
+   * UI: merge answers to the "nature of the business" questions into room state.
+   * Array fields replace (the form sends the full current selection); scalars and
+   * booleans overwrite when provided. Mirrors {@link updateOnboarding}.
+   */
+  @callable()
+  async updateBusinessProfile(patch: Partial<BusinessProfile>, by = "someone"): Promise<{ ok: true }> {
+    this.applyBusinessProfilePatch(patch ?? {}, by);
+    return { ok: true };
+  }
+
+  /** UI: clear the captured business profile so discovery can start over. */
+  @callable()
+  async resetBusinessProfile(_by = "someone"): Promise<{ ok: true }> {
+    this.setState({ ...this.state, businessProfile: undefined });
+    return { ok: true };
+  }
+
+  /**
+   * UI: queue a single tailored recommendation (from recommendations.ts) as a
+   * pending action for human Apply — the "Queue" button in the sidebar
+   * Recommendations panel.
+   *
+   * Security: the client sends only the recommendation **id** and the target zone
+   * id. The server recomputes the recommendation set from the room's own trusted
+   * {@link BusinessProfile} and rebuilds the exact API call from its catalog via
+   * {@link recommendationToPending}, so the button can never inject an arbitrary
+   * Cloudflare request. Recommendations that aren't concretely queueable (managed
+   * rules, rate limits, and manual/plan-gated steps) are refused here and must be
+   * set up through chat, where Glide can do the required discovery first.
+   */
+  @callable()
+  async queueRecommendation(
+    recId: string,
+    zoneId: string,
+    by = "someone",
+  ): Promise<{ ok: boolean; message: string; id?: string }> {
+    this.currentActor = by;
+    if (!zoneId || !/^[0-9a-f]{32}$/i.test(zoneId.trim())) {
+      return { ok: false, message: "A valid target zone id is required first — ask Glide to find your zone." };
+    }
+    const set = recommendConfigurations(this.state.businessProfile, {
+      goals: this.state.onboarding?.goals,
+      setupType: this.state.onboarding?.setupType,
+    });
+    const rec = set.recommendations.find((r) => r.id === recId);
+    if (!rec) {
+      return { ok: false, message: "That recommendation no longer applies to this room's business profile." };
+    }
+    const mapped = recommendationToPending(rec, zoneId.trim());
+    if (!mapped) {
+      return {
+        ok: false,
+        message: `"${rec.title}" needs a quick setup — ask Glide in chat and it'll walk you through it before queuing.`,
+      };
+    }
+    const canonical = canonicalizeApiPath(mapped.path);
+    const dup = this.state.pendingActions.find(
+      (p) => p.method === mapped.method && p.path === (canonical ?? mapped.path),
+    );
+    if (dup) return { ok: false, message: `Already queued (pending id: ${dup.id}).`, id: dup.id };
+    const message = this.queuePending(mapped);
+    const created = this.state.pendingActions.find(
+      (p) => p.method === mapped.method && p.path === (canonical ?? mapped.path),
+    );
+    if (!created) return { ok: false, message };
+    return { ok: true, message, id: created.id };
   }
 
   /** UI wizard: run a read-only provider-config preview (parses + stores the plan). */
@@ -1110,39 +1373,43 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
   @callable()
   async restoreSnapshot(
     snapshotId: string,
-    zoneId: string | undefined,
     by = "someone",
   ): Promise<{ ok: boolean; message: string }> {
     this.currentActor = by;
-    return this.doRestore(snapshotId, zoneId, by);
+    return this.doRestore(snapshotId, by);
   }
 
   // ---------------------------------------------------------------------------
   // Token storage (encrypted at rest) — never synced or returned in plaintext.
   // ---------------------------------------------------------------------------
 
-  private hasStoredToken(): boolean {
-    const rows = this.sql<{ name: string }>`
-      SELECT name FROM glide_secrets WHERE name = ${TOKEN_SECRET_NAME}`;
-    return rows.length > 0;
-  }
-
-  /** Resolve the active token: GUI-set (decrypted) first, then the Worker secret. */
+  /** Resolve this room's encrypted token. Decryption failures fail closed. */
   private async getToken(): Promise<string> {
     const key = this.env.GLIDE_TOKEN_KEY;
-    if (key) {
-      const rows = this.sql<{ value: string }>`
-        SELECT value FROM glide_secrets WHERE name = ${TOKEN_SECRET_NAME}`;
-      const packed = rows[0]?.value;
-      if (packed) {
-        try {
-          return await decryptSecret(key, packed);
-        } catch {
-          // Corrupt/rotated key — fall through to the env secret.
-        }
-      }
+    if (!key) {
+      this.tokenForRedaction = "";
+      return "";
     }
-    return this.env.CF_API_TOKEN ?? "";
+    const rows = this.sql<{ value: string }>`
+      SELECT value FROM glide_secrets WHERE name = ${TOKEN_SECRET_NAME}`;
+    const packed = rows[0]?.value;
+    if (!packed) {
+      this.tokenForRedaction = "";
+      return "";
+    }
+    try {
+      const token = await decryptSecret(key, packed);
+      this.tokenForRedaction = token;
+      return token;
+    } catch (err) {
+      this.tokenForRedaction = "";
+      this.logChatEvent(
+        "token.decrypt_failed",
+        { reason: err instanceof Error ? err.name : "unknown" },
+        "error",
+      );
+      return "";
+    }
   }
 
   @callable()
@@ -1163,6 +1430,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     const packed = await encryptSecret(this.env.GLIDE_TOKEN_KEY, token);
     this.sql`INSERT OR REPLACE INTO glide_secrets (name, value, ts)
       VALUES (${TOKEN_SECRET_NAME}, ${packed}, ${Date.now()})`;
+    this.tokenForRedaction = token;
 
     this.setState({
       ...this.state,
@@ -1182,9 +1450,10 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
   @callable()
   async clearCloudflareToken(): Promise<{ ok: true }> {
     this.sql`DELETE FROM glide_secrets WHERE name = ${TOKEN_SECRET_NAME}`;
+    this.tokenForRedaction = "";
     this.setState({
       ...this.state,
-      tokenConfigured: Boolean(this.env.CF_API_TOKEN),
+      tokenConfigured: false,
       tokenLast4: undefined,
       tokenValid: undefined,
     });
@@ -1203,7 +1472,12 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     const token = await this.getToken();
     if (!token) {
       if (this.state.tokenValid !== undefined) {
-        this.setState({ ...this.state, tokenValid: undefined });
+        this.setState({
+          ...this.state,
+          tokenConfigured: false,
+          tokenLast4: undefined,
+          tokenValid: undefined,
+        });
       }
       return { ok: false, valid: false, message: "No Cloudflare API token is configured." };
     }
@@ -1353,16 +1627,15 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
   }
 
   // ---------------------------------------------------------------------------
-  // Cloudflare docs RAG (admin-triggered global reindex + per-message retrieval)
+  // Cloudflare docs RAG (cron-owned global reindex + per-message retrieval)
   //
   // A resumable background job scrapes the FULL Cloudflare developer docs, embeds
   // each page, and upserts them into the SHARED Vectorize index under a GLOBAL
   // namespace (docs-scraper.ts) — so EVERY room's chat retrieves grounding
   // excerpts, not just this one. It runs in bounded batches chained via the
   // Agents SDK scheduler, so it survives client disconnects and DO restarts.
-  // Progress is mirrored into `state.docsIndex` for the /admin dashboard. The job
-  // is global but bookkeeping (the work queue + progress) lives on whichever
-  // room's DO started it; deterministic vector ids make concurrent runs idempotent.
+  // Progress and bookkeeping live only in the fixed DOCS_SYSTEM_ROOM instance.
+  // The browser has no callable controls for this deployment-wide resource.
   // ---------------------------------------------------------------------------
 
   /** Current docs-index progress, defaulted for a room that's never run it. */
@@ -1420,13 +1693,12 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
   }
 
   /**
-   * Start (or restart) a full Cloudflare-docs reindex. Fetches the top-level
+   * Start (or restart) the cron-owned Cloudflare-docs reindex. Fetches the top-level
    * index synchronously so we can report the product total immediately, seeds the
    * work queue, then hands off to `docsTick` via the scheduler. The heavy lifting
    * (per-product enumeration + per-page embed/upsert) happens in the background.
    */
-  @callable()
-  async startDocsReindex(by = "an admin"): Promise<{ ok: boolean; message: string }> {
+  async startDocsReindex(by = "the weekly refresh cron"): Promise<{ ok: boolean; message: string }> {
     if (!hasVectorize(this.env)) {
       return {
         ok: false,
@@ -1435,7 +1707,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     }
     const cur = this.docsState();
     if (cur.status === "enumerating" || cur.status === "indexing") {
-      return { ok: false, message: "A docs reindex is already running — cancel it first to restart." };
+      return { ok: false, message: "A docs reindex is already running." };
     }
 
     const md = await fetchDocText(DOCS_ROOT_INDEX);
@@ -1457,9 +1729,19 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
       return { ok: false, message: "The docs index looked empty — the format may have changed." };
     }
 
-    // Reset the work queue for a clean run.
+    // Preserve the last completed manifest. Deterministic page ids let this run
+    // replace vectors in place while failed pages keep their last-known-good data.
+    const previousManifestCount = Number(
+      this.sql<{ n: number }>`SELECT COUNT(*) AS n FROM glide_docs_previous_pages`[0]?.n ?? 0,
+    );
+    if (previousManifestCount === 0) {
+      this.sql`INSERT OR REPLACE INTO glide_docs_previous_pages (url, chunks)
+        SELECT url, chunks FROM glide_docs_pages WHERE status = ${DOCS_PAGE_DONE}`;
+    }
+
     this.sql`DELETE FROM glide_docs_products`;
     this.sql`DELETE FROM glide_docs_pages`;
+    this.sql`DELETE FROM glide_docs_product_attempts`;
     for (const p of products) {
       this.sql`INSERT OR REPLACE INTO glide_docs_products (product, label, url, category, enumerated)
         VALUES (${p.product}, ${p.label}, ${p.url}, ${p.category}, 0)`;
@@ -1490,11 +1772,80 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     };
   }
 
+  /** Start the first global index on demand so a new deployment need not wait for Sunday. */
+  async ensureDocsIndex(): Promise<{ ok: boolean; message: string }> {
+    const state = this.docsState();
+    if (state.status === "enumerating" || state.status === "indexing" || state.status === "done") {
+      return { ok: true, message: `Docs index is ${state.status}.` };
+    }
+    if (
+      state.status === "error" &&
+      state.updatedAt &&
+      Date.now() - state.updatedAt < DOCS_BOOTSTRAP_RETRY_MS
+    ) {
+      return { ok: false, message: "Docs index bootstrap is waiting before retrying." };
+    }
+    return this.startDocsReindex("the initial deployment bootstrap");
+  }
+
+  /** Commit manifest cleanup only after every product index was enumerated. */
+  private async finishDocsReindex(): Promise<void> {
+    const counts = this.docsCounts();
+    const failedProducts = Number(
+      this.sql<{ n: number }>`SELECT COUNT(*) AS n FROM glide_docs_products WHERE enumerated = -1`[0]?.n ?? 0,
+    );
+    if (failedProducts > 0) {
+      this.setDocsState({
+        status: "error",
+        currentProduct: undefined,
+        productsTotal: counts.productsTotal,
+        productsEnumerated: counts.productsEnumerated,
+        pagesTotal: counts.pagesTotal,
+        pagesIndexed: counts.pagesIndexed,
+        pagesFailed: counts.pagesFailed,
+        chunksUpserted: counts.chunksUpserted,
+        error: `${failedProducts} product index${failedProducts === 1 ? "" : "es"} could not be enumerated; last-known-good vectors were retained.`,
+        finishedAt: Date.now(),
+      });
+      return;
+    }
+
+    const currentUrls = new Set(this.sql<{ url: string }>`SELECT url FROM glide_docs_pages`.map((row) => row.url));
+    const previousPages = this.sql<{ url: string; chunks: number }>`
+      SELECT url, chunks FROM glide_docs_previous_pages`;
+    const removedPages = previousPages.filter((page) => !currentUrls.has(page.url));
+    const cleanup = await deleteDocPages(this.env, removedPages);
+    if (!cleanup.ok) {
+      this.setDocsState({
+        status: "error",
+        currentProduct: undefined,
+        error: "The replacement crawl completed, but removed-page cleanup failed; existing vectors were retained.",
+        finishedAt: Date.now(),
+      });
+      return;
+    }
+    for (const page of removedPages) {
+      this.sql`DELETE FROM glide_docs_previous_pages WHERE url = ${page.url}`;
+    }
+    this.setDocsState({
+      status: "done",
+      currentProduct: undefined,
+      productsTotal: counts.productsTotal,
+      productsEnumerated: counts.productsEnumerated,
+      pagesTotal: counts.pagesTotal,
+      pagesIndexed: counts.pagesIndexed,
+      pagesFailed: counts.pagesFailed,
+      chunksUpserted: counts.chunksUpserted,
+      error: undefined,
+      finishedAt: Date.now(),
+    });
+  }
+
   /**
    * One bounded unit of reindex work, invoked by the scheduler and re-armed by
    * itself until the queue drains. Phase 1 enumerates one product's page list;
    * phase 2 embeds+upserts a batch of pending pages. Stale ticks (from a
-   * cancelled/superseded run — matched on `runId`) return without rescheduling,
+   * superseded run — matched on `runId`) return without rescheduling,
    * which cleanly kills the chain. Per-page failures are recorded, not fatal.
    */
   async docsTick(payload?: { runId?: string }): Promise<void> {
@@ -1508,13 +1859,26 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
         SELECT product, label, url FROM glide_docs_products WHERE enumerated = 0 LIMIT 1`[0];
       if (prod) {
         const md = await fetchDocText(prod.url);
-        if (md != null) {
-          for (const pg of parseProductIndex(md)) {
+        const pages = md == null ? [] : parseProductIndex(md);
+        if (pages.length) {
+          for (const pg of pages) {
             this.sql`INSERT OR IGNORE INTO glide_docs_pages (url, product, title, section, status, chunks)
               VALUES (${pg.url}, ${prod.label}, ${pg.title}, ${pg.section}, ${DOCS_PAGE_PENDING}, 0)`;
           }
+          this.sql`UPDATE glide_docs_products SET enumerated = 1 WHERE product = ${prod.product}`;
+          this.sql`DELETE FROM glide_docs_product_attempts WHERE product = ${prod.product}`;
+        } else {
+          const attempts =
+            Number(
+              this.sql<{ attempts: number }>`SELECT attempts FROM glide_docs_product_attempts
+                WHERE product = ${prod.product}`[0]?.attempts ?? 0,
+            ) + 1;
+          this.sql`INSERT OR REPLACE INTO glide_docs_product_attempts (product, attempts)
+            VALUES (${prod.product}, ${attempts})`;
+          if (attempts >= DOCS_PRODUCT_ATTEMPTS) {
+            this.sql`UPDATE glide_docs_products SET enumerated = -1 WHERE product = ${prod.product}`;
+          }
         }
-        this.sql`UPDATE glide_docs_products SET enumerated = 1 WHERE product = ${prod.product}`;
         const c = this.docsCounts();
         this.setDocsState({
           status: "enumerating",
@@ -1542,40 +1906,35 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
           );
           if (res.ok) {
             this.sql`UPDATE glide_docs_pages SET status = ${DOCS_PAGE_DONE}, chunks = ${res.chunks} WHERE url = ${row.url}`;
+            const retainedChunks = res.retainedChunks ?? res.chunks;
+            this.sql`INSERT OR REPLACE INTO glide_docs_previous_pages (url, chunks)
+              VALUES (${row.url}, ${retainedChunks})`;
           } else {
             this.sql`UPDATE glide_docs_pages SET status = ${DOCS_PAGE_FAILED} WHERE url = ${row.url}`;
           }
         }
         const c = this.docsCounts();
         const done = c.pagesPending === 0;
-        this.setDocsState({
-          status: done ? "done" : "indexing",
-          currentProduct: pageRows[pageRows.length - 1]?.product,
-          productsTotal: c.productsTotal,
-          productsEnumerated: c.productsEnumerated,
-          pagesTotal: c.pagesTotal,
-          pagesIndexed: c.pagesIndexed,
-          pagesFailed: c.pagesFailed,
-          chunksUpserted: c.chunksUpserted,
-          ...(done ? { finishedAt: Date.now(), currentProduct: undefined } : {}),
-        });
-        if (!done) await this.schedule(DOCS_TICK_DELAY_SEC, "docsTick", { runId: payload.runId });
+        if (done) {
+          await this.finishDocsReindex();
+        } else {
+          this.setDocsState({
+            status: "indexing",
+            currentProduct: pageRows[pageRows.length - 1]?.product,
+            productsTotal: c.productsTotal,
+            productsEnumerated: c.productsEnumerated,
+            pagesTotal: c.pagesTotal,
+            pagesIndexed: c.pagesIndexed,
+            pagesFailed: c.pagesFailed,
+            chunksUpserted: c.chunksUpserted,
+          });
+          await this.schedule(DOCS_TICK_DELAY_SEC, "docsTick", { runId: payload.runId });
+        }
         return;
       }
 
       // All products enumerated and no pending pages → done.
-      const c = this.docsCounts();
-      this.setDocsState({
-        status: "done",
-        currentProduct: undefined,
-        productsTotal: c.productsTotal,
-        productsEnumerated: c.productsEnumerated,
-        pagesTotal: c.pagesTotal,
-        pagesIndexed: c.pagesIndexed,
-        pagesFailed: c.pagesFailed,
-        chunksUpserted: c.chunksUpserted,
-        finishedAt: Date.now(),
-      });
+      await this.finishDocsReindex();
     } catch (err) {
       this.setDocsState({
         status: "error",
@@ -1583,66 +1942,6 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
         finishedAt: Date.now(),
       });
     }
-  }
-
-  /**
-   * Cancel a running reindex. We flip status to "cancelled" and clear the runId;
-   * the next scheduled tick sees the mismatch and stops without rescheduling, so
-   * no explicit alarm cancellation is needed. Work already indexed is kept.
-   */
-  @callable()
-  async cancelDocsReindex(): Promise<{ ok: true; message: string }> {
-    const cur = this.docsState();
-    if (cur.status === "enumerating" || cur.status === "indexing") {
-      this.setDocsState({
-        status: "cancelled",
-        runId: undefined,
-        currentProduct: undefined,
-        finishedAt: Date.now(),
-      });
-      return { ok: true, message: "Reindex cancelling — the background job stops on its next step." };
-    }
-    return { ok: true, message: "No reindex is running." };
-  }
-
-  /**
-   * Remove every doc vector this room indexed (by reconstructing deterministic
-   * ids from the page queue) and reset the work queue. Refuses while a run is in
-   * flight — cancel first.
-   */
-  @callable()
-  async clearDocsIndex(): Promise<{ ok: boolean; message: string; deleted: number }> {
-    const cur = this.docsState();
-    if (cur.status === "enumerating" || cur.status === "indexing") {
-      return { ok: false, message: "Cancel the running reindex before clearing.", deleted: 0 };
-    }
-    const rows = this.sql<{ url: string; chunks: number }>`
-      SELECT url, chunks FROM glide_docs_pages WHERE status = ${DOCS_PAGE_DONE} AND chunks > 0`;
-    let deleted = 0;
-    for (const r of rows) {
-      await deleteDocPage(this.env, r.url, Number(r.chunks));
-      deleted += Number(r.chunks);
-    }
-    this.sql`DELETE FROM glide_docs_pages`;
-    this.sql`DELETE FROM glide_docs_products`;
-    this.setState({
-      ...this.state,
-      docsIndex: {
-        status: "idle",
-        productsTotal: 0,
-        productsEnumerated: 0,
-        pagesTotal: 0,
-        pagesIndexed: 0,
-        pagesFailed: 0,
-        chunksUpserted: 0,
-        updatedAt: Date.now(),
-      },
-    });
-    return {
-      ok: true,
-      message: `Cleared ${deleted} doc chunk${deleted === 1 ? "" : "s"} from the shared index.`,
-      deleted,
-    };
   }
 
   /**
@@ -1722,6 +2021,37 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
       if (Object.keys(patch).length) this.applyOnboardingPatch(patch, this.currentActor);
     }
 
+    // Backfill the "nature of the business" profile from the user's message
+    // (see inferBusinessProfileFromText). Runs whether or not onboarding is
+    // active so the on-demand advisor keeps a useful profile even after go-live.
+    // It only FILLS BLANKS and UNIONS arrays — it never overwrites an explicit
+    // answer or flips a boolean to false — so it can't fight a more specific tool
+    // call, exactly like the onboarding backfill above.
+    if (!isActionResultEvent) {
+      const inferred = inferBusinessProfileFromText(latestUserText(messages));
+      const cur = this.state.businessProfile ?? EMPTY_BUSINESS_PROFILE;
+      const patch: Partial<BusinessProfile> = {};
+      if (inferred.industry && !cur.industry) patch.industry = inferred.industry;
+      if (inferred.audience && !cur.audience) patch.audience = inferred.audience;
+      if (inferred.trafficProfile && !cur.trafficProfile) patch.trafficProfile = inferred.trafficProfile;
+      if (inferred.hasLogin && cur.hasLogin === undefined) patch.hasLogin = true;
+      if (inferred.hasApi && cur.hasApi === undefined) patch.hasApi = true;
+      const union = (base: string[], extra?: string[]): string[] | undefined => {
+        if (!extra?.length) return undefined;
+        const merged = Array.from(new Set([...base, ...extra]));
+        return merged.length !== base.length ? merged : undefined;
+      };
+      const appTypes = union(cur.appTypes, inferred.appTypes);
+      if (appTypes) patch.appTypes = appTypes;
+      const sensitiveData = union(cur.sensitiveData, inferred.sensitiveData);
+      if (sensitiveData) patch.sensitiveData = sensitiveData;
+      const compliance = union(cur.compliance, inferred.compliance);
+      if (compliance) patch.compliance = compliance;
+      const concerns = union(cur.concerns, inferred.concerns);
+      if (concerns) patch.concerns = concerns;
+      if (Object.keys(patch).length) this.applyBusinessProfilePatch(patch, this.currentActor);
+    }
+
     // RAG (run both retrievals concurrently): pick the guidance docs most
     // relevant to this turn (or all, for small rooms / when semantic search is
     // unavailable), and pull grounding excerpts from the indexed Cloudflare docs.
@@ -1737,6 +2067,11 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     });
     const system = buildSystemPrompt(this.state, guidanceForPrompt, docsForPrompt);
     const tools = this.buildTools();
+    const repairToolCall: ToolCallRepairFunction<typeof tools> = async ({ toolCall }) => {
+      if (toolCall.toolName !== "update_onboarding") return null;
+      const input = repairOnboardingToolInput(toolCall.input);
+      return input ? { ...toolCall, input } : null;
+    };
     const abortSignal = options?.abortSignal;
 
     // Multi-pass response, emitted as ONE assistant message. Pass 1 runs the
@@ -1801,7 +2136,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
           // with an exact summary derived from actions server code created.
           writeChunks(chunks, false);
           console.warn(`Replaced model queue narration with server state in ${label}.`);
-          appendText(this.authoritativeQueueNarration());
+          appendText(this.authoritativeQueueNarration(prose));
           return true;
         };
         stage = "model.initial";
@@ -1810,6 +2145,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
           system,
           messages,
           tools,
+          experimental_repairToolCall: repairToolCall,
           stopWhen: stepCountIs(8),
           abortSignal,
           onFinish,
@@ -1909,6 +2245,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
             messages: [...messages, ...responseMessages],
             tools,
             toolChoice: "required",
+            experimental_repairToolCall: repairToolCall,
             stopWhen: stepCountIs(8),
             abortSignal,
           });
@@ -2054,11 +2391,18 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
           "Resolve a zone id by its domain name and remember it as the room's default zone. Runs immediately.",
         inputSchema: z.object({ name: z.string().describe('Domain, e.g. "example.com".') }),
         execute: async ({ name }) => {
-          const res = await findZoneByName(await this.getToken(), name);
+          const domain = canonicalizeDomainName(name);
+          if (!domain) return `"${name}" doesn't look like a bare domain, e.g. "example.com".`;
+          const res = await findZoneByName(await this.getToken(), domain);
           if (!res.ok) return this.readError(res);
           this.noteTokenOutcome(res);
-          const zone = { id: res.result.id, name: res.result.name };
-          this.setState({ ...this.state, defaultZone: zone });
+          const accountId = res.result.account?.id;
+          const zone = { id: res.result.id, name: res.result.name, accountId };
+          this.setState({
+            ...this.state,
+            defaultAccountId: accountId ?? this.state.defaultAccountId,
+            defaultZone: zone,
+          });
           return `Found zone ${zone.name} → ${zone.id}. Saved as the room's default zone.`;
         },
       }),
@@ -2101,7 +2445,9 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
             .describe('Path after https://api.cloudflare.com/client/v4, e.g. "/zones/<id>/settings".'),
         }),
         execute: async ({ path }) => {
-          const res = await cfGet(path.startsWith("/") ? path : `/${path}`, await this.getToken());
+          const canonicalPath = canonicalizeApiPath(path.startsWith("/") ? path : `/${path}`);
+          if (!canonicalPath) return "Error: Invalid Cloudflare API path.";
+          const res = await cfGet(canonicalPath, await this.getToken());
           if (!res.ok) return this.readError(res);
           return clip(res.result);
         },
@@ -2128,7 +2474,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
         execute: async ({ accountId, zoneId, zoneName }) => {
           const next: GlideState = { ...this.state };
           if (accountId) next.defaultAccountId = accountId;
-          if (zoneId && zoneName) next.defaultZone = { id: zoneId, name: zoneName };
+          if (zoneId && zoneName) next.defaultZone = { id: zoneId, name: zoneName, accountId };
           this.setState(next);
           return "Updated room defaults.";
         },
@@ -2147,7 +2493,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
       // ---- WRITES — these only QUEUE a pending action ----------------------
       add_domain: tool({
         description:
-          "QUEUE adding a domain (zone) to Cloudflare for human approval. Call this the moment onboarding has a domain to add — it creates a pending \"Add domain\" action a human clicks Apply to execute. Does NOT add it immediately. If you don't pass an accountId, it uses the room's default account or, when a token is available, auto-resolves it (asking you to choose only if the token sees several accounts).",
+          "QUEUE adding a domain (zone) to Cloudflare for human approval after checking that it does not already exist. It creates a pending \"Add domain\" action a human clicks Apply to execute. Does NOT add it immediately. If you don't pass an accountId, it uses the room's default account or, when a token is available, auto-resolves it (asking you to choose only if the token sees several accounts).",
         inputSchema: z.object({
           name: z.string().describe('The domain to add, bare hostname only, e.g. "example.com" (no scheme, no path).'),
           accountId: z
@@ -2160,21 +2506,63 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
             .describe('"full" = Cloudflare is primary DNS (default, recommended); "partial" = CNAME setup (Business/Enterprise).'),
         }),
         execute: async ({ name, accountId, setupType }) => {
-          const domain = name
-            .trim()
-            .replace(/^https?:\/\//i, "")
-            .replace(/\/.*$/, "")
-            .replace(/\.$/, "")
-            .toLowerCase();
-          if (!domain || !domain.includes(".") || /\s/.test(domain)) {
+          const domain = canonicalizeDomainName(name);
+          if (!domain) {
             return `"${name}" doesn't look like a domain. Give me the bare hostname, e.g. "example.com", and I'll queue it.`;
+          }
+
+          const selectedZone = this.state.defaultZone;
+          const selectedZoneMatches =
+            canonicalizeDomainName(selectedZone?.name ?? "") === domain;
+          const token = await this.getToken();
+
+          // Older persisted rooms stored only zone id/name. Resolve that zone by
+          // id before considering any default account, so a stale account cannot
+          // redirect a duplicate zone request into the wrong account.
+          const selectedZoneIsCurrent = selectedZoneMatches;
+          let selectedZoneAccountId = selectedZone?.accountId;
+          // An explicit target account is authoritative. Do not let a stale
+          // legacy room default block it while trying to recover provenance.
+          if (selectedZone && selectedZoneMatches && !selectedZoneAccountId && token && !accountId?.trim()) {
+            const resolved = await cfGet<ZoneSummary>(
+              `/zones/${encodeURIComponent(selectedZone.id)}`,
+              token,
+            );
+            if (!resolved.ok) {
+              const detail =
+                resolved.category === "not_found"
+                  ? "The selected zone id is no longer accessible; run find_zone again or choose the target account explicitly."
+                  : this.readError(resolved);
+              return `No action queued: I couldn't verify the selected zone's account. ${detail}`;
+            }
+            if (canonicalizeDomainName(resolved.result.name) !== domain) {
+              return `No action queued: the selected zone id now resolves to ${resolved.result.name}, not ${domain}. Run find_zone again.`;
+            }
+            selectedZoneAccountId = resolved.result.account?.id;
+            if (!selectedZoneAccountId) {
+              return `No action queued: Cloudflare returned ${domain} without an owning account, so I can't target zone creation safely.`;
+            }
+            this.setState({
+              ...this.state,
+              defaultAccountId: selectedZoneAccountId,
+              defaultZone: {
+                id: resolved.result.id,
+                name: resolved.result.name,
+                accountId: selectedZoneAccountId,
+              },
+            });
           }
 
           // Resolve which account to create the zone under. Reads (listAccounts)
           // run now; the write itself is only ever QUEUED below.
-          let acct = (accountId ?? this.state.defaultAccountId ?? "").trim();
+          let acct =
+            resolveTargetAccountId({
+              explicitAccountId: accountId,
+              selectedZoneMatches: selectedZoneIsCurrent,
+              selectedZoneAccountId,
+              defaultAccountId: this.state.defaultAccountId,
+            }) ?? "";
           if (!acct) {
-            const token = await this.getToken();
             if (!token) {
               return (
                 `I can add **${domain}**, but I need to know which Cloudflare account it goes under, and ` +
@@ -2193,6 +2581,41 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
             }
             acct = res.result[0].id;
             this.setState({ ...this.state, defaultAccountId: acct });
+          }
+
+          // Never queue a duplicate solely from a possibly stale default. With a
+          // token, confirm against the selected account immediately before queueing.
+          if (token) {
+            const existing = await findZoneByName(token, domain, acct);
+            if (!existing.ok && existing.category !== "not_found") {
+              return `No action queued: I couldn't safely check whether ${domain} already exists. ${this.readError(existing)}`;
+            }
+            if (existing.ok) {
+              if (selectedZone?.id !== existing.result.id || this.state.defaultAccountId !== acct) {
+                this.setState({
+                  ...this.state,
+                  defaultAccountId: acct,
+                  defaultZone: {
+                    id: existing.result.id,
+                    name: existing.result.name,
+                    accountId: acct,
+                  },
+                });
+              }
+              return (
+                `No action queued: ${domain} already exists in Cloudflare account ${acct}. ` +
+                `Use list_dns_records with zone id ${existing.result.id} to review its current DNS records.`
+              );
+            }
+            if (selectedZoneIsCurrent && (!selectedZoneAccountId || selectedZoneAccountId === acct)) {
+              const { defaultZone: _staleDefault, ...nextState } = this.state;
+              this.setState(nextState);
+            }
+          } else if (selectedZoneIsCurrent && !accountId?.trim()) {
+            return (
+              `No action queued: ${domain} is selected as this room's default zone, but there is no token to ` +
+              "confirm whether it still exists. Add a token in Connection, then retry."
+            );
           }
 
           const type = setupType === "partial" ? "partial" : "full";
@@ -2292,11 +2715,16 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
           zoneId: z.string().optional().describe("Zone id this targets (snapshotted before Apply)."),
         }),
         execute: async ({ product, summary, method, path, body, zoneId }) => {
+          const normalizedPath = canonicalizeApiPath(path.startsWith("/") ? path : `/${path}`);
+          if (!normalizedPath) return "No action queued: the Cloudflare API path is invalid or ambiguous.";
+          if (method === "POST" && normalizedPath.split("?", 1)[0].replace(/\/+$/, "") === "/zones") {
+            return "No action queued: use add_domain for zone creation so Glide can resolve the account, check for an existing zone, and prevent duplicate approvals.";
+          }
           return this.queuePending({
             product,
             summary,
             method: method as WriteMethod,
-            path: path.startsWith("/") ? path : `/${path}`,
+            path: normalizedPath,
             body,
             zoneId,
           });
@@ -2326,7 +2754,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
             .array(z.string())
             .optional()
             .describe('Checklist step ids to mark done, e.g. ["domain","setup","scan"].'),
-        }),
+        }).strict(),
         execute: async ({ path, domain, setupType, migratingFrom, goals, checkOff }) => {
           const next = this.applyOnboardingPatch(
             { path, domain, setupType: setupType as SetupType | undefined, migratingFrom, goals, checkOff },
@@ -2341,6 +2769,124 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
               : "";
           const who = this.currentActor ?? "the team";
           return `Onboarding state saved (${done}/${next.checklist.length} steps done). ${status} Now reply to ${who} in plain conversational prose: confirm in a sentence what you just recorded, briefly explain this step, and ask the single next question to keep things moving. Do NOT emit JSON or call another tool unless their next answer actually requires one.`;
+        },
+      }),
+
+      update_business_profile: tool({
+        description:
+          "Record answers to the 'nature of the business' discovery questions (industry, app type, audience, traffic, whether users log in, whether an API is exposed, sensitive data, compliance, and top concerns). Call this as you learn each answer — it feeds the recommendation engine. It ONLY stores context; it changes nothing on the account. Pass only what the user told you; arrays you pass REPLACE the stored ones, so include prior values you still want to keep.",
+        inputSchema: z
+          .object({
+            industry: z
+              .enum([
+                "ecommerce",
+                "saas",
+                "fintech",
+                "healthcare",
+                "media",
+                "gaming",
+                "government",
+                "education",
+                "nonprofit",
+                "marketing",
+                "api_platform",
+                "other",
+              ])
+              .optional()
+              .describe("Industry/vertical."),
+            appTypes: z
+              .array(z.enum(["website", "web_app", "api", "mobile_backend", "static_site", "ugc"]))
+              .optional()
+              .describe("Kinds of app the team runs."),
+            audience: z.enum(["global", "regional", "internal"]).optional().describe("Who the app serves."),
+            trafficProfile: z
+              .enum(["low", "steady", "spiky", "high_volume"])
+              .optional()
+              .describe("Rough traffic scale / spikiness."),
+            hasLogin: z.boolean().optional().describe("Whether the app has user login / authentication."),
+            hasApi: z.boolean().optional().describe("Whether the team exposes an API."),
+            cacheableContent: z.boolean().optional().describe("Whether a meaningful share of content is static/cacheable."),
+            sensitiveData: z
+              .array(z.enum(["pii", "payments", "health", "credentials", "financial"]))
+              .optional()
+              .describe("Sensitive data handled."),
+            compliance: z
+              .array(z.enum(["pci_dss", "hipaa", "gdpr", "soc2", "iso27001", "fedramp"]))
+              .optional()
+              .describe("Compliance regimes in scope."),
+            concerns: z
+              .array(
+                z.enum([
+                  "bots",
+                  "ddos",
+                  "scraping",
+                  "credential_stuffing",
+                  "card_testing",
+                  "fraud",
+                  "latency",
+                  "downtime",
+                  "cost",
+                ]),
+              )
+              .optional()
+              .describe("Top concerns / threats the team named."),
+            notes: z.string().optional().describe("Freeform note that doesn't fit a field."),
+          })
+          .strict(),
+        execute: async (input) => {
+          // Union arrays with what's already captured so a partial tool call can
+          // never drop earlier answers (models are inconsistent about resending
+          // the full set), then persist with the low-level replace setter.
+          const cur = this.state.businessProfile ?? EMPTY_BUSINESS_PROFILE;
+          const merge = (base: string[], extra?: string[]) =>
+            extra?.length ? Array.from(new Set([...base, ...extra])) : undefined;
+          const next = this.applyBusinessProfilePatch(
+            {
+              ...input,
+              appTypes: merge(cur.appTypes, input.appTypes),
+              sensitiveData: merge(cur.sensitiveData, input.sensitiveData),
+              compliance: merge(cur.compliance, input.compliance),
+              concerns: merge(cur.concerns, input.concerns),
+            },
+            this.currentActor,
+          );
+          const missing = recommendConfigurations(next, {
+            goals: this.state.onboarding?.goals,
+            setupType: this.state.onboarding?.setupType,
+          }).missing;
+          const nextQ = missing.length
+            ? `Still unknown: ${missing.slice(0, 3).join("; ")}. Ask ONE of these next.`
+            : "The profile is well-rounded — you can call recommend_configuration now.";
+          return `Business profile saved. ${nextQ} Reply to the room in one or two plain sentences: confirm what you noted and ask the single next question (or, if enough is captured, offer tailored recommendations). Do NOT dump JSON.`;
+        },
+      }),
+
+      recommend_configuration: tool({
+        description:
+          "Turn the captured business profile into tailored Cloudflare performance/security/reliability recommendations. READ-ONLY: it proposes settings and rules but queues nothing. Call it once you've learned enough about the business (or when the user asks 'what should I turn on?'). Then present the relevant items grouped by theme, explain why each fits, and offer to QUEUE the important ones via the builder tools (set_zone_setting, create_waf_custom_rule, cf_write).",
+        inputSchema: z
+          .object({
+            focus: z
+              .enum(["all", "security", "performance", "reliability", "privacy", "bots", "api", "tls"])
+              .optional()
+              .describe("Optionally narrow the recommendations to one theme."),
+          })
+          .strict(),
+        execute: async ({ focus }) => {
+          const profile = this.state.businessProfile;
+          if (!profile || (!profile.industry && !profile.appTypes.length && !profile.concerns.length && !profile.compliance.length && !profile.sensitiveData.length)) {
+            const missing = recommendConfigurations(profile, {}).missing;
+            return `No business profile captured yet, so recommendations would be generic. First ask a couple of the discovery questions (one at a time) — e.g. ${missing.slice(0, 3).join("; ")} — record them with update_business_profile, then call this again.`;
+          }
+          const set = recommendConfigurations(profile, {
+            goals: this.state.onboarding?.goals,
+            setupType: this.state.onboarding?.setupType,
+          });
+          const filtered =
+            focus && focus !== "all"
+              ? { ...set, recommendations: set.recommendations.filter((r) => r.category === focus) }
+              : set;
+          return clip(formatRecommendationsForModel(filtered));
         },
       }),
 
@@ -2534,7 +3080,25 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
   private queuePending(
     input: Omit<PendingAction, "id" | "ts" | "createdBy" | "status" | "error" | "attemptedAt">,
   ): string {
-    const action = this.newPending(input);
+    const path = canonicalizeApiPath(input.path);
+    if (!path) return "No action queued: the Cloudflare API path is invalid or ambiguous.";
+    const normalizedInput = { ...input, path };
+    const zoneTarget = zoneCreationIdentity(normalizedInput);
+    const duplicate = zoneTarget
+      ? this.state.pendingActions.find((action) => zoneCreationIdentity(action) === zoneTarget)
+      : undefined;
+    if (duplicate) {
+      const status = pendingActionStatus(duplicate);
+      const nextStep = isActionApplying(duplicate)
+        ? "It is currently being applied."
+        : isActionOutcomeUncertain(duplicate)
+          ? "Its outcome is uncertain; verify the live zone before retrying that approval individually."
+          : status === "failed"
+            ? "It previously failed; review the error and Retry that approval instead."
+            : "Review or Apply the existing approval instead.";
+      return `No action queued: this Add domain approval already exists (pending id: ${duplicate.id}). ${nextStep}`;
+    }
+    const action = this.newPending(normalizedInput);
     this.setState({ ...this.state, pendingActions: [...this.state.pendingActions, action] });
     this.queuedActionsThisTurn.push(action);
     // Queueing a change may satisfy a go-live step (e.g. an SSL setting, a WAF
@@ -2547,8 +3111,8 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
   }
 
   /** Render queue narration from server-created actions, never from model claims. */
-  private authoritativeQueueNarration(): string {
-    if (!this.queuedActionsThisTurn.length) return queueClaimCorrection(this.state);
+  private authoritativeQueueNarration(prose = ""): string {
+    if (!this.queuedActionsThisTurn.length) return queueClaimCorrection(this.state, prose);
 
     const pendingById = new Map(this.state.pendingActions.map((action) => [action.id, action]));
     const resultById = new Map<string, ActionResult>();
@@ -2635,8 +3199,30 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     configFiles?: Array<{ filename: string; content: string }>;
     format?: MigrationConfigFormat;
   }): Promise<{ ok: true; data: unknown } | { ok: false; message: string }> {
+    if (args.config !== undefined && typeof args.config !== "string") {
+      return { ok: false, message: "Inline config must be text." };
+    }
+    if (args.configUrl !== undefined && typeof args.configUrl !== "string") {
+      return { ok: false, message: "Config URL must be text." };
+    }
+    if (args.configFiles !== undefined && !Array.isArray(args.configFiles)) {
+      return { ok: false, message: "Uploaded configs must be a file list." };
+    }
+    const inlineSizeError = args.config ? configSizeError(args.config) : undefined;
+    if (inlineSizeError) return { ok: false, message: inlineSizeError };
+    const configFiles = args.configFiles ?? [];
+    if (configFiles.length > MAX_CONFIG_FILES) {
+      return { ok: false, message: `Too many config files (${configFiles.length}; max ${MAX_CONFIG_FILES}).` };
+    }
+    for (const file of configFiles) {
+      if (!file || typeof file.filename !== "string" || typeof file.content !== "string") {
+        return { ok: false, message: "Every uploaded config file needs a filename and text content." };
+      }
+    }
+    const filesSizeError = configFilesSizeError(configFiles);
+    if (filesSizeError) return { ok: false, message: filesSizeError };
     // Multiple uploaded Terraform files → the migration tool parses + merges them.
-    const tfFiles = (args.configFiles ?? []).filter((f) => f && typeof f.content === "string" && f.content.trim());
+    const tfFiles = configFiles.filter((f) => f.content.trim());
     if (tfFiles.length > 1) {
       return { ok: true, data: { __raw_tf_files: tfFiles } };
     }
@@ -3191,13 +3777,28 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     };
   }
 
-  /** Resolve the target zone for snapshot/restore: explicit, then the room default. */
+  /** Resolve the target zone for snapshot capture: explicit, then the room default. */
   private resolveZone(zoneId?: string): { id: string; name: string } | undefined {
     if (zoneId) {
       const dz = this.state.defaultZone;
       return { id: zoneId, name: dz?.id === zoneId ? dz.name : "" };
     }
     return this.state.defaultZone ? { id: this.state.defaultZone.id, name: this.state.defaultZone.name } : undefined;
+  }
+
+  /** Prove the active room token can read this zone and that it belongs to the selected account. */
+  private async authorizeZone(
+    token: string,
+    accountId: string,
+    zoneId: string,
+  ): Promise<{ ok: true; zone: ZoneSummary } | { ok: false; message: string }> {
+    if (!/^[a-f0-9]{32}$/i.test(zoneId)) return { ok: false, message: "The zone id is invalid." };
+    const res = await cfGet<ZoneSummary>(`/zones/${zoneId}`, token);
+    if (!res.ok) return { ok: false, message: `Couldn't authorize the target zone: ${this.readError(res)}` };
+    if (!res.result.account?.id || res.result.account.id !== accountId) {
+      return { ok: false, message: "The target zone does not belong to the active Cloudflare account." };
+    }
+    return { ok: true, zone: res.result };
   }
 
   /** Capture a full zone snapshot (read-only on CF), then refresh the synced list. */
@@ -3209,29 +3810,42 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     if (!accountId) return { ok: false, message: "Couldn't determine the account id. Set a default account, then retry." };
     const zone = this.resolveZone(zoneId);
     if (!zone) return { ok: false, message: "A snapshot needs a target zone — set a default zone (find_zone) or pass a zone id." };
+    const authorized = await this.authorizeZone(token, accountId, zone.id);
+    if (!authorized.ok) return authorized;
 
     const res = await captureZoneSnapshot(this.migrationTransport(), {
       apiToken: token,
       accountId,
-      zoneId: zone.id,
-      zoneName: zone.name,
+      zoneId: authorized.zone.id,
+      zoneName: authorized.zone.name,
     });
     if (!res.ok) return { ok: false, message: `Snapshot failed: ${res.message}` };
-    await this.doRefreshSnapshots(zone.id);
-    return { ok: true, message: `Captured snapshot ${res.result.snapshotId} for ${zone.name || zone.id}.` };
+    await this.doRefreshSnapshots(authorized.zone.id);
+    return { ok: true, message: `Captured snapshot ${res.result.snapshotId} for ${authorized.zone.name}.` };
   }
 
   /** Pull the stored snapshot list into synced state. */
   private async doRefreshSnapshots(zoneId?: string): Promise<{ ok: boolean; message?: string }> {
     if (!migrationConfigured(this.migrationTransport())) return { ok: false, message: this.notConfigured() };
-    const res = await listZoneSnapshots(this.migrationTransport(), zoneId);
+    const token = await this.getToken();
+    if (!token) return { ok: false, message: "No Cloudflare API token configured — add one to list snapshots." };
+    const accountId = await this.resolveAccountId(token);
+    if (!accountId) return { ok: false, message: "Couldn't determine the account id. Set a default account, then retry." };
+    const targetZoneId = zoneId ?? this.state.defaultZone?.id;
+    if (!targetZoneId) return { ok: false, message: "Set a default zone before listing snapshots." };
+    const authorized = await this.authorizeZone(token, accountId, targetZoneId);
+    if (!authorized.ok) return authorized;
+    const res = await listZoneSnapshots(this.migrationTransport(), authorized.zone.id);
     if (!res.ok) return { ok: false, message: res.message };
-    const snapshots: SnapshotInfo[] = res.result.snapshots.slice(0, 50).map((s) => ({
-      id: s.id,
-      zoneId: s.zone_id,
-      zoneName: s.zone_name,
-      created: s.created_at,
-    }));
+    const snapshots: SnapshotInfo[] = res.result.snapshots
+      .filter((s) => s.account_id === accountId && s.zone_id === authorized.zone.id)
+      .slice(0, 50)
+      .map((s) => ({
+        id: s.id,
+        zoneId: s.zone_id,
+        zoneName: s.zone_name,
+        created: s.created_at,
+      }));
     this.setState({ ...this.state, snapshots });
     return { ok: true };
   }
@@ -3239,7 +3853,6 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
   /** Restore a zone to a snapshot (DESTRUCTIVE). Records the outcome in recentResults. */
   private async doRestore(
     snapshotId: string,
-    zoneId: string | undefined,
     by: string,
   ): Promise<{ ok: boolean; message: string }> {
     if (!migrationConfigured(this.migrationTransport())) return { ok: false, message: this.notConfigured() };
@@ -3251,25 +3864,27 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     const snap = await getZoneSnapshot(this.migrationTransport(), snapshotId);
     if (!snap.ok) return { ok: false, message: `Couldn't load snapshot: ${snap.message}` };
     const row = snap.result.snapshot;
+    const target = resolveSnapshotTarget(row, accountId);
+    if (!target.ok) return target;
+    const authorized = await this.authorizeZone(token, target.accountId, target.zoneId);
+    if (!authorized.ok) return authorized;
     let snapshotData: unknown;
     try {
       snapshotData = JSON.parse(row.snapshot_data);
     } catch {
       return { ok: false, message: "Snapshot data is corrupt or unreadable." };
     }
-    const zone = zoneId ?? row.zone_id;
-
     const res = await restoreZoneSnapshot(this.migrationTransport(), {
       apiToken: token,
-      accountId,
-      zoneId: zone,
+      accountId: target.accountId,
+      zoneId: target.zoneId,
       snapshotData,
     });
 
     const result: ActionResult = {
       id: crypto.randomUUID(),
       product: "Restore",
-      summary: `Restore ${row.zone_name || zone} to snapshot ${snapshotId.slice(0, 8)}…`,
+      summary: `Restore ${row.zone_name || authorized.zone.name} to snapshot ${snapshotId.slice(0, 8)}…`,
       status: res.ok ? "applied" : "failed",
       detail: res.ok ? "Zone restored to the snapshot." : res.message,
       by,
@@ -3280,7 +3895,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
       recentResults: [result, ...this.state.recentResults].slice(0, MAX_RECENT_RESULTS),
     });
     return res.ok
-      ? { ok: true, message: `Restored ${row.zone_name || zone} to snapshot ${snapshotId.slice(0, 8)}…` }
+      ? { ok: true, message: `Restored ${row.zone_name || authorized.zone.name} to snapshot ${snapshotId.slice(0, 8)}…` }
       : { ok: false, message: `Restore failed: ${res.message}` };
   }
 
@@ -3289,11 +3904,16 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
   // ---------------------------------------------------------------------------
 
   @callable()
-  async applyAction(id: string, by = "someone"): Promise<ActionResult> {
-    return this.applyActionInternal(id, by, true);
+  async applyAction(id: string, by = "someone", confirmUncertain = false): Promise<ActionResult> {
+    return this.applyActionInternal(id, by, true, confirmUncertain);
   }
 
-  private async applyActionInternal(id: string, by: string, notify: boolean): Promise<ActionResult> {
+  private async applyActionInternal(
+    id: string,
+    by: string,
+    notify: boolean,
+    confirmUncertain = false,
+  ): Promise<ActionResult> {
     const action = this.state.pendingActions.find((a) => a.id === id);
     if (!action) {
       return {
@@ -3323,6 +3943,19 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
         true,
         notify,
       );
+    }
+
+    if (isActionOutcomeUncertain(action) && confirmUncertain !== true) {
+      return {
+        id,
+        product: action.product,
+        summary: action.summary,
+        status: "failed",
+        detail:
+          "Outcome uncertain: verify the live Cloudflare configuration, then retry this action individually with explicit confirmation.",
+        by,
+        ts: Date.now(),
+      };
     }
 
     if (isActionApplying(action)) {
@@ -3544,10 +4177,14 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
   }
 
   @callable()
-  async applyAll(by = "someone"): Promise<ActionResult[]> {
-    const ids = this.state.pendingActions.filter((a) => !isActionApplying(a)).map((a) => a.id);
+  async applyAll(ids: string[], by = "someone"): Promise<ActionResult[]> {
+    if (!Array.isArray(ids)) return [];
+    const reviewedIds = Array.from(
+      new Set(ids.filter((id): id is string => typeof id === "string" && id.length > 0 && id.length <= 200)),
+    );
+    const safeIds = selectBulkApplyIds(this.state.pendingActions, reviewedIds);
     const results: ActionResult[] = [];
-    for (const id of ids) results.push(await this.applyActionInternal(id, by, true));
+    for (const id of safeIds) results.push(await this.applyActionInternal(id, by, true));
     return results;
   }
 
@@ -3678,7 +4315,8 @@ export default {
         try {
           const system = await getAgentByName(env.GlideAgent, DOCS_SYSTEM_ROOM);
           const res = await system.startDocsReindex("the weekly refresh cron");
-          console.log(`[cron] weekly docs reindex: ${res.message}`);
+          if (res.ok) console.log(`[cron] weekly docs reindex: ${res.message}`);
+          else console.warn(`[cron] weekly docs reindex did not start: ${res.message}`);
         } catch (err) {
           console.error(
             "[cron] weekly docs reindex failed to start:",
@@ -3688,7 +4326,20 @@ export default {
       })(),
     );
   },
-  async fetch(request: Request, env: Cloudflare.Env): Promise<Response> {
+  async fetch(request: Request, env: Cloudflare.Env, ctx: ExecutionContext): Promise<Response> {
+    const requestUrl = new URL(request.url);
+    if (request.method === "GET" && requestUrl.pathname === "/") {
+      ctx.waitUntil(
+        (async () => {
+          try {
+            const system = await getAgentByName(env.GlideAgent, DOCS_SYSTEM_ROOM);
+            await system.ensureDocsIndex();
+          } catch (err) {
+            console.warn("[docs-bootstrap] initial docs index check failed:", (err as Error)?.message ?? err);
+          }
+        })(),
+      );
+    }
     const routed = await routeAgentRequest(request, env);
     if (routed) return routed;
     const res = await env.ASSETS.fetch(request);

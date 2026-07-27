@@ -1,13 +1,7 @@
-/**
- * Augment the generated binding types with the CF_API_TOKEN secret.
- * Secrets are not declared in wrangler.jsonc, so `wrangler types` does not
- * know about them — we merge it into the generated `Cloudflare.Env` here.
- */
+/** Secrets are merged into the generated `Cloudflare.Env` binding types here. */
 declare global {
   namespace Cloudflare {
     interface Env {
-      /** Cloudflare API token Glide uses to drive the Cloudflare API (optional fallback; can also be set in the GUI). */
-      CF_API_TOKEN: string;
       /**
        * 32-byte (base64) key used to derive the AES-256-GCM key that encrypts
        * GUI-provided API tokens at rest in the Durable Object. Set with

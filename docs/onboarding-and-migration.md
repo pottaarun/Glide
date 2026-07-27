@@ -2,8 +2,9 @@
 
 Glide guides a team onto Cloudflare two ways: a **chat-led guided setup** (the
 default) and, for teams leaving another vendor, a **read-only provider-migration
-pipeline**. Both keep the safety contract — nothing changes until a human Applies
-a queued action.
+pipeline**. Along the way it also profiles the **nature of the business** to offer
+tailored, docs-cited recommendations. Everything keeps the safety contract —
+nothing changes until a human Applies a queued action.
 
 - Chat-led setup: Glide asks one question at a time and records each answer; the
   sidebar checklist fills itself in. System prompt: `src/system-prompt.ts:52`.
@@ -16,6 +17,10 @@ a queued action.
   `recomputeOnboardingChecklist()` (`src/server.ts:900`).
 - Restart: the sidebar **Reset** button clears onboarding via `resetOnboarding`
   (`src/client/main.tsx:514`).
+- Business discovery + recommendations: the `update_business_profile` and
+  `recommend_configuration` tools, the engine `src/recommendations.ts`, and the
+  `RecommendationsPanel` (`src/client/main.tsx:2058`); RPCs `updateBusinessProfile`,
+  `resetBusinessProfile`, `queueRecommendation` (`src/server.ts:1224` onward).
 - Migration client: `src/migration.ts`; queueing logic: `src/server.ts:2392`.
 
 ---
@@ -30,8 +35,8 @@ into the synced
 anything already captured (`src/system-prompt.ts:52`).
 
 Glide never needs a token value in chat. When a credential is missing, it directs
-the user to **Connection → Set token**; recognizable `cfat_...` values are blocked
-from the normal composer and redacted before persistence.
+the user to **Connection → Set token**; recognizable `cfat_...`, `cfut_...`, and
+`cfk_...` values are blocked from the normal composer and redacted before persistence.
 
 The empty-chat opener is three-way (`src/client/main.tsx:605`): if onboarding is
 **completed** it shows a done card, if it is **active** (already started, but no
@@ -131,8 +136,12 @@ hand:
   `src/server.ts:844`) and re-derived whenever the queue changes
   (`recomputeOnboardingChecklist`, `src/server.ts:900`, called from
   `queuePending` / `queueMigrationRules` / `finish`).
-- Adding the zone itself is queued with the `add_domain` tool (`POST /zones`),
-  which resolves the target account for you; see [Tools reference](./tools.md#writes--these-only-queue-a-pending-action).
+- `find_zone` / `add_domain` establish the target before downstream work.
+  `add_domain` performs an exact lookup in the resolved account; when the zone
+  already exists it saves that zone as the room default, queues no Add domain
+  approval, and continues with `list_dns_records`. Otherwise it queues one
+  `POST /zones` approval and reuses any matching pending/failed approval instead
+  of creating a duplicate. See [Tools reference](./tools.md#writes--these-only-queue-a-pending-action).
 - It only ever **adds** completions — manual checks and earlier auto-checks are
   sticky and never auto-unchecked. Reviewing scanned records via
   `list_dns_records` sets `dnsReviewed`, which ticks the "review DNS records" step.
@@ -149,6 +158,107 @@ activation → coordinate DNSSEC.
 **Fresh path:** identify domains → choose DNS setup → add/review DNS records → set
 proxy status → configure WAF/security → set SSL/TLS to Full (strict) → lower TTLs
 → change nameservers → verify activation.
+
+### Existing zones and zone-creation permissions
+
+Do not infer that a domain is new from the onboarding checklist alone. Glide first
+uses the token to look up the exact domain. If it exists, no **Add domain** card
+should appear; the correct next step is to review its current DNS records. The
+room remembers both the zone id and owning account id so a stale account default
+cannot redirect a future creation request.
+
+Creating a genuinely new zone requires **Zone > Zone > Edit** over **All
+zones/domains**, because a not-yet-created domain cannot be selected as a specific
+resource. Account API Tokens need this in a separate zone/domain-scoped policy,
+not under **Entire Account**. See [Setup](./setup.md#cloudflare-api-token-permissions).
+
+---
+
+## Business discovery & tailored recommendations
+
+Alongside the mechanical go-live, Glide works out the **nature of the team's
+business** so it can recommend the settings that actually fit them. It asks
+**probing questions one at a time** (never a questionnaire dump) — industry, app
+type, whether users log in and whether an API is exposed, audience reach and
+traffic profile, sensitive data, compliance regimes, and top concerns — recording
+each answer with the `update_business_profile` tool into the room's
+`businessProfile`. Capturing a profile changes **nothing** on the account; it is
+only context for the recommendation engine. The loop is driven by the
+"discovery → tailored config" block of the system prompt (`src/system-prompt.ts:85`)
+and a rendered profile snapshot (`renderBusinessProfile()`, `src/system-prompt.ts:224`)
+that tells the model which dimensions are still blank, so it never re-asks.
+
+This runs during onboarding **and on-demand at any time** — if someone asks "what
+should we turn on?", "how do we harden this?", or "make it faster", Glide runs the
+same loop even after go-live. The profile lives at the room level (not inside
+`OnboardingState`), so the advisor keeps working once onboarding is complete.
+
+- **Chat backfill.** `inferBusinessProfileFromText()` (`src/server.ts:392`)
+  deterministically recovers obvious answers from free text (e.g. "we take card
+  payments") and merges them via `applyBusinessProfilePatch()` (`src/server.ts:1193`,
+  called at `src/server.ts:2052`). It only **fills blanks and unions arrays** — it
+  never overwrites an explicit tool answer or flips a boolean to `false`.
+- **Form step.** The opt-in wizard has a matching "nature of the business" step
+  that writes the same state through the `updateBusinessProfile` RPC
+  (`patchBusinessProfile()`, `src/client/main.tsx:1024`).
+- **Reset.** The sidebar **Reset** clears the captured profile via
+  `resetBusinessProfile` (`src/client/main.tsx:1030`, guarded by `window.confirm`).
+
+### From profile to recommendations
+
+Once there's enough signal — or the moment someone asks for advice — Glide calls
+`recommend_configuration` (**read-only**; it proposes and queues nothing). The
+deterministic engine `recommendConfigurations()` (`src/recommendations.ts`) maps
+the profile to priority-ranked recommendations grouped by theme (security /
+performance / reliability / privacy / bots / API / TLS), each with a plain-English
+rationale, the profile signals that triggered it, and a Cloudflare docs citation.
+Glide presents the relevant items, explains **why each fits**, and offers to
+**queue** the concrete ones through the normal write builders — so recommendations
+still pass through the human-Apply safety contract, and nothing plan-gated or
+destructive is queued without confirmation.
+
+The same engine drives the sidebar **Recommendations** panel (`RecommendationsPanel`,
+`src/client/main.tsx:2058`), which runs client-side against the synced profile:
+
+- **Queue** (one-click) appears only for concretely queueable items and calls the
+  `queueRecommendation` RPC. The client sends only the recommendation id and the
+  room's default zone id; the server recomputes the set from the room's trusted
+  `businessProfile` and rebuilds the exact call from its own catalog
+  (`recommendationToPending()`), never from client-supplied input — see
+  [Tools & RPC reference](./tools.md#business-discovery--recommendations) and the
+  [Security model](./security.md).
+- **Ask Glide** appears for everything else and hands the setup to chat
+  (`askAboutRecommendation()`, `src/client/main.tsx:1054`) so the model can do the
+  required discovery first.
+
+Only a narrow set is one-click queueable: `set_zone_setting` for `ssl`,
+`always_use_https`, `min_tls_version`, `tls_1_3`, and `brotli`, plus the concrete
+`cf_write` items for HSTS (`security_header`) and Tiered Cache (`argo/tiered_caching`).
+WAF managed rules, rate limits, Bot Fight Mode, API Shield, Access, Argo, Load
+Balancing, Data Localization, leaked-credential checks, and anything needing
+discovery or a paid plan route to **Ask Glide** instead
+(`isRecommendationQueueable()`, `src/recommendations.ts`). The captured profile and
+its recommendations are also shown read-only in the `/admin` dashboard.
+
+### `BusinessProfile` reference
+
+`BusinessProfile` (`src/shared.ts:299`) — every field is optional so the profile
+fills in gradually; the arrays default to `[]`:
+
+| Field | Meaning |
+| --- | --- |
+| `industry` / `industryLabel` | Canonical vertical key (`ecommerce`, `saas`, `fintech`, `healthcare`, `media`, `gaming`, `government`, `education`, `nonprofit`, `marketing`, `api_platform`, `other`) + its human label (auto-derived). Freeform allowed. |
+| `appTypes` | `website` / `web_app` / `api` / `mobile_backend` / `static_site` / `ugc`. |
+| `audience` | `global` / `regional` / `internal` — drives caching/routing and Access. |
+| `trafficProfile` | `low` / `steady` / `spiky` / `high_volume` — drives rate-limit and caching urgency. |
+| `hasLogin` / `hasApi` | Whether the app has user auth, and whether it exposes an API. |
+| `cacheableContent` | Whether a meaningful share of content is static/cacheable. |
+| `sensitiveData` | `pii` / `payments` / `health` / `credentials` / `financial`. |
+| `compliance` | `pci_dss` / `hipaa` / `gdpr` / `soc2` / `iso27001` / `fedramp`. |
+| `concerns` | `bots` / `ddos` / `scraping` / `credential_stuffing` / `card_testing` / `fraud` / `latency` / `downtime` / `cost`. |
+| `notes` | Freeform note that doesn't fit a structured field. |
+| `completed` | Discovery marked complete for now. |
+| `updatedBy` / `ts` | Attribution + timestamp. |
 
 ---
 
@@ -244,7 +354,10 @@ phase from an empty baseline. A best-effort zone snapshot is also captured. See
 `snapshotZone` / `restoreSnapshot` capture and roll back a full read-only zone
 snapshot (rulesets, settings, IP lists, load balancers) via the migration tool's
 store. **Restoring is destructive** and always a human-confirmed UI action
-(`window.confirm`, `src/client/main.tsx:1024`) — Glide never auto-restores.
+(`window.confirm`) — Glide never auto-restores. The browser sends only the
+snapshot id. The server uses the snapshot's recorded account and zone, requires
+the active room account to match, and verifies that the room token can read that
+exact live zone before restoring.
 
 ---
 

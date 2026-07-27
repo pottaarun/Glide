@@ -72,16 +72,16 @@ export interface GlideState {
   memory: Record<string, string>;
   /** Changes awaiting human approval. */
   pendingActions: PendingAction[];
-  /** Last N applied/failed/rejected actions, newest first (full history is in SQLite). */
+  /** Last N applied/failed/rejected actions retained in synced state, newest first. */
   recentResults: ActionResult[];
   /** People invited to this room by email (most recent first). */
   invites: Invite[];
   /** Convenience pointers the agent can set so users don't repeat IDs. */
   defaultAccountId?: string;
-  defaultZone?: { id: string; name: string };
+  defaultZone?: { id: string; name: string; accountId?: string };
   /**
-   * Whether a Cloudflare API token is available to this room — either set in the
-   * GUI (stored encrypted in the Durable Object) or via the `CF_API_TOKEN` secret.
+   * Whether this room has a usable GUI-set Cloudflare API token, stored encrypted
+   * in its Durable Object.
    */
   tokenConfigured: boolean;
   /** Last 4 chars of the GUI-set token, for a non-sensitive status display. */
@@ -90,6 +90,14 @@ export interface GlideState {
   tokenValid?: boolean;
   /** Guided onboarding progress (set once someone starts onboarding). */
   onboarding?: OnboardingState;
+  /**
+   * The team's "nature of the business" answers (see {@link BusinessProfile}).
+   * Captured by Glide's discovery questions during onboarding AND on-demand, and
+   * fed to the recommendation engine (recommendations.ts) to suggest tailored
+   * performance/security settings. Lives at the room level (not inside
+   * onboarding) so the advisor keeps working after go-live.
+   */
+  businessProfile?: BusinessProfile;
   /** Most recent provider-config preview translated into Cloudflare rules. */
   migrationPlan?: MigrationPlan;
   /** Most recent Terraform export the room generated (downloadable in the UI). */
@@ -109,12 +117,8 @@ export interface GlideState {
    */
   guidance?: GuidanceDoc[];
   /**
-   * Progress of the admin-triggered Cloudflare-docs reindex job (see
-   * {@link DocsIndexState}). The job scrapes the full Cloudflare developer docs,
-   * embeds each page, and upserts them into the SHARED Vectorize index under a
-   * global namespace — so retrieval benefits EVERY room, not just this one. Only
-   * present on the room whose admin started the run; synced so the dashboard can
-   * show live progress and offer cancel.
+   * Internal progress for the cron-owned Cloudflare-docs reindex job. Present only
+   * on the fixed system Durable Object; normal room clients cannot control it.
    */
   docsIndex?: DocsIndexState;
 }
@@ -122,11 +126,9 @@ export interface GlideState {
 /**
  * Live progress of the global "index the Cloudflare docs" background job.
  *
- * The job is admin-triggered from `/admin`, resumable, and runs in bounded
- * batches via the Agents SDK scheduler (it survives client disconnects and DO
- * restarts). Vectors are written to a GLOBAL namespace in the shared index with
- * deterministic ids derived from each page URL, so re-runs update in place
- * (never duplicate) and concurrent runs from different rooms are idempotent.
+ * The job is triggered by the Worker cron, resumable, and runs in bounded batches
+ * via the Agents SDK scheduler. Vectors are written to a global namespace with
+ * deterministic ids, and the previous canonical run is removed before rebuild.
  */
 export interface DocsIndexState {
   /** Lifecycle: idle (never run) → enumerating → indexing → done | error | cancelled. */
@@ -277,6 +279,74 @@ export interface OnboardingState {
   updatedBy?: string;
   ts?: number;
 }
+
+// ---------------------------------------------------------------------------
+// Business profile — the "nature of the business" discovery answers that drive
+// tailored Cloudflare recommendations (see recommendations.ts). Pure data.
+// ---------------------------------------------------------------------------
+
+/**
+ * The team's answers to Glide's probing "nature of the business" questions.
+ *
+ * Glide asks these one at a time (during onboarding and on-demand) to understand
+ * the app, audience, data sensitivity, compliance needs, and known threats, then
+ * feeds this profile to the recommendation engine to suggest relevant
+ * performance/security/reliability settings and rules. Every field is optional
+ * so the profile fills in gradually; the arrays default to `[]`. Recommendations
+ * are still only ever QUEUED for human Apply — capturing a profile changes
+ * nothing on the account.
+ */
+export interface BusinessProfile {
+  /** Canonical industry/vertical key when recognised, e.g. "ecommerce", "fintech", "saas". Freeform allowed. */
+  industry?: string;
+  /** Human label for the industry, e.g. "E-commerce". */
+  industryLabel?: string;
+  /**
+   * What kind of app(s) the team runs. Canonical keys:
+   * "website" | "web_app" | "api" | "mobile_backend" | "static_site" | "ugc".
+   */
+  appTypes: string[];
+  /** Who the app serves — drives caching/routing recommendations. */
+  audience?: "global" | "regional" | "internal";
+  /** Rough traffic scale / spikiness — drives rate limiting and caching urgency. */
+  trafficProfile?: "low" | "steady" | "spiky" | "high_volume";
+  /** Whether the app has user authentication / login flows. */
+  hasLogin?: boolean;
+  /** Whether the team exposes an API (public or partner-facing). */
+  hasApi?: boolean;
+  /** Whether a meaningful share of content is static / cacheable. */
+  cacheableContent?: boolean;
+  /**
+   * Sensitive data handled. Canonical keys:
+   * "pii" | "payments" | "health" | "credentials" | "financial".
+   */
+  sensitiveData: string[];
+  /**
+   * Compliance regimes in scope. Canonical keys:
+   * "pci_dss" | "hipaa" | "gdpr" | "soc2" | "iso27001" | "fedramp".
+   */
+  compliance: string[];
+  /**
+   * Known pains / threats the team is worried about. Canonical keys:
+   * "bots" | "ddos" | "scraping" | "credential_stuffing" | "card_testing" |
+   * "fraud" | "latency" | "downtime" | "cost".
+   */
+  concerns: string[];
+  /** Freeform notes Glide captured that don't fit a structured field. */
+  notes?: string;
+  /** Whether the discovery Q&A has been marked complete for now. */
+  completed?: boolean;
+  updatedBy?: string;
+  ts?: number;
+}
+
+/** An empty profile with the required arrays initialised. */
+export const EMPTY_BUSINESS_PROFILE: BusinessProfile = {
+  appTypes: [],
+  sensitiveData: [],
+  compliance: [],
+  concerns: [],
+};
 
 // ---------------------------------------------------------------------------
 // Migration — existing provider config translated to Cloudflare rules.

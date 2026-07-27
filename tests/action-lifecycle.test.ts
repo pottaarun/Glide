@@ -3,13 +3,92 @@ import test from "node:test";
 
 import {
   APPLY_ATTEMPT_STALE_MS,
+  actionResourceKey,
   formatActionResultEvent,
   isActionApplying,
+  isActionOutcomeUncertain,
   markActionApplying,
   markActionFailed,
   pendingActionStatus,
   recoverStaleActionAttempts,
+  rulesetEntrypointIdentity,
+  selectBulkApplyIds,
+  zoneCreationIdentity,
 } from "../src/action-lifecycle.ts";
+
+test("only failed actions with an explicit uncertain outcome require individual verification", () => {
+  assert.equal(
+    isActionOutcomeUncertain({
+      id: "uncertain",
+      status: "failed",
+      error: "Outcome uncertain: verify the live configuration before retrying.",
+    }),
+    true,
+  );
+  assert.equal(
+    isActionOutcomeUncertain({ id: "ordinary-failure", status: "failed", error: "Permission denied" }),
+    false,
+  );
+  assert.equal(
+    isActionOutcomeUncertain({ id: "pending", status: "pending", error: "Outcome uncertain: stale text" }),
+    false,
+  );
+  assert.equal(
+    isActionOutcomeUncertain(
+      { id: "stale", status: "applying", attemptedAt: 100 },
+      100 + APPLY_ATTEMPT_STALE_MS,
+    ),
+    true,
+  );
+});
+
+test("bulk apply uses only the reviewed snapshot and excludes stale attempts", () => {
+  const now = 1_000 + APPLY_ATTEMPT_STALE_MS;
+  const actions = [
+    { id: "reviewed", status: "pending" as const },
+    { id: "new-after-review", status: "pending" as const },
+    { id: "stale", status: "applying" as const, attemptedAt: 1_000 },
+    { id: "uncertain", status: "failed" as const, error: "Outcome uncertain: timeout" },
+  ];
+
+  assert.deepEqual(
+    selectBulkApplyIds(actions, ["reviewed", "stale", "uncertain"], now),
+    ["reviewed"],
+  );
+});
+
+test("resource locks cover method changes and semantic zone creation", () => {
+  assert.equal(
+    actionResourceKey({ method: "PATCH", path: "/zones/z1/settings/ssl" }),
+    actionResourceKey({ method: "DELETE", path: "/zones/z1/settings/ssl?force=true" }),
+  );
+  const zone = { method: "POST", path: "/zones", body: { name: "Example.COM.", account: { id: "a1" } } };
+  assert.equal(zoneCreationIdentity(zone), "a1:example.com");
+  assert.equal(actionResourceKey(zone), "zone-create:a1:example.com");
+
+  const rulesetPath = "/zones/z1/rulesets/phases/http_request_firewall_custom/entrypoint";
+  assert.deepEqual(rulesetEntrypointIdentity(rulesetPath), {
+    zoneId: "z1",
+    phase: "http_request_firewall_custom",
+  });
+  assert.equal(
+    actionResourceKey({
+      method: "PUT",
+      path: rulesetPath,
+      zoneId: "z1",
+      mergeEntrypoint: { phase: "http_request_firewall_custom" },
+    }),
+    actionResourceKey({ method: "DELETE", path: rulesetPath }),
+  );
+  assert.equal(
+    actionResourceKey({ method: "POST", path: "/zones/z1/rulesets/ruleset-1/rules" }),
+    actionResourceKey({ method: "PUT", path: rulesetPath }),
+  );
+  assert.notEqual(
+    actionResourceKey({ method: "POST", path: "/zones/z2/rulesets/ruleset-1/rules" }),
+    actionResourceKey({ method: "PUT", path: rulesetPath }),
+  );
+});
 
 test("legacy actions default to pending and failed attempts stay retryable", () => {
   const legacy = { id: "a1", summary: "Add zone" };

@@ -20,6 +20,9 @@ const MAX_RETRIES_WRITE = 0;
 const BACKOFF_FACTOR_MS = 1500;
 const TIMEOUT_READ_MS = 25_000;
 const TIMEOUT_WRITE_MS = 60_000;
+export const MAX_CF_API_RESPONSE_BYTES = 2_000_000;
+export const MAX_CF_API_PAGINATION_BYTES = 8_000_000;
+export const MAX_CF_API_PAGES = 50;
 
 export type ApiErrorCategory =
   | "auth"
@@ -45,19 +48,58 @@ export type CfResult<T = unknown> =
   | { ok: true; result: T; resultInfo?: Record<string, unknown> }
   | ({ ok: false } & CfError);
 
-/** Map a CF API path to the human-readable token permission it needs. */
-const PERMISSION_MAP: Array<[string, string]> = [
-  ["/load_balancers/pools", "Load Balancing: Monitors and Pools — Edit (Account)"],
-  ["/load_balancers", "Load Balancers — Edit (Zone)"],
-  ["/rules/lists", "Account Filter Lists — Edit (Account)"],
-  ["/rulesets", "Zone WAF — Edit (Zone) + Account Rulesets — Edit (Account)"],
-  ["/settings/", "Zone Settings — Edit (Zone)"],
-  ["/dns_records", "DNS — Edit (Zone)"],
-  ["/gateway/rules", "Zero Trust: Gateway — Edit (Account)"],
-  ["/access/apps", "Access: Apps and Policies — Edit (Account)"],
-  ["/cfd_tunnel", "Cloudflare Tunnel — Edit (Account)"],
-  ["/teamnet/routes", "Cloudflare Tunnel: Routes — Edit (Account)"],
-  ["/workers/scripts", "Workers Scripts — Edit (Account)"],
+/** A missing phase entrypoint is an empty baseline; every other read failure blocks its replacing PUT. */
+export function resolveRulesetEntrypointBaseline(
+  response: CfResult<{ rules?: Array<Record<string, unknown>> }>,
+): CfResult<Array<Record<string, unknown>>> {
+  if (!response.ok) return response.category === "not_found" ? { ok: true, result: [] } : response;
+  if (
+    !Array.isArray(response.result.rules) ||
+    response.result.rules.some((rule) => !rule || typeof rule !== "object" || Array.isArray(rule))
+  ) {
+    return {
+      ok: false,
+      status: 502,
+      category: "transient",
+      message: "Cloudflare returned a malformed ruleset entrypoint.",
+    };
+  }
+  return { ok: true, result: response.result.rules };
+}
+
+/** Project an API rule response onto the fields accepted by a ruleset PUT. */
+export function rulesetRuleForPut(rule: Record<string, unknown>): Record<string, unknown> {
+  const writable = [
+    "id",
+    "action",
+    "action_parameters",
+    "categories",
+    "description",
+    "enabled",
+    "exposed_credential_check",
+    "expression",
+    "logging",
+    "ratelimit",
+    "ref",
+  ] as const;
+  return Object.fromEntries(
+    writable.flatMap((field) => rule[field] === undefined ? [] : [[field, rule[field]]]),
+  );
+}
+
+/** Map common API paths to likely read/write token permission groups. */
+const PERMISSION_MAP: Array<[string, { read: string; write: string }]> = [
+  ["/load_balancers/pools", { read: "Load Balancing: Monitors and Pools — Read (Account)", write: "Load Balancing: Monitors and Pools — Edit (Account)" }],
+  ["/load_balancers", { read: "Load Balancers — Read (Zone)", write: "Load Balancers — Edit (Zone)" }],
+  ["/rules/lists", { read: "Account Filter Lists — Read (Account)", write: "Account Filter Lists — Edit (Account)" }],
+  ["/rulesets", { read: "Zone WAF — Read (Zone) or Account Rulesets — Read (Account)", write: "Zone WAF — Edit (Zone) or Account Rulesets — Edit (Account)" }],
+  ["/settings/", { read: "Zone Settings — Read (Zone)", write: "Zone Settings — Edit (Zone)" }],
+  ["/dns_records", { read: "DNS — Read (Zone)", write: "DNS — Edit (Zone)" }],
+  ["/gateway/rules", { read: "Zero Trust: Gateway — Read (Account)", write: "Zero Trust: Gateway — Edit (Account)" }],
+  ["/access/apps", { read: "Access: Apps and Policies — Read", write: "Access: Apps and Policies — Edit" }],
+  ["/cfd_tunnel", { read: "Cloudflare Tunnel — Read (Account)", write: "Cloudflare Tunnel — Edit (Account)" }],
+  ["/teamnet/routes", { read: "Cloudflare Tunnel: Routes — Read (Account)", write: "Cloudflare Tunnel: Routes — Edit (Account)" }],
+  ["/workers/scripts", { read: "Workers Scripts — Read (Account)", write: "Workers Scripts — Edit (Account)" }],
 ];
 
 export function permissionHint(path: string, method = "GET"): string | undefined {
@@ -66,8 +108,9 @@ export function permissionHint(path: string, method = "GET"): string | undefined
       ? "Zone > Zone > Read, scoped to the target zones"
       : "Zone > Zone > Edit, scoped to All zones/domains (Account API Tokens need a zone/domain-scoped policy; this permission is not shown under Entire Account)";
   }
+  const access = method.toUpperCase() === "GET" || method.toUpperCase() === "HEAD" ? "read" : "write";
   for (const [pattern, rec] of PERMISSION_MAP) {
-    if (path.includes(pattern)) return rec;
+    if (path.includes(pattern)) return rec[access];
   }
   return undefined;
 }
@@ -98,11 +141,120 @@ interface CfEnvelope<T> {
   result_info?: Record<string, unknown>;
 }
 
+type ResponseBodyFailure =
+  | "missing_body"
+  | "response_too_large"
+  | "pagination_too_large"
+  | "invalid_utf8"
+  | "invalid_json"
+  | "read_error";
+
+type BoundedJsonResult =
+  | { ok: true; value: unknown; bytes: number }
+  | { ok: false; failure: ResponseBodyFailure };
+
+interface InternalCfResult<T> {
+  response: CfResult<T>;
+  responseBytes: number;
+}
+
 function isCfEnvelope<T>(value: unknown): value is CfEnvelope<T> {
   if (!value || typeof value !== "object" || typeof (value as { success?: unknown }).success !== "boolean") {
     return false;
   }
   return !(value as { success: boolean }).success || "result" in value;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+async function cancelResponseBody(response: Response): Promise<void> {
+  try {
+    await response.body?.cancel();
+  } catch {
+    // Cancellation is best-effort after rejecting or retrying a response.
+  }
+}
+
+async function readBoundedJson(
+  response: Response,
+  maxBytes: number,
+  limitFailure: "response_too_large" | "pagination_too_large",
+): Promise<BoundedJsonResult> {
+  if (!response.body) return { ok: false, failure: "missing_body" };
+
+  const contentLength = response.headers.get("Content-Length");
+  if (contentLength && /^\d+$/.test(contentLength)) {
+    const declaredBytes = Number(contentLength);
+    if (!Number.isSafeInteger(declaredBytes) || declaredBytes > maxBytes) {
+      await cancelResponseBody(response);
+      return { ok: false, failure: limitFailure };
+    }
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  const textParts: string[] = [];
+  let bytes = 0;
+  try {
+    while (true) {
+      let chunk: ReadableStreamReadResult<Uint8Array>;
+      try {
+        chunk = await reader.read();
+      } catch {
+        await reader.cancel().catch(() => undefined);
+        return { ok: false, failure: "read_error" };
+      }
+      if (chunk.done) break;
+      bytes += chunk.value.byteLength;
+      if (bytes > maxBytes) {
+        await reader.cancel().catch(() => undefined);
+        return { ok: false, failure: limitFailure };
+      }
+      try {
+        textParts.push(decoder.decode(chunk.value, { stream: true }));
+      } catch {
+        await reader.cancel().catch(() => undefined);
+        return { ok: false, failure: "invalid_utf8" };
+      }
+    }
+
+    try {
+      textParts.push(decoder.decode());
+    } catch {
+      return { ok: false, failure: "invalid_utf8" };
+    }
+
+    try {
+      return { ok: true, value: JSON.parse(textParts.join("")), bytes };
+    } catch {
+      return { ok: false, failure: "invalid_json" };
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+function responseBodyFailureMessage(status: number, failure: ResponseBodyFailure): string {
+  if (failure === "response_too_large") {
+    return `Cloudflare API response exceeded ${MAX_CF_API_RESPONSE_BYTES} bytes.`;
+  }
+  if (failure === "pagination_too_large") {
+    return `Cloudflare API pagination exceeded ${MAX_CF_API_PAGINATION_BYTES} bytes. Narrow the query.`;
+  }
+  if (failure === "missing_body") return `Cloudflare returned HTTP ${status} without a response body.`;
+  if (failure === "invalid_utf8") return `Cloudflare returned HTTP ${status} with invalid UTF-8.`;
+  if (failure === "invalid_json") return `Cloudflare returned HTTP ${status} with invalid JSON.`;
+  return `Cloudflare returned HTTP ${status} with an unreadable response body.`;
+}
+
+function envelopeErrors(value: CfEnvelope<unknown> | null): Array<{ code: number; message: string }> {
+  if (!Array.isArray(value?.errors)) return [];
+  return value.errors.filter(
+    (error): error is { code: number; message: string } =>
+      isRecord(error) && Number.isFinite(error.code) && typeof error.message === "string",
+  );
 }
 
 /**
@@ -114,22 +266,39 @@ export async function cfRequest<T = unknown>(
   token: string,
   body?: unknown,
 ): Promise<CfResult<T>> {
+  return (await cfRequestInternal<T>(method, path, token, body)).response;
+}
+
+async function cfRequestInternal<T = unknown>(
+  method: string,
+  path: string,
+  token: string,
+  body?: unknown,
+  responseLimit = MAX_CF_API_RESPONSE_BYTES,
+  limitFailure: "response_too_large" | "pagination_too_large" = "response_too_large",
+): Promise<InternalCfResult<T>> {
   if (!token) {
     return {
-      ok: false,
-      status: 0,
-      category: "auth",
-      message: "No Cloudflare API token is configured. Add one in Connection > Set token.",
+      response: {
+        ok: false,
+        status: 0,
+        category: "auth",
+        message: "No Cloudflare API token is configured. Add one in Connection > Set token.",
+      },
+      responseBytes: 0,
     };
   }
 
   const canonicalPath = canonicalizeApiPath(path);
   if (!canonicalPath) {
     return {
-      ok: false,
-      status: 400,
-      category: "validation",
-      message: "Invalid Cloudflare API path.",
+      response: {
+        ok: false,
+        status: 400,
+        category: "validation",
+        message: "Invalid Cloudflare API path.",
+      },
+      responseBytes: 0,
     };
   }
 
@@ -155,59 +324,95 @@ export async function cfRequest<T = unknown>(
 
       // Retry only on transient/rate-limit statuses (and only while attempts remain)
       if (RETRYABLE_STATUSES.has(status) && attempt < maxRetries) {
+        await cancelResponseBody(resp);
         continue;
       }
 
-      let rawData: unknown = null;
-      try {
-        rawData = await resp.json();
-      } catch {
-        // Non-JSON response
+      const bodyResult = await readBoundedJson(resp, responseLimit, limitFailure);
+      if (!bodyResult.ok) {
+        const category = resp.ok
+          ? (isGet ? "unknown" : "transient")
+          : classifyHttpError(status);
+        return {
+          response: {
+            ok: false,
+            status,
+            category,
+            message: responseBodyFailureMessage(status, bodyResult.failure),
+            hint: category === "permission" ? permissionHint(canonicalPath, method) : undefined,
+            cfErrors: [],
+          },
+          responseBytes: 0,
+        };
       }
-      const data = isCfEnvelope<T>(rawData) ? rawData : null;
+      const data = isCfEnvelope<T>(bodyResult.value) ? bodyResult.value : null;
 
       if (resp.ok && data?.success) {
-        return { ok: true, result: data.result, resultInfo: data.result_info };
+        return {
+          response: {
+            ok: true,
+            result: data.result,
+            resultInfo: isRecord(data.result_info) ? data.result_info : undefined,
+          },
+          responseBytes: bodyResult.bytes,
+        };
       }
 
       if (resp.ok && !data) {
         return {
-          ok: false,
-          status,
-          category: isGet ? "unknown" : "transient",
-          message: `Cloudflare returned HTTP ${status} without a valid API response envelope.`,
+          response: {
+            ok: false,
+            status,
+            category: isGet ? "unknown" : "transient",
+            message: `Cloudflare returned HTTP ${status} without a valid API response envelope.`,
+          },
+          responseBytes: bodyResult.bytes,
         };
       }
 
-      const cfErrors = data?.errors ?? [];
+      const cfErrors = envelopeErrors(data);
       const cfCode = cfErrors[0]?.code;
       const category = classifyHttpError(status, cfCode);
       const detail =
         cfErrors.map((e) => `${e.message}${e.code ? ` (code ${e.code})` : ""}`).join("; ") ||
         `HTTP ${status}`;
       return {
-        ok: false,
-        status,
-        category,
-        message: detail,
-        hint: category === "permission" ? permissionHint(canonicalPath, method) : undefined,
-        cfErrors,
+        response: {
+          ok: false,
+          status,
+          category,
+          message: detail,
+          hint: category === "permission" ? permissionHint(canonicalPath, method) : undefined,
+          cfErrors,
+        },
+        responseBytes: bodyResult.bytes,
       };
     } catch (err) {
       lastNetworkError = err instanceof Error ? err.message : String(err);
       if (attempt < maxRetries) continue;
       return {
-        ok: false,
-        status: 0,
-        category: "network",
-        message: `Network error calling Cloudflare API: ${lastNetworkError}`,
+        response: {
+          ok: false,
+          status: 0,
+          category: "network",
+          message: `Network error calling Cloudflare API: ${lastNetworkError}`,
+        },
+        responseBytes: 0,
       };
     } finally {
       clearTimeout(timeout);
     }
   }
 
-  return { ok: false, status: 0, category: "unknown", message: lastNetworkError || "Unknown error" };
+  return {
+    response: {
+      ok: false,
+      status: 0,
+      category: "unknown",
+      message: lastNetworkError || "Unknown error",
+    },
+    responseBytes: 0,
+  };
 }
 
 export const cfGet = <T = unknown>(path: string, token: string) =>
@@ -220,14 +425,55 @@ export async function cfGetAll<T = unknown>(
   perPage = 50,
 ): Promise<CfResult<T[]>> {
   const results: T[] = [];
-  let page = 1;
-  // hard cap to protect Worker CPU
-  for (; page <= 50; page++) {
+  let responseBytes = 0;
+  for (let page = 1; page <= MAX_CF_API_PAGES; page++) {
+    const remainingBytes = MAX_CF_API_PAGINATION_BYTES - responseBytes;
+    if (remainingBytes <= 0) {
+      return {
+        ok: false,
+        status: 502,
+        category: "transient",
+        message: `Cloudflare API pagination exceeded ${MAX_CF_API_PAGINATION_BYTES} bytes. Narrow the query.`,
+      };
+    }
     const sep = path.includes("?") ? "&" : "?";
-    const res = await cfRequest<T[]>("GET", `${path}${sep}page=${page}&per_page=${perPage}`, token);
+    const internal = await cfRequestInternal<T[]>(
+      "GET",
+      `${path}${sep}page=${page}&per_page=${perPage}`,
+      token,
+      undefined,
+      Math.min(MAX_CF_API_RESPONSE_BYTES, remainingBytes),
+      remainingBytes < MAX_CF_API_RESPONSE_BYTES ? "pagination_too_large" : "response_too_large",
+    );
+    const res = internal.response;
     if (!res.ok) return res;
-    results.push(...(res.result ?? []));
-    const totalPages = Number((res.resultInfo as { total_pages?: number })?.total_pages ?? 1);
+    if (!Array.isArray(res.result)) {
+      return {
+        ok: false,
+        status: 502,
+        category: "transient",
+        message: "Cloudflare returned a malformed paginated result.",
+      };
+    }
+    responseBytes += internal.responseBytes;
+    for (const item of res.result) results.push(item);
+    const totalPages = res.resultInfo?.total_pages ?? 1;
+    if (typeof totalPages !== "number" || !Number.isSafeInteger(totalPages) || totalPages < 1) {
+      return {
+        ok: false,
+        status: 502,
+        category: "transient",
+        message: "Cloudflare returned malformed pagination metadata.",
+      };
+    }
+    if (totalPages > MAX_CF_API_PAGES) {
+      return {
+        ok: false,
+        status: 502,
+        category: "transient",
+        message: `Cloudflare API pagination exceeded ${MAX_CF_API_PAGES} pages. Narrow the query.`,
+      };
+    }
     if (page >= totalPages) break;
   }
   return { ok: true, result: results };
@@ -307,52 +553,4 @@ export async function findZoneByName(
     return { ok: false, status: 404, category: "not_found", message: `No zone named "${domain}" found on this token.` };
   }
   return { ok: true, result: zone };
-}
-
-/** Zone settings captured in a pre-change snapshot for rollback. */
-const SNAPSHOT_SETTINGS = [
-  "security_level", "ssl", "min_tls_version", "always_use_https",
-  "automatic_https_rewrites", "tls_1_3", "browser_check", "brotli",
-];
-
-export interface ZoneSnapshot {
-  zoneId: string;
-  ts: number;
-  settings: Record<string, unknown>;
-  rulesets: unknown;
-}
-
-export async function snapshotZone(token: string, zoneId: string): Promise<CfResult<ZoneSnapshot>> {
-  // These reads are independent. Running them serially could hold an Apply RPC
-  // open through nine full timeout/retry windows before the write even started.
-  const [settingResults, rs] = await Promise.all([
-    Promise.all(
-      SNAPSHOT_SETTINGS.map(async (key) => ({
-        key,
-        result: await cfGet<{ id: string; value: unknown }>(
-          `/zones/${zoneId}/settings/${key}`,
-          token,
-        ),
-      })),
-    ),
-    cfGet(`/zones/${zoneId}/rulesets`, token),
-  ]);
-  const settings: Record<string, unknown> = {};
-  for (const { key, result } of settingResults) {
-    if (result.ok) settings[key] = result.result?.value;
-  }
-  if (Object.keys(settings).length === 0 && !rs.ok) {
-    return {
-      ok: false,
-      status: rs.status,
-      category: rs.category,
-      message: `Could not capture zone settings or rulesets: ${rs.message}`,
-      hint: rs.hint,
-      cfErrors: rs.cfErrors,
-    };
-  }
-  return {
-    ok: true,
-    result: { zoneId, ts: Date.now(), settings, rulesets: rs.ok ? rs.result : null },
-  };
 }

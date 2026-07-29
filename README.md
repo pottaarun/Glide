@@ -65,10 +65,11 @@ This README is the overview. In-depth docs live in [`docs/`](docs/):
 - **Verified message delivery.** A **live** / **reconnecting** badge prevents sends
   into a closed socket. Interrupted sends are checked by message id; missing text
   returns to the composer and incomplete assistant turns can be retried safely.
-- **Drives all of Cloudflare.** Dedicated tools to add a domain/zone, and manage
-  DNS, zone settings, and WAF custom rules, plus a generic `cf_write`/`cf_get`
-  that can reach any Cloudflare API endpoint (Gateway, Access, Tunnels, R2, Load
-  Balancing, cache rules, …). Zone creation is intentionally reserved for
+- **Broad Cloudflare API coverage.** Dedicated tools add a domain/zone and manage
+  DNS, zone settings, and WAF custom rules. Generic `cf_write`/`cf_get` tools cover
+  Cloudflare v4 JSON REST endpoints for products such as Gateway, Access, Tunnels,
+  Load Balancing, and cache rules; raw, multipart, binary, GraphQL, and nonstandard
+  response APIs are outside their contract. Zone creation is intentionally reserved for
   `add_domain`, which deduplicates approvals and, when the room has a token,
   checks the target account for an existing zone first.
 - **Answers grounded in the live Cloudflare docs.** A system-owned background job
@@ -101,8 +102,9 @@ This README is the overview. In-depth docs live in [`docs/`](docs/):
   own catalog, so a button can't inject an arbitrary API request.
 - **Provider migration (read-only first).** Translate an exported Akamai / Fastly /
   Imperva / Zscaler / Prisma Access / Cisco Umbrella / Proofpoint config into
-  Cloudflare rules, with pre-flight permission checks, a target-zone diff,
-  post-migration validation, Terraform & CSV export, and zone snapshots/restore.
+  Cloudflare rules, with pre-flight permission checks, a target-zone diff, and
+  Terraform & CSV export. Automated post-migration validation and zone snapshot
+  operations are disabled fail-closed; verify the reviewed live configuration directly.
 - **Team guidance (semantic RAG).** Admins add per-room "guidance" docs (house
   rules, preferred defaults, onboarding questions to ask). They're embedded with
   Workers AI and stored in **Vectorize**; at chat time Glide retrieves only the
@@ -110,7 +112,7 @@ This README is the overview. In-depth docs live in [`docs/`](docs/):
   docs when Vectorize isn't configured — so it always works.
 - **Read-only admin dashboard (`/admin`).** A per-room control room to review the
   full transcript, the pending/After-Apply action log, invites, onboarding and
-  migration status, zone snapshots, exports, and a build-time docs tracker — plus
+  migration status, exports, and a build-time docs tracker — plus
   one editable surface for room-scoped **Team guidance**.
 - **Encrypted-at-rest tokens.** A Cloudflare API token can be set in the GUI and
   is stored AES-256-GCM encrypted in the Durable Object — never synced, logged, or
@@ -118,8 +120,8 @@ This README is the overview. In-depth docs live in [`docs/`](docs/):
 - **Secret-safe chat and telemetry.** API-token-shaped chat input is blocked,
   persisted history is redacted, and privacy-safe `glideEvent` logs correlate
   rooms, turns, messages, model stages, outcomes, and client connection epochs.
-- **Friendly errors.** API failures are classified and, where relevant, tell you
-  exactly which token permission is missing.
+- **Friendly errors.** API failures are classified and, where relevant, suggest
+  the likely read/write token permission group to verify.
 - **A responsive control-plane interface.** Neutral dark operational surfaces,
   restrained Cloudflare-orange accents, explicit connection/token states, and a
   color-coded safety model (green = applied, amber = pending, red = failed).
@@ -138,7 +140,7 @@ Worker (src/server.ts)
    ├── routeAgentRequest()  ──►  GlideAgent (Durable Object)
    │                               ├── AIChatAgent: streaming chat + message history
    │                               ├── GlideState: synced room memory + pending queue
-   │                               ├── SQLite: encrypted token, snapshots, queues, last config
+   │                               ├── SQLite: encrypted token, queues, and migration source
    │                               ├── secret-redacted history + structured chat events
    │                               ├── LLM tools (reads run; writes queue)
    │                               ├── Team guidance RAG ──► AI embed + Vectorize (guidance-rag.ts)
@@ -168,9 +170,10 @@ link and you share the same agent — same chat, same queue, same memory. Append
 | `src/system-prompt.ts` | Builds the LLM system prompt, injecting room memory, onboarding status, the migration plan, and the retrieved team-guidance docs. Encodes the safety contract. |
 | `src/guidance-rag.ts` | Team-guidance RAG helper: embeds docs with `GLIDE_EMBED_MODEL`, upserts/queries **Vectorize** per-room (namespace-isolated), and degrades gracefully when the index is absent. |
 | `src/docs-scraper.ts` | Cloudflare-docs RAG: scrapes the developer docs (`llms.txt` index), cleans + chunks pages, embeds them into a shared `__cfdocs_v2__` Vectorize namespace with deterministic ids, and retrieves the top matches per chat turn. |
-| `src/cf-api.ts` | Cloudflare API client: retry/backoff, typed error classification, a permission-hint map, and zone-snapshot capture. |
-| `src/chat-delivery.ts` | Server-authoritative delivery classification plus Cloudflare token detection and persistence redaction. |
-| `src/migration.ts` | Read-only client for the Switchflare / migration tool Worker (preview, Terraform, pre-flight, diff, validate, CSV, snapshots, restore). |
+| `src/cf-api.ts` | Cloudflare API client: retry/backoff, typed error classification, permission hints, and ruleset safety reads. |
+| `src/chat-delivery.ts` | Server-authoritative delivery classification and admission validation plus Cloudflare token detection and persistence redaction. |
+| `src/chat-message-ledger.ts` | Durable accepted-user-message ID ledger schema and trigger, preventing replay after transcript pruning. |
+| `src/migration.ts` | Client for the Switchflare / migration tool Worker (preview, Terraform/CSV, pre-flight, and diff), with fail-closed guards for disabled validation and snapshot mutation endpoints. |
 | `src/env.d.ts` | Augments the generated `Cloudflare.Env` with secrets not declared in `wrangler.jsonc`. |
 | `vite.config.ts` | Builds the client to `dist/client` and exposes the build-time docs manifest (`virtual:glide-docs`) that powers the admin **Dev docs** tab. |
 | `wrangler.jsonc` | Worker config: Durable Object, AI binding, Vectorize binding, optional MIGRATION service binding, static assets, and the `GLIDE_MODEL` / `GLIDE_EMBED_MODEL` vars. |
@@ -182,7 +185,7 @@ link and you share the same agent — same chat, same queue, same memory. Append
 
 ## Prerequisites
 
-- **Node.js** 20+ and npm (Vite 8 requires a current Node release)
+- **Node.js** `^22.18.0` or `>=24.11.0` and npm (also pinned in `.nvmrc`)
 - A **Cloudflare account** with **Workers AI** enabled
 - **[Wrangler](https://developers.cloudflare.com/workers/wrangler/)** (installed as a dev dependency)
 - A **Cloudflare API token** (create one at
@@ -230,9 +233,11 @@ npm run dev:ui
 | `npm run dev:ui` | `vite` — runs only the React UI dev server for quick iteration. |
 | `npm run build` | `vite build` — builds the client to `dist/client`. |
 | `npm run deploy` | `npm run build && wrangler deploy` — build, then deploy the Worker. |
-| `npm test` | Runs the action-lifecycle, chat-integrity, and delivery/redaction regression tests with Node's test runner. |
+| `npm test` | Runs the Node regression suite and Workers-runtime Durable Object integration tests. |
+| `npm run test:workers` | Runs the Workers-runtime integration tests with Vitest. |
 | `npm run types` | `wrangler types` — regenerate binding types. |
-| `npm run check` | `tsc --noEmit` — type-check the project. |
+| `npm run types:check` | Verifies that committed Worker binding types match `wrangler.jsonc`. |
+| `npm run check` | Checks generated bindings, then type-checks the app and Workers-runtime tests. |
 
 ---
 
@@ -392,11 +397,10 @@ Everything in the sidebar is live-synced read-only to every client: room `memory
 token status (`tokenConfigured`, masked `tokenLast4`, `tokenValid`), the
 `onboarding` progress, the captured `businessProfile`, the current
 `migrationPlan`, `terraform` / `csv` exports,
-the latest `migrationCheck`, zone `snapshots`, the team `guidance` docs, and
-whether a migration tool is connected (`migrationToolConfigured`). The decrypted
-token, the raw provider config, the guidance **vectors**, and pre-apply zone
-snapshots are **not** synced — they live only in the Durable Object's SQLite (or
-Vectorize).
+the latest pre-flight/diff `migrationCheck`, the team `guidance` docs, and
+whether migration import is configured (`migrationToolConfigured`). The decrypted
+token, the raw provider config, and the guidance **vectors** are **not** synced —
+they live only in the Durable Object's SQLite (or Vectorize).
 
 Clients mutate room data only through callable RPCs; direct client state writes
 are rejected by the agent.
@@ -474,17 +478,16 @@ preview path is **read-only** — nothing changes until queued rules are Applied
    best-effort and flagged "review before Apply."
 5. **`generate_migration_terraform`** / **`export_migration_csv`** — export the
    plan as Infrastructure-as-Code or CSV (downloaded from the sidebar).
-6. **`migration_validate`** — after Apply, verify the queued rules actually exist
-   in the zone.
 
 **Supported providers:** Akamai, Fastly, Imperva (Incapsula), Zscaler ZIA,
 Zscaler ZPA, Prisma Access, Cisco Umbrella, Akamai EAA, Proofpoint.
 
-**Zone snapshots.** Capture a full read-only snapshot of a zone (rulesets,
-settings, IP lists, load balancers) as a restore point before applying changes.
-Restoring a snapshot is **destructive** and is always a human-only action in the
-UI. Glide derives the restore account and zone from the snapshot, then verifies
-that the room token can read that exact zone before writing; it never auto-restores.
+Automated post-migration validation is **disabled fail-closed** because the
+migration service does not compare complete live rule and setting values. Verify
+the reviewed Cloudflare configuration directly after Apply. Zone snapshot capture,
+listing, restore, and rollback are also disabled because complete, fail-safe
+recovery cannot be guaranteed. Glide exposes no model tools or UI controls for
+these paths; compatibility RPCs return disabled errors.
 
 > Deep dive (wizard steps, checklists, the translation table for what
 > `queue_migration_rules` can map): [docs/onboarding-and-migration.md](docs/onboarding-and-migration.md).
@@ -532,7 +535,7 @@ controls here (do that from the chat room). Tabs:
 | **Actions** | The pending queue (view-only) and the recent apply/fail/reject results. |
 | **Team guidance** | An editable surface — add / edit / enable / delete guidance docs and **Reindex for search**. |
 | **Dev docs** | A "what changed" tracker of the repo's Markdown (README + `docs/`): title, last-modified, size, and an inline viewer. Refreshed on every `npm run build`. |
-| **Onboarding & migration** | Onboarding checklist/progress, the migration plan + last check, zone snapshots, and the Terraform / CSV exports. |
+| **Onboarding & migration** | Onboarding checklist/progress, the migration plan + last pre-flight/diff check, and the Terraform / CSV exports. |
 
 ---
 
@@ -549,7 +552,7 @@ only add a pending action for human approval.
 | `list_zones` | List zones, optionally filtered to one account. |
 | `find_zone` | Resolve a zone id by domain name and save it as the room default. |
 | `list_dns_records` | List DNS records for a zone (optionally by type). |
-| `cf_get` | Generic READ against any Cloudflare API GET endpoint. |
+| `cf_get` | Generic READ against Cloudflare v4 JSON REST endpoints that use the standard API envelope. |
 | `recommend_configuration` | Turn the room's business profile into tailored, priority-ranked Cloudflare recommendations (rationale + docs). Read-only — it proposes; the write builders queue. |
 
 ### Memory & collaboration
@@ -568,7 +571,7 @@ only add a pending action for human approval.
 | `create_dns_record` | Queue creating a DNS record. |
 | `set_zone_setting` | Queue changing a zone setting. |
 | `create_waf_custom_rule` | Queue adding a WAF custom rule to a ruleset. |
-| `cf_write` | Queue any Cloudflare API change (POST/PUT/PATCH/DELETE) for products without a dedicated builder. It refuses `POST /zones`; use `add_domain` for zone creation. |
+| `cf_write` | Queue JSON REST changes (POST/PUT/PATCH/DELETE) for products without a dedicated builder. It refuses `POST /zones`; use `add_domain` for zone creation. |
 
 ### Onboarding, discovery & migration
 
@@ -576,8 +579,7 @@ only add a pending action for human approval.
 answers that drive `recommend_configuration`), `list_migration_providers`,
 `preview_provider_migration`, `queue_migration_rules`,
 `generate_migration_terraform`, `migration_preflight`, `migration_diff_report`,
-`migration_validate`, `export_migration_csv`, `snapshot_zone`,
-`list_zone_snapshots`.
+`export_migration_csv`.
 
 > Each turn runs at most 8 tool-steps, read payloads echoed to the model are
 > capped (~6 KB) to protect the context window, and the room keeps the last 25
@@ -604,10 +606,12 @@ answers that drive `recommend_configuration`), `list_migration_providers`,
 - **LLM-proposed writes always pass through a human.** The model can only queue;
   the server approval path is the only place a pending action executes. Bulk
   approval uses exact reviewed IDs, and uncertain outcomes require an individual
-  live-state check and confirmation. A best-effort zone snapshot is captured
-  before mutating a zone, and ruleset-phase replacements re-read current rules.
+  live-state check and confirmation. Apply does not capture a local pre-mutation
+  snapshot; ruleset-phase replacements re-read current rules and fail closed if
+  that safety read fails.
 - **Migration previews never write.** Glide only calls the migration tool's
-  read-only endpoints; it never triggers a direct deploy.
+  enabled read-only/export endpoints; it never triggers a direct deploy. Automated
+  validation and snapshot/restore/rollback paths are disabled fail-closed.
 
 > Full threat model, the encryption scheme (HKDF → AES-256-GCM), and operator
 > recommendations: [docs/security.md](docs/security.md).

@@ -7,7 +7,7 @@
     "allowImportingTsExtensions": true,
     "lib": ["ES2023", "DOM", "DOM.Iterable", "WebWorker"],
     "jsx": "react-jsx",
-    "types": ["@cloudflare/workers-types"],
+    "types": ["./worker-configuration.d.ts", "node"],
     "strict": true,
     "skipLibCheck": true,
     "esModuleInterop": true,

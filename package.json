@@ -4,19 +4,25 @@
   "private": true,
   "type": "module",
   "description": "Glide — a multi-user, real-time chat room that drives the Cloudflare API with persistent memory.",
+  "engines": {
+    "node": "^22.18.0 || >=24.11.0"
+  },
   "scripts": {
     "build": "vite build",
     "dev": "wrangler dev",
     "dev:ui": "vite",
     "deploy": "npm run build && wrangler deploy",
-    "test": "node --experimental-strip-types --test tests/*.test.ts",
-    "types": "wrangler types",
-    "check": "tsc --noEmit"
+    "test": "npm run test:node && npm run test:workers",
+    "test:node": "node --experimental-strip-types --test tests/*.test.ts",
+    "test:workers": "vitest run",
+    "types": "wrangler types --config wrangler.jsonc",
+    "types:check": "wrangler types --check --config wrangler.jsonc",
+    "check": "npm run types:check && tsc --noEmit && tsc --noEmit -p tests/workers/tsconfig.json"
   },
   "dependencies": {
     "@ai-sdk/react": "^3.0.216",
-    "@cloudflare/ai-chat": "^0.9.1",
-    "agents": "^0.17.1",
+    "@cloudflare/ai-chat": "^0.10.1",
+    "agents": "^0.20.1",
     "ai": "^6.0.214",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",
@@ -24,15 +30,16 @@
     "zod": "^4.4.3"
   },
   "devDependencies": {
-    "@cloudflare/vite-plugin": "^1.42.3",
-    "@cloudflare/workers-types": "^4.20260629.1",
+    "@cloudflare/vite-plugin": "^1.48.0",
+    "@cloudflare/vitest-pool-workers": "^0.19.0",
     "@types/node": "^26.0.1",
     "@types/react": "^19.2.17",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^6.0.3",
     "typescript": "^6.0.3",
     "vite": "^8.1.0",
-    "wrangler": "^4.105.0"
+    "vitest": "^4.1.10",
+    "wrangler": "^4.115.0"
   },
   "overrides": {
     "fast-uri": "3.1.4",

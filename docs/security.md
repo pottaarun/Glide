@@ -12,15 +12,16 @@ and the threat model's sharp edges.
 
 - Every "write" tool (`add_domain`, `create_dns_record`, `set_zone_setting`,
   `create_waf_custom_rule`, `cf_write`, `queue_migration_rules`) calls
-  `queuePending()` (`src/server.ts:2274`), which only appends a `PendingAction`
+  `queuePending()` (`src/server.ts`), which only appends a `PendingAction`
   to synced state. None of them touch Cloudflare.
 - `applyAction()` and its private `applyActionInternal()` are the **only** paths
   that execute an LLM-queued `PendingAction` with
   `cfRequest(action.method, action.path, …)`. `applyAll()` delegates to the same
   internal path for an exact reviewed ID set; it is not a second write mechanism.
-- Snapshot restore is a separate, destructive migration operation. It is never an
-  LLM tool and is documented below under [Snapshot restores are human-only](#snapshot-restores-are-human-only).
-- The system prompt reinforces this (`src/system-prompt.ts:43`): the model is
+- Automated migration validation and zone snapshot capture/list/restore/rollback
+  are disabled fail-closed. They have no LLM tools or UI controls; compatibility
+  RPCs return disabled errors, and legacy restore approvals are rejected.
+- The system prompt reinforces this (`src/system-prompt.ts`): the model is
   instructed never to claim a change is "done/live/created" until it's applied.
 
 This is what makes Glide safe to use collaboratively: the LLM proposes, humans
@@ -33,7 +34,7 @@ written to the Durable Object's SQLite (`glide_secrets` table). The key is
 **derived from the Worker-held `GLIDE_TOKEN_KEY` secret via HKDF-SHA-256**, so the
 ciphertext in the DO is useless without that Worker secret.
 
-Implementation (`src/server.ts:723`–754):
+Implementation (`src/server.ts`):
 
 - `deriveAesKey()` — HKDF-SHA-256 with fixed salt `glide:token:salt:v1` and info
   `glide:token:aes-gcm:v1`, producing a 256-bit AES-GCM key.
@@ -75,6 +76,9 @@ Cloudflare API token. The normal chat path has three layers of protection:
   `[Cloudflare API token redacted]` before any text part is stored.
 - When a room wakes, `onStart()` applies the same sanitizer to historical messages
   created before this guard existed and persists the cleaned transcript.
+- Before the chat SDK can hydrate a pre-upgrade transcript, Glide swaps it into a
+  server-only quarantine and redacts it in bounded batches. Reads and chat writes
+  remain locked until sanitization and the durable completion marker both succeed.
 
 Structured `glideEvent` logs contain identifiers, counts, stages, and outcomes,
 not chat text or token values. `reportClientChatIssue` similarly accepts only a
@@ -91,10 +95,10 @@ There is **no per-user authentication**. A room is identified by its URL hash, a
 **anyone with the link can read the room and Apply changes using its token.**
 
 - Default rooms get a **128-bit random id** (`newRoomId()`,
-  `src/client/main.tsx:65`) so they aren't guessable. Treat the link like a
+  `src/client/main.tsx`) so they aren't guessable. Treat the link like a
   password.
 - The Invite panel makes this explicit and warns before sharing
-  (`src/client/main.tsx:1050`).
+  (`src/client/main.tsx`).
 - Choosing a short/custom room name (the header lets you type one) makes the room
   guessable — only do that for non-sensitive use.
 - The **`/admin#<room>` dashboard** is under the same credential model: it addresses
@@ -114,13 +118,13 @@ your Cloudflare account. If you need stronger isolation, put the Worker behind
 - **Review before controls.** Each approval card presents the method, product,
   summary, path, request body, and any prior error before Apply/Reject. The user
   reviews the actual queued request rather than approving a model sentence alone.
-- **Pre-mutation zone snapshot.** Before applying an action that targets a zone,
-  `applyAction` captures a best-effort snapshot of key zone settings + rulesets
-  (`snapshotZone()`, `src/cf-api.ts:252`) into the `glide_snapshots` table as a
-  rollback breadcrumb. Snapshots are advisory and never block an apply.
+- **No implicit rollback snapshot.** `applyAction` does not capture a local
+  pre-mutation snapshot. On room startup, `onStart()` drops the legacy
+  `glide_snapshots` table because those incomplete breadcrumbs had no safe restore
+  consumer.
 - **Ruleset entrypoint merge.** Phase-replacing `PUT`s re-read the phase's current
   rules at apply time and append the queued rules (`mergeEntrypointRules()`,
-  `src/server.ts:2594`), so applying never silently drops rules added by anyone
+  `src/server.ts`), so applying never silently drops rules added by anyone
   after the action was queued. If that safety read fails, Apply refuses the write
   and retains the action; it never replaces the phase from an empty baseline.
 - **Apply lifecycle and resource fencing.** The server marks an action `applying`
@@ -147,10 +151,10 @@ your Cloudflare account. If you need stronger isolation, put the Worker behind
   `applyAction` also runtime-validates persisted action method/path fields.
 - **Attribution.** Every queued action and every result records who triggered it
   (`createdBy` / `by`), resolved from the request body or message metadata
-  (`resolveActor()`, `src/server.ts:1773`).
-- **Friendly permission errors.** A failed write returns the exact token
-  permission to add (`permissionHint()`, `src/cf-api.ts:59`), so operators grant
-  least privilege rather than over-scoping. New-zone creation specifically
+  (`resolveActor()`, `src/server.ts`).
+- **Friendly permission errors.** A failed call suggests the likely method-aware
+  token permission group (`permissionHint()`, `src/cf-api.ts`) for operators to
+  verify and scope narrowly. New-zone creation specifically
   requires Zone > Zone > Edit over All zones/domains; Account API Tokens need a
   separate zone/domain-scoped policy rather than an Entire Account policy.
 - **Visible, retryable failures.** Failed actions remain in Pending approvals with
@@ -169,28 +173,36 @@ that traffic inside the Cloudflare runtime, so it works even when the migration
 tool's public hostname is protected by Cloudflare Access — no public request, no
 Access challenge.
 
+Automated post-migration validation is disabled because the migration service
+does not compare complete live rule and setting values. Snapshot capture, listing,
+restore, and rollback are disabled because complete, fail-safe recovery cannot be
+guaranteed. The server exposes neither capability to the model or UI and returns
+explicit errors from compatibility RPCs.
+
 ## The Cloudflare-docs RAG only reads public docs
 
 The Cloudflare-docs indexer (`src/docs-scraper.ts`) fetches the **public**
 developer documentation, embeds it, and writes vectors to a **shared** Vectorize
 namespace (`__cfdocs_v2__`). It contains no account data, no tokens, and nothing
 room-specific — reindexing and retrieval never touch your Cloudflare account. The
-job is owned by one fixed system Durable Object and triggered only by the weekly
-cron. Room clients cannot start, cancel, or clear this deployment-wide resource.
-Each rebuild removes the prior canonical run's known vectors before indexing, so
-removed pages and shorter pages do not leave stale chunks. The versioned `v2`
-namespace also prevents vectors created by the earlier room-controlled indexer
-from being queried. The job has no write path to your Cloudflare account.
+job is owned by one fixed `__system__` Durable Object and triggered only by the
+weekly cron or first-load bootstrap. Worker routing returns `404` before HTTP or
+WebSocket requests can wake that reserved instance, and coordinator methods reject
+ordinary room names. A durable queue-ready marker and startup reconciliation
+prevent interrupted jobs from remaining active or treating a partial manifest as
+canonical. Successful pages replace deterministic vectors in place; removed pages
+are deleted only after complete product enumeration. The job has no write path to
+your Cloudflare account.
 
-## Snapshot restores are human-only
+## Disabled migration validation and recovery paths
 
-`restoreSnapshot` reverts a zone to a captured snapshot, **removing changes made
-since**. It is never an LLM tool and never automated: the UI requires an explicit
-`window.confirm` (`src/client/main.tsx:1024`) before calling the RPC. The outcome
-is recorded in `recentResults`. The client supplies only the snapshot id; the
-server takes the account and zone from the stored snapshot, requires the active
-room account to match, and verifies that the room token can read that exact live
-zone before invoking the destructive restore.
+There is no current snapshot or automated validation workflow. `runValidate`,
+`snapshotZone`, `refreshSnapshots`, and `restoreSnapshot` are compatibility stubs
+that always return `{ ok: false }`. The UI has no controls for them, the LLM has no
+corresponding tools, and legacy `/api/restore` or `/api/rollback` approvals are
+recognized and refused by Apply. Operators must verify the reviewed live
+configuration directly and use an external backup/change-management process when
+rollback protection is required.
 
 ## Input-size & resource limits
 
@@ -198,14 +210,14 @@ These limits bound resource use and protect the model's context window:
 
 | Limit | Value | Source |
 | --- | --- | --- |
-| Tool-steps per chat turn | 8 | `stepCountIs(8)`, `src/server.ts:1635` |
-| Read payload echoed to the model | ~6 000 chars | `MAX_READ_CHARS`, `src/server.ts:109` |
-| Synced action-result history | 25 | `MAX_RECENT_RESULTS`, `src/server.ts:107` |
-| Migration-plan rules in synced state | 300 | `MAX_PLAN_RULES`, `src/server.ts:113` |
-| Inline, uploaded, or URL-fetched config size | 2 000 000 UTF-8 bytes total | `MAX_CONFIG_BYTES`, `src/migration.ts` |
+| Tool-steps per chat turn | 8 | `stepCountIs(8)`, `src/server.ts` |
+| Read payload echoed to the model | ~6 000 chars | `MAX_READ_CHARS`, `src/server.ts` |
+| Synced action-result history | 25 | `MAX_RECENT_RESULTS`, `src/server.ts` |
+| Migration-plan rules in synced state | 300 | `MAX_PLAN_RULES`, `src/server.ts` |
+| Inline or uploaded config size | 850 000 UTF-8 bytes total | `MAX_CONFIG_BYTES`, `src/migration.ts` |
 | Uploaded config file count | 50 | `MAX_CONFIG_FILES`, `src/migration.ts` |
 | API GET retries / write retries | 3 / 0 | `cfRequest`, `src/cf-api.ts` |
-| `cfGetAll` page cap | 50 pages × 50 | `src/cf-api.ts:190` |
+| `cfGetAll` page cap | 50 pages × 50 | `src/cf-api.ts` |
 
 ## Threat-model summary
 
@@ -217,12 +229,14 @@ These limits bound resource use and protect the model's context window:
 | Duplicate zone proposal | Exact existing-zone lookup, central account/domain queue dedupe, and `cf_write` block for `POST /zones` | A token without read access cannot prove whether a zone exists; use correct Zone Read scope before queueing. |
 | Token theft from storage | AES-256-GCM at rest, key in a Worker secret; never synced/logged/returned | Anyone with both the DO storage **and** `GLIDE_TOKEN_KEY` could decrypt. |
 | Token pasted into chat | Client blocks recognizable `cfat_...`, `cfut_...`, and `cfk_...` values; server redacts new and historical persisted text | Other secret formats or obfuscation can bypass pattern matching; revoke any exposed credential. |
+| Old transcript cannot be redacted because its room token cannot decrypt | Recovery is exposed only from a durable decryption-failed state, requires an exact typed confirmation, deletes in bounded batches, and preserves permanent message-id tombstones | The unrecoverable legacy transcript is permanently deleted. Anyone with the room link can invoke offered recovery, so protect room links or front Glide with Access. |
 | Sensitive text exposed through diagnostics | Structured chat events omit message text and token values | Platform-generated exception metadata may still need normal operator access controls and retention review. |
 | Unauthorized room access | 128-bit unguessable default room id | The link is the credential; sharing it grants Apply rights. Use custom names only for non-sensitive rooms, or front with Access. |
-| Dropping existing ruleset rules on Apply | Re-read + merge at apply time; pre-apply snapshot | Concurrent changes after the final read remain possible; review the result and snapshot. If the safety read fails, Glide refuses the write. |
+| Dropping existing ruleset rules on Apply | Re-read + merge at apply time; refuse the write if the safety read fails | Concurrent changes after the final read remain possible; review the live result directly. |
 | A message appears sent during a disconnect | Send-time socket validation and server-authoritative transcript check | Delivery can be temporarily unconfirmed while both WebSocket and verification fetch are unavailable; wait for **live** before retrying. |
-| Migration tool causing writes | Only read-only endpoints are called; `/api/migrations/start` is never used | Trust boundary is the migration tool you connect. |
-| Destructive restore | Human-only, explicit confirm, snapshot-recorded target, and live account/zone authorization; never an LLM tool | A human can still confirm a destructive restore for a zone their room token controls. |
+| Migration tool causing writes | Enabled operations are read-only/export only; `/api/migrations/start` is never used, and snapshot/restore/rollback paths fail closed | Trust boundary is the migration service you configure. |
+| False confidence from incomplete migration validation | Automated validation is disabled; operators verify the reviewed live values directly | Verification is manual and must cover the intended rules and settings. |
+| Incomplete snapshot restore | Snapshot capture/list/restore/rollback have no tools or UI; compatibility paths fail closed and legacy approvals are refused | Glide provides no automated rollback; use an external recovery process. |
 
 ## Operator recommendations
 
@@ -237,8 +251,9 @@ These limits bound resource use and protect the model's context window:
 - Keep default (random) room ids for any room with a real token; share links only
   with trusted teammates.
 - Consider fronting the Worker with Cloudflare Access for an extra auth layer.
-- Capture a zone snapshot before a large migration Apply, and use
-  `migration_diff_report` first to see what already exists.
+- Before a large migration Apply, use `migration_diff_report`, arrange any needed
+  external backup/rollback process, and verify the reviewed live configuration
+  directly afterward.
 - Restrict Workers Observability access and use the structured `glideEvent` fields
   for incident analysis instead of adding ad hoc message-body logging. See
   [Troubleshooting & observability](./troubleshooting.md).

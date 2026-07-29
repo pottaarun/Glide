@@ -2,6 +2,7 @@ node_modules/
 dist/
 .wrangler/
 .dev.vars
-worker-configuration.d.ts
 *.log
+*.cpuprofile
 .DS_Store
+.~lock.*#

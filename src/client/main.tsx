@@ -14,6 +14,7 @@ import {
   Component,
   StrictMode,
   Suspense,
+  use,
   useCallback,
   useEffect,
   useMemo,
@@ -29,27 +30,53 @@ import type { UIMessage } from "ai";
 // Build-time snapshot of the project's Markdown docs (README + fix-progress log
 // + docs/*.md), injected by the `glide-docs-manifest` Vite plugin. Powers the
 // Admin page's "Dev docs updates" tracker.
-import { docsManifest } from "virtual:glide-docs";
+import type { GlideDocsManifest } from "virtual:glide-docs";
 
 import "./index.css";
 
 import {
   isCloudflareDocsUrl,
+  LEGACY_CHAT_RECOVERY_CONFIRMATION,
   type ActionResult,
   type BusinessProfile,
   type DocLink,
   type GlideMessageMetadata,
   type GlideState,
   type GuidanceDoc,
+  type LegacyChatMigrationStatus,
   type MigrationPlan,
   type OnboardingPath,
   type OnboardingState,
   type PendingAction,
   type SetupType,
+  type TerraformArtifact,
 } from "../shared";
-import { isActionApplying, isActionOutcomeUncertain, pendingActionStatus } from "../action-lifecycle";
-import { containsCloudflareApiToken, persistedDeliveryStatus } from "../chat-delivery";
+import {
+  hasCanonicalActionResultParts,
+  isActionApplying,
+  isActionOutcomeUncertain,
+  isSnapshotRestoreAction,
+  pendingActionStatus,
+} from "../action-lifecycle";
+import {
+  MAX_CHAT_DELIVERY_STATUS_IDS,
+  MAX_CHAT_HISTORY_BYTES,
+  MAX_CHAT_PARTICIPANT_NAME_CHARS,
+  MAX_CHAT_TEXT_CHARS,
+  chatParticipantNameError,
+  containsCloudflareApiToken,
+  interruptedRetryTarget,
+  isChatTextWithinLimit,
+  persistedDeliveryStatus,
+  type DeliveryStatus,
+} from "../chat-delivery";
+import {
+  readPendingDelivery,
+  readRecoverableDrafts,
+  type PendingDelivery,
+} from "../chat-delivery-storage";
 import { MAX_CONFIG_BYTES, MAX_CONFIG_FILENAME_BYTES, MAX_CONFIG_FILES } from "../migration";
+import { MAX_ONBOARDING_DOMAIN_CHARS } from "../input-validation";
 import {
   isRecommendationQueueable,
   recommendConfigurations,
@@ -58,14 +85,212 @@ import {
 } from "../recommendations";
 
 const CHAT_CONNECTION_ERROR = "Glide's live connection closed before the message was sent.";
+const AGENT_MESSAGES_TIMEOUT_MS = 10_000;
+const MAX_MIGRATION_STATUS_BYTES = 16_000;
+const MAX_RECOVERABLE_DRAFTS = MAX_CHAT_DELIVERY_STATUS_IDS;
+
+type ReconciledDeliveryStatus = DeliveryStatus | "accepted_pruned";
+
+function reconciledDeliveryStatus(
+  messages: readonly UIMessage[],
+  messageId: string,
+  acceptedAbsentIds: ReadonlySet<string>,
+): ReconciledDeliveryStatus {
+  const status = persistedDeliveryStatus(messages, messageId);
+  return status === "not_delivered" && acceptedAbsentIds.has(messageId) ? "accepted_pruned" : status;
+}
+
+interface StoredDraft {
+  text: string;
+  revision: string;
+  recoveryId?: string;
+}
+
+function parsedLegacyChatMigrationStatus(value: unknown): LegacyChatMigrationStatus | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const candidate = value as {
+    status?: unknown;
+    message?: unknown;
+    recoveryConfirmation?: unknown;
+  };
+  if (
+    !["ready", "migrating", "recovery_required", "discarding"].includes(String(candidate.status)) ||
+    typeof candidate.message !== "string" ||
+    !candidate.message ||
+    candidate.message.length > 500
+  ) return undefined;
+  if (
+    candidate.status === "recovery_required" &&
+    candidate.recoveryConfirmation !== LEGACY_CHAT_RECOVERY_CONFIRMATION
+  ) return undefined;
+  if (
+    candidate.recoveryConfirmation !== undefined &&
+    candidate.recoveryConfirmation !== LEGACY_CHAT_RECOVERY_CONFIRMATION
+  ) return undefined;
+  return candidate as LegacyChatMigrationStatus;
+}
+
+function roomSessionKey(kind: "draft" | "pending" | "recoverable", room: string): string {
+  return `glide:${kind}:${encodeURIComponent(room)}`;
+}
+
+function readSessionValue(key: string): string | null {
+  try {
+    return sessionStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function readStoredDraft(key: string): StoredDraft | undefined {
+  let value: unknown;
+  try {
+    value = JSON.parse(readSessionValue(key) ?? "null");
+  } catch {
+    value = undefined;
+  }
+  const draft = value && typeof value === "object" && !Array.isArray(value)
+    ? value as Partial<StoredDraft>
+    : undefined;
+  if (draft && typeof draft.text === "string" && containsCloudflareApiToken(draft.text)) {
+    try {
+      sessionStorage.removeItem(key);
+    } catch {
+      // The secret is still excluded from React state even if storage is unavailable.
+    }
+    return undefined;
+  }
+  if (
+    !draft ||
+    typeof draft.text !== "string" ||
+    !draft.text ||
+    !isChatTextWithinLimit(draft.text) ||
+    typeof draft.revision !== "string" ||
+    !/^[A-Za-z0-9_-]{1,200}$/.test(draft.revision) ||
+    (draft.recoveryId !== undefined && !/^[A-Za-z0-9_-]{1,200}$/.test(draft.recoveryId))
+  ) return undefined;
+  return draft as StoredDraft;
+}
+
+function writeSessionValue(key: string, value: string | undefined): boolean {
+  try {
+    if (value === undefined) sessionStorage.removeItem(key);
+    else sessionStorage.setItem(key, value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function writeStoredDraft(key: string, draft: StoredDraft | undefined): boolean {
+  return writeSessionValue(key, draft ? JSON.stringify(draft) : undefined);
+}
+
+async function readBoundedResponseText(response: Response, maxBytes: number): Promise<string> {
+  const contentLength = Number(response.headers.get("content-length"));
+  if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+    await response.body?.cancel().catch(() => undefined);
+    throw new Error(`Room history exceeds the ${maxBytes.toLocaleString()} byte safety limit.`);
+  }
+  if (!response.body) return "";
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  const chunks: string[] = [];
+  let bytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      bytes += value.byteLength;
+      if (bytes > maxBytes) {
+        await reader.cancel().catch(() => undefined);
+        throw new Error(`Room history exceeds the ${maxBytes.toLocaleString()} byte safety limit.`);
+      }
+      chunks.push(decoder.decode(value, { stream: true }));
+    }
+    chunks.push(decoder.decode());
+    return chunks.join("");
+  } catch (error) {
+    await reader.cancel().catch(() => undefined);
+    throw error;
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+async function fetchAgentMessages(
+  agentUrl: string,
+  timeoutMs = AGENT_MESSAGES_TIMEOUT_MS,
+  allowPendingMigration = false,
+): Promise<UIMessage[]> {
+  const url = new URL(agentUrl, location.origin);
+  url.searchParams.delete("_pk");
+  url.pathname = `${url.pathname.replace(/\/$/, "")}/get-messages`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, {
+      cache: "no-store",
+      credentials: "same-origin",
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      const body = await readBoundedResponseText(response, MAX_MIGRATION_STATUS_BYTES);
+      let payload: unknown;
+      try {
+        payload = JSON.parse(body);
+      } catch {
+        payload = undefined;
+      }
+      const migration = payload && typeof payload === "object" && !Array.isArray(payload) &&
+          (payload as { code?: unknown }).code === "legacy_chat_migration_incomplete"
+        ? parsedLegacyChatMigrationStatus(payload)
+        : undefined;
+      if (response.status === 503 && migration) {
+        if (allowPendingMigration) return [];
+        throw new Error(migration.message);
+      }
+      throw new Error(`Loading room history returned HTTP ${response.status}.`);
+    }
+    const value: unknown = JSON.parse(await readBoundedResponseText(response, MAX_CHAT_HISTORY_BYTES));
+    if (
+      !Array.isArray(value) ||
+      value.some(
+        (message) =>
+          !message ||
+          typeof message !== "object" ||
+          typeof (message as { id?: unknown }).id !== "string" ||
+          !Array.isArray((message as { parts?: unknown }).parts),
+      )
+    ) {
+      throw new Error("Glide returned malformed room history.");
+    }
+    return value as UIMessage[];
+  } catch (error) {
+    if (controller.signal.aborted) throw new Error("Loading room history timed out. Reload to try again.");
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function loadInitialAgentMessages({ url }: { url?: string }): Promise<UIMessage[]> {
+  if (!url) throw new Error("Glide could not determine the room history URL.");
+  return fetchAgentMessages(url, AGENT_MESSAGES_TIMEOUT_MS, true);
+}
 
 // ---------------------------------------------------------------------------
 // Room + identity helpers
 // ---------------------------------------------------------------------------
 
 function readRoomFromHash(): string {
-  const raw = decodeURIComponent(location.hash.replace(/^#/, "")).trim();
-  return raw.replace(/^room=/, "").trim();
+  try {
+    const raw = decodeURIComponent(location.hash.replace(/^#/, "")).trim();
+    const room = raw.replace(/^room=/, "").trim();
+    return room.length <= 200 && !/[\u0000-\u001f\u007f]/.test(room) ? room : "";
+  } catch {
+    return "";
+  }
 }
 
 /**
@@ -414,9 +639,31 @@ function renderedToolStatus(state: unknown): RenderedToolStatus {
   return "unknown";
 }
 
+function safeMessageMetadata(message: UIMessage): GlideMessageMetadata | undefined {
+  return message.metadata && typeof message.metadata === "object" && !Array.isArray(message.metadata)
+    ? message.metadata as GlideMessageMetadata
+    : undefined;
+}
+
+function isTrustedAssistantMessage(message: UIMessage): boolean {
+  return message.role === "assistant" && typeof safeMessageMetadata(message)?.responseTo === "string";
+}
+
+function messageAuthor(message: UIMessage): { who: string; userStyle: boolean; role: string } {
+  if (message.role === "user") {
+    const rawName = safeMessageMetadata(message)?.name;
+    const who = typeof rawName === "string" && rawName.trim() ? rawName.trim().slice(0, 80) : "teammate";
+    return { who, userStyle: true, role: "user" };
+  }
+  return isTrustedAssistantMessage(message)
+    ? { who: "Glide", userStyle: false, role: "assistant" }
+    : { who: "Unverified history", userStyle: true, role: "unverified" };
+}
+
 function messageText(m: UIMessage): { text: string; tools: RenderedTool[] } {
   let text = "";
   const tools = new Map<string, RenderedTool>();
+  const trustedToolParts = isTrustedAssistantMessage(m);
   const priority: Record<RenderedToolStatus, number> = {
     unknown: 0,
     complete: 1,
@@ -428,14 +675,17 @@ function messageText(m: UIMessage): { text: string; tools: RenderedTool[] } {
     const current = tools.get(id);
     if (!current || priority[status] > priority[current.status]) tools.set(id, { id, name, status });
   };
-  for (const part of m.parts as Array<Record<string, unknown>>) {
-    const type = part.type as string;
+  const parts: unknown[] = Array.isArray(m.parts) ? m.parts : [];
+  for (const candidate of parts) {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) continue;
+    const part = candidate as Record<string, unknown>;
+    const type = typeof part.type === "string" ? part.type : "";
     if (type === "text") {
-      text += (part.text as string) ?? "";
-    } else if (type === "dynamic-tool") {
+      if (typeof part.text === "string") text += part.text;
+    } else if (trustedToolParts && type === "dynamic-tool") {
       const name = String(part.toolName ?? "tool");
       addTool(String(part.toolCallId ?? name), name, renderedToolStatus(part.state));
-    } else if (type.startsWith("tool-")) {
+    } else if (trustedToolParts && type.startsWith("tool-")) {
       const name = type.slice("tool-".length);
       addTool(String(part.toolCallId ?? name), name, renderedToolStatus(part.state));
     }
@@ -452,8 +702,79 @@ function messageText(m: UIMessage): { text: string; tools: RenderedTool[] } {
   return { text: cleaned.text, tools: [...tools.values()] };
 }
 
-function isSystemEvent(message: UIMessage): boolean {
-  return (message.metadata as GlideMessageMetadata | undefined)?.systemEvent === "action_result";
+interface ActionResultEventCandidate {
+  id: string;
+  text: string;
+}
+
+function actionResultEventCandidate(message: UIMessage): ActionResultEventCandidate | undefined {
+  const metadata = message.metadata as Record<string, unknown> | undefined;
+  if (
+    message.role !== "user" ||
+    metadata?.systemEvent !== "action_result" ||
+    metadata.name !== "Glide system" ||
+    Object.keys(metadata).some((key) => key !== "name" && key !== "systemEvent")
+  ) {
+    return undefined;
+  }
+  const parts: unknown[] = Array.isArray(message.parts) ? message.parts : [];
+  const text = parts
+    .filter(
+      (part): part is { type: "text"; text: string } =>
+        Boolean(part) && typeof part === "object" && !Array.isArray(part) &&
+        (part as { type?: unknown }).type === "text" && typeof (part as { text?: unknown }).text === "string",
+    )
+    .map((part) => part.text)
+    .join("");
+  return hasCanonicalActionResultParts(parts, text) ? { id: message.id, text } : undefined;
+}
+
+function actionResultEventKey(candidate: ActionResultEventCandidate): string {
+  return JSON.stringify([candidate.id, candidate.text]);
+}
+
+/** Hide only exact server-registered events; unverified metadata stays visible. */
+function useVerifiedActionResultEvents(
+  agent: { call: <T = unknown>(method: string, args?: unknown[]) => Promise<T>; readyState: number },
+  messages: UIMessage[],
+): Set<string> {
+  const [verified, setVerified] = useState<Set<string>>(() => new Set());
+  const candidates = [
+    ...new Map(
+      messages
+        .map(actionResultEventCandidate)
+        .filter((candidate): candidate is ActionResultEventCandidate => candidate !== undefined)
+        .map((candidate) => [actionResultEventKey(candidate), candidate]),
+    ).values(),
+  ];
+  const signature = candidates.map(actionResultEventKey).join("\n");
+
+  useEffect(() => {
+    if (!signature || agent.readyState !== WebSocket.OPEN) return;
+    let active = true;
+    const batches = Array.from(
+      { length: Math.ceil(candidates.length / 100) },
+      (_, index) => candidates.slice(index * 100, (index + 1) * 100),
+    );
+    void Promise.all(
+      batches.map((batch) =>
+        agent.call<Array<{ id: string; text: string }>>("verifyActionResultEvents", [batch]),
+      ),
+    )
+      .then((responses) => {
+        if (!active) return;
+        const items = responses.flat().filter((item) => item && typeof item === "object");
+        setVerified(new Set(items.map(actionResultEventKey)));
+      })
+      .catch(() => {
+        // Safe default: a verification failure leaves reserved-looking text visible.
+      });
+    return () => {
+      active = false;
+    };
+  }, [agent, agent.readyState, signature]);
+
+  return verified;
 }
 
 /** A subtle, non-interactive light bloom that follows fine pointers only. */
@@ -553,6 +874,8 @@ function ToolChip({ tool: rendered }: { tool: RenderedTool }) {
 
 function Join({ onJoin }: { onJoin: (name: string) => void }) {
   const [value, setValue] = useState("");
+  const normalizedName = value.trim();
+  const nameError = value ? chatParticipantNameError(normalizedName) : undefined;
   return (
     <div style={S.joinWrap} className="glide-join">
       <div style={S.joinCard} className="glide-glass glide-join-card">
@@ -562,19 +885,21 @@ function Join({ onJoin }: { onJoin: (name: string) => void }) {
         <form
           onSubmit={(e) => {
             e.preventDefault();
-            const name = value.trim();
-            if (name) onJoin(name);
+            if (!nameError && normalizedName) onJoin(normalizedName);
           }}
         >
           <label style={S.label}>Your display name</label>
           <input
             autoFocus
             value={value}
+            maxLength={MAX_CHAT_PARTICIPANT_NAME_CHARS}
             onChange={(e) => setValue(e.target.value)}
             placeholder="e.g. Avery"
             style={S.input}
+            aria-invalid={Boolean(nameError)}
           />
-          <button type="submit" style={S.primaryBtn} disabled={!value.trim()}>
+          {nameError && <div style={{ ...S.hint, marginTop: 6 }}>{nameError}</div>}
+          <button type="submit" style={S.primaryBtn} disabled={!normalizedName || Boolean(nameError)}>
             Enter room
           </button>
         </form>
@@ -589,36 +914,227 @@ function Join({ onJoin }: { onJoin: (name: string) => void }) {
 
 function Room({ name }: { name: string }) {
   const [room, setRoom] = useState<string>(() => readRoomFromHash() || newRoomId());
+
+  useEffect(() => {
+    if (!readRoomFromHash()) {
+      history.replaceState(null, "", `${location.pathname}${location.search}#${encodeURIComponent(room)}`);
+    }
+    const onHash = () => {
+      const next = readRoomFromHash();
+      setRoom(next || newRoomId());
+    };
+    window.addEventListener("hashchange", onHash);
+    return () => window.removeEventListener("hashchange", onHash);
+  }, [room]);
+
+  const changeRoom = useCallback((next: string) => {
+    const normalized = next.trim();
+    if (!normalized || normalized.length > 200 || /[\u0000-\u001f\u007f]/.test(normalized)) return;
+    location.hash = encodeURIComponent(normalized);
+  }, []);
+
+  return <RoomSession key={room} name={name} room={room} onRoomChange={changeRoom} />;
+}
+
+function RoomSession({
+  name,
+  room,
+  onRoomChange,
+}: {
+  name: string;
+  room: string;
+  onRoomChange: (room: string) => void;
+}) {
+  const draftStorageKey = roomSessionKey("draft", room);
+  const pendingStorageKey = roomSessionKey("pending", room);
+  const recoverableStorageKey = roomSessionKey("recoverable", room);
+  const initialDraft = useMemo(() => readStoredDraft(draftStorageKey), [draftStorageKey]);
   const [state, setState] = useState<GlideState>();
   const [notice, setNotice] = useState<string>();
   const [busyIds, setBusyIds] = useState<Set<string>>(new Set());
-  const [draft, setDraft] = useState("");
+  const [draft, setDraft] = useState(() => initialDraft?.text ?? "");
+  const [recoverableDrafts, setRecoverableDrafts] = useState<PendingDelivery[]>(() =>
+    readRecoverableDrafts(sessionStorage, recoverableStorageKey));
   const [tokenInput, setTokenInput] = useState("");
   const [showTokenForm, setShowTokenForm] = useState(false);
   const [inviteEmail, setInviteEmail] = useState("");
   // The guided FORM is opt-in now; onboarding is chat-led by default.
   const [formOpen, setFormOpen] = useState(false);
   const [migBusy, setMigBusy] = useState<string>();
-  const [snapBusy, setSnapBusy] = useState<string>();
   const [connected, setConnected] = useState(false);
+  const [historyReady, setHistoryReady] = useState(false);
+  const [hydrationRetry, setHydrationRetry] = useState(0);
+  const [deliverySyncing, setDeliverySyncing] = useState(false);
   const [deliveryIssue, setDeliveryIssue] = useState<{ message: string; retryable: boolean }>();
+  const [legacyChatMigration, setLegacyChatMigration] = useState<LegacyChatMigrationStatus>();
+  const [legacyRecoveryConfirmation, setLegacyRecoveryConfirmation] = useState("");
+  const [legacyRecoveryBusy, setLegacyRecoveryBusy] = useState(false);
+  const [roomDraft, setRoomDraft] = useState(room);
   const scrollRef = useRef<HTMLDivElement>(null);
   const guidedStartInFlight = useRef(false);
   const reverifiedToken = useRef(false);
   const connectionEpoch = useRef(0);
+  const hydratedEpoch = useRef(0);
+  const hydratingEpoch = useRef(0);
+  const hydrationFailures = useRef(0);
+  const hydrationRetryTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const busyRef = useRef(false);
+  const historyReadyRef = useRef(historyReady);
+  const deliverySyncingRef = useRef(false);
+  const submissionInFlightRef = useRef(false);
+  const deliverySyncSequence = useRef(0);
+  const pendingDeliveryRef = useRef<PendingDelivery | undefined>(
+    readPendingDelivery(sessionStorage, pendingStorageKey),
+  );
+  const pendingRetryRef = useRef<{ messageId: string; interruptedAssistantId?: string } | undefined>(undefined);
+  const draftRef = useRef(draft);
+  const draftRecoveryIdRef = useRef<string | undefined>(initialDraft?.recoveryId);
+  const draftRevisionRef = useRef<string | undefined>(initialDraft?.revision);
+  const recoverableCountRef = useRef(recoverableDrafts.length);
+  const recoverableDraftsRef = useRef(recoverableDrafts);
   const messagesRef = useRef<UIMessage[]>([]);
+  const legacyChatMigrationRef = useRef<LegacyChatMigrationStatus | undefined>(undefined);
+  draftRef.current = draft;
+  historyReadyRef.current = historyReady;
+  recoverableCountRef.current = recoverableDrafts.length;
+  recoverableDraftsRef.current = recoverableDrafts;
+
+  const updateHistoryReady = useCallback((ready: boolean) => {
+    historyReadyRef.current = ready;
+    setHistoryReady(ready);
+  }, []);
+
+  const scheduleHydrationRetry = useCallback(() => {
+    if (hydrationRetryTimer.current) return;
+    hydrationFailures.current = Math.min(hydrationFailures.current + 1, 6);
+    const delay = Math.min(250 * 2 ** (hydrationFailures.current - 1), 5_000);
+    hydrationRetryTimer.current = setTimeout(() => {
+      hydrationRetryTimer.current = undefined;
+      setHydrationRetry((current) => current + 1);
+    }, delay);
+  }, []);
+
+  useEffect(() => () => {
+    if (hydrationRetryTimer.current) clearTimeout(hydrationRetryTimer.current);
+  }, []);
+
+  const updateDraft = useCallback((value: string, recoveryId?: string): boolean => {
+    if (containsCloudflareApiToken(value)) {
+      writeStoredDraft(draftStorageKey, undefined);
+      draftRef.current = value;
+      draftRecoveryIdRef.current = undefined;
+      draftRevisionRef.current = value ? crypto.randomUUID() : undefined;
+      setDraft(value);
+      setDeliveryIssue({
+        message: "Token-like text is kept only in memory and cannot be sent in chat. Use Connection > Set token instead.",
+        retryable: false,
+      });
+      return false;
+    }
+    const stored = value
+      ? { text: value, revision: crypto.randomUUID(), ...(recoveryId ? { recoveryId } : {}) }
+      : undefined;
+    const persisted = writeStoredDraft(draftStorageKey, stored);
+    draftRef.current = value;
+    draftRecoveryIdRef.current = stored?.recoveryId;
+    draftRevisionRef.current = stored?.revision;
+    setDraft(value);
+    if (!persisted) {
+      setDeliveryIssue({
+        message: "Browser session storage is unavailable. Keep this tab open; drafts will not survive a reload.",
+        retryable: false,
+      });
+    }
+    return persisted;
+  }, [draftStorageKey]);
+
+  const clearDeliveryDraft = useCallback((delivery: PendingDelivery): boolean => {
+    const matchesRecovery =
+      draftRecoveryIdRef.current === delivery.id && draftRef.current === delivery.text;
+    const matchesAccepted =
+      delivery.acceptedDraftRevision !== undefined &&
+      draftRevisionRef.current === delivery.acceptedDraftRevision &&
+      draftRef.current.trim() === delivery.text;
+    if (!matchesRecovery && !matchesAccepted) return true;
+    if (!writeStoredDraft(draftStorageKey, undefined)) {
+      setDeliveryIssue({
+        message: "Browser session storage could not finish delivery cleanup. Keep this tab open while Glide retries.",
+        retryable: false,
+      });
+      return false;
+    }
+    draftRef.current = "";
+    draftRecoveryIdRef.current = undefined;
+    draftRevisionRef.current = undefined;
+    setDraft("");
+    return true;
+  }, [draftStorageKey]);
+
+  const clearPendingDelivery = useCallback((expectedId?: string): boolean => {
+    if (expectedId && pendingDeliveryRef.current?.id !== expectedId) return false;
+    if (!writeSessionValue(pendingStorageKey, undefined)) {
+      setDeliveryIssue({
+        message: "Browser session storage could not finish delivery cleanup. Keep this tab open while Glide retries.",
+        retryable: false,
+      });
+      return false;
+    }
+    pendingDeliveryRef.current = undefined;
+    return true;
+  }, [pendingStorageKey]);
+
+  const removeRecoverableDraft = useCallback((id: string): boolean => {
+    const drafts = recoverableDraftsRef.current;
+    const next = drafts.filter((draft) => draft.id !== id);
+    if (next.length === drafts.length) return true;
+    const persisted = writeSessionValue(recoverableStorageKey, next.length ? JSON.stringify(next) : undefined);
+    if (!persisted) {
+      setDeliveryIssue({
+        message: "Browser session storage could not update saved undelivered messages. Keep this tab open and reload only after recovery.",
+        retryable: false,
+      });
+      return false;
+    }
+    recoverableDraftsRef.current = next;
+    recoverableCountRef.current = next.length;
+    setRecoverableDrafts(next);
+    return true;
+  }, [recoverableStorageKey]);
+
+  const preserveUndeliveredDraft = useCallback((pending: PendingDelivery): {
+    location: "restored" | "existing" | "queued";
+    persisted: boolean;
+  } => {
+    const { text } = pending;
+    const drafts = recoverableDraftsRef.current;
+    if (!drafts.some((draft) => draft.id === pending.id)) {
+      const next = [...drafts, pending];
+      if (!writeSessionValue(recoverableStorageKey, JSON.stringify(next))) {
+        setDeliveryIssue({
+          message: "Browser session storage could not save the undelivered message. Keep this tab open and do not reload.",
+          retryable: false,
+        });
+        return { location: "queued", persisted: false };
+      }
+      recoverableDraftsRef.current = next;
+      recoverableCountRef.current = next.length;
+      setRecoverableDrafts(next);
+    }
+    const current = draftRef.current;
+    if (!current.trim()) {
+      return { location: "restored", persisted: updateDraft(text, pending.id) };
+    }
+    if (
+      current === text &&
+      (draftRecoveryIdRef.current === pending.id ||
+        draftRevisionRef.current === pending.acceptedDraftRevision)
+    ) {
+      return { location: "existing", persisted: updateDraft(text, pending.id) };
+    }
+    return { location: "queued", persisted: true };
+  }, [recoverableStorageKey, updateDraft]);
 
   const roomLink = `${location.origin}/#${encodeURIComponent(room)}`;
-
-  // Keep the URL hash in sync so the room is shareable.
-  useEffect(() => {
-    const onHash = () => setRoom(readRoomFromHash() || newRoomId());
-    window.addEventListener("hashchange", onHash);
-    return () => window.removeEventListener("hashchange", onHash);
-  }, []);
-  useEffect(() => {
-    if (readRoomFromHash() !== room) location.hash = room;
-  }, [room]);
 
   const agent = useAgent<GlideState>({
     agent: "GlideAgent",
@@ -626,22 +1142,96 @@ function Room({ name }: { name: string }) {
     onStateUpdate: (s) => setState(s),
   });
 
+  const acceptedChatMessageIds = useCallback(async (ids: readonly string[]): Promise<Set<string>> => {
+    if (!ids.length) return new Set();
+    const requested = Array.from(new Set(ids));
+    const value = await agent.call("acceptedChatMessageIds", [requested], { timeout: AGENT_MESSAGES_TIMEOUT_MS }) as {
+      ok?: unknown;
+      accepted?: unknown;
+    };
+    if (
+      value?.ok !== true ||
+      !Array.isArray(value.accepted) ||
+      value.accepted.some((id) => typeof id !== "string" || !requested.includes(id))
+    ) {
+      throw new Error("Glide returned a malformed delivery-ledger response.");
+    }
+    return new Set(value.accepted as string[]);
+  }, [agent]);
+
+  const applyLegacyChatMigrationStatus = useCallback((next: LegacyChatMigrationStatus) => {
+    const wasReady = legacyChatMigrationRef.current?.status === "ready";
+    legacyChatMigrationRef.current = next;
+    setLegacyChatMigration(next);
+    if (next.status !== "ready") {
+      hydratedEpoch.current = 0;
+      hydratingEpoch.current = 0;
+      updateHistoryReady(false);
+    } else if (!wasReady) {
+      hydratedEpoch.current = 0;
+      hydratingEpoch.current = 0;
+      updateHistoryReady(false);
+      setHydrationRetry((current) => current + 1);
+    }
+  }, [updateHistoryReady]);
+
+  const refreshLegacyChatMigrationStatus = useCallback(async (): Promise<LegacyChatMigrationStatus> => {
+    const value = await agent.call("legacyChatMigrationStatus", [], { timeout: AGENT_MESSAGES_TIMEOUT_MS });
+    const parsed = parsedLegacyChatMigrationStatus(value);
+    if (!parsed) throw new Error("Glide returned a malformed room-migration status.");
+    applyLegacyChatMigrationStatus(parsed);
+    return parsed;
+  }, [agent, applyLegacyChatMigrationStatus]);
+
   useEffect(() => {
+    let open = false;
     const update = () => setConnected(agent.readyState === WebSocket.OPEN);
-    const onClose = () => {
-      connectionEpoch.current += 1;
+    const onOpen = () => {
+      if (!open) {
+        open = true;
+        connectionEpoch.current += 1;
+        hydratedEpoch.current = 0;
+        updateHistoryReady(false);
+      }
       update();
     };
-    agent.addEventListener("open", update);
+    const onClose = () => {
+      open = false;
+      connectionEpoch.current += 1;
+      updateHistoryReady(false);
+      update();
+    };
+    agent.addEventListener("open", onOpen);
     agent.addEventListener("close", onClose);
     agent.addEventListener("error", update);
-    update();
+    if (agent.readyState === WebSocket.OPEN) onOpen();
+    else update();
     return () => {
-      agent.removeEventListener("open", update);
+      agent.removeEventListener("open", onOpen);
       agent.removeEventListener("close", onClose);
       agent.removeEventListener("error", update);
     };
-  }, [agent, room]);
+  }, [agent, room, updateHistoryReady]);
+
+  useEffect(() => {
+    if (!connected) return;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const poll = async () => {
+      try {
+        const migration = await refreshLegacyChatMigrationStatus();
+        if (cancelled || migration.status === "ready") return;
+      } catch {
+        if (cancelled) return;
+      }
+      timer = setTimeout(() => void poll(), 2_000);
+    };
+    void poll();
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [connected, refreshLegacyChatMigrationStatus]);
 
   // `WebSocketChatTransport` treats AgentConnection.send() as void, while the
   // underlying PartySocket returns false when it only buffered the frame. Do
@@ -669,14 +1259,15 @@ function Room({ name }: { name: string }) {
 
   const chat = useAgentChat({
     agent: chatAgent,
+    // A bounded loader prevents both an endless Suspense fallback and retries
+    // from submitting an incomplete transcript that omits persisted history.
+    getInitialMessages: loadInitialAgentMessages,
     // Coalesce fast stream bursts so per-chunk store updates cannot trip
     // React's nested-update guard (minified error #185).
     experimental_throttle: 100,
-    // Don't block the initial render on the HTTP /get-messages fetch. In the
-    // browser that `use()` promise suspends <Room> and never resolves, wedging
-    // the UI on the Suspense fallback ("Loading room…"). History and live
-    // messages hydrate over the WebSocket instead (resume + syncMessagesToServer).
-    getInitialMessages: null,
+    cancelOnClientAbort: true,
+    // Local hydration must never replace the server's authoritative transcript.
+    syncMessagesToServer: false,
     body: () => ({ name }),
     onError: (error) => {
       setDeliveryIssue({
@@ -688,10 +1279,16 @@ function Room({ name }: { name: string }) {
       });
     },
   });
+  const setChatMessagesRef = useRef(chat.setMessages);
+  setChatMessagesRef.current = chat.setMessages;
 
   const messages = chat.messages;
   messagesRef.current = messages;
-  const visibleMessages = messages.filter((message) => !isSystemEvent(message));
+  const verifiedActionResultEvents = useVerifiedActionResultEvents(agent, messages);
+  const visibleMessages = messages.filter((message) => {
+    const candidate = actionResultEventCandidate(message);
+    return !candidate || !verifiedActionResultEvents.has(actionResultEventKey(candidate));
+  });
   const busy =
     chat.status === "submitted" ||
     chat.status === "streaming" ||
@@ -699,6 +1296,183 @@ function Room({ name }: { name: string }) {
     chat.isServerStreaming ||
     chat.isToolContinuation ||
     chat.isRecovering;
+  const legacyMigrationReady = legacyChatMigration?.status === "ready";
+  busyRef.current = busy;
+
+  // A frame classified as absent can still arrive after the bounded delivery
+  // check. Keep its original id as a tombstone and reconcile any later
+  // authoritative broadcast before the saved text can be resent.
+  useEffect(() => {
+    if (!historyReady || deliverySyncing || busy || submissionInFlightRef.current) return;
+    let reconciled = false;
+    for (const recovery of [...recoverableDraftsRef.current]) {
+      if (persistedDeliveryStatus(messages, recovery.id) === "not_delivered") continue;
+      if (!clearDeliveryDraft(recovery) || !removeRecoverableDraft(recovery.id)) {
+        hydratedEpoch.current = 0;
+        updateHistoryReady(false);
+        scheduleHydrationRetry();
+        return;
+      }
+      reconciled = true;
+    }
+    if (!reconciled) return;
+    const retryTarget = interruptedRetryTarget(messages);
+    setDeliveryIssue(
+      retryTarget
+        ? { message: "The delayed message arrived, but the assistant response was interrupted.", retryable: true }
+        : undefined,
+    );
+  }, [busy, clearDeliveryDraft, deliverySyncing, historyReady, messages, removeRecoverableDraft, scheduleHydrationRetry, updateHistoryReady]);
+
+  // A reconnect can miss turns posted by another teammate. Rehydrate only
+  // while idle, and only if local history stays unchanged during the fetch, so
+  // a slow response cannot overwrite newer streamed chunks.
+  useEffect(() => {
+    const epoch = connectionEpoch.current;
+    if (
+      !connected ||
+      !legacyMigrationReady ||
+      busy ||
+      epoch === 0 ||
+      hydratedEpoch.current === epoch ||
+      hydratingEpoch.current === epoch
+    ) return;
+    hydratingEpoch.current = epoch;
+    let cancelled = false;
+    void (async () => {
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        const revision = JSON.stringify(messagesRef.current);
+        const persisted = await fetchAgentMessages(agent.getHttpUrl());
+        if (cancelled || connectionEpoch.current !== epoch || busyRef.current) return;
+        if (revision !== JSON.stringify(messagesRef.current)) continue;
+        const recoveries = [...recoverableDraftsRef.current];
+        const pending = pendingDeliveryRef.current;
+        const deliveryRevision = JSON.stringify({ recoveries, pending });
+        const absentIds = Array.from(new Set(
+          [...recoveries.map((recovery) => recovery.id), ...(pending ? [pending.id] : [])]
+            .filter((id) => persistedDeliveryStatus(persisted, id) === "not_delivered"),
+        ));
+        const acceptedAbsentIds = await acceptedChatMessageIds(absentIds);
+        if (cancelled || connectionEpoch.current !== epoch || busyRef.current) return;
+        if (
+          revision !== JSON.stringify(messagesRef.current) ||
+          deliveryRevision !== JSON.stringify({
+            recoveries: recoverableDraftsRef.current,
+            pending: pendingDeliveryRef.current,
+          })
+        ) continue;
+        let applied = false;
+        setChatMessagesRef.current((current) => {
+          if (busyRef.current || revision !== JSON.stringify(current)) return current;
+          applied = true;
+          return persisted;
+        });
+        await Promise.resolve();
+        if (!applied) continue;
+        let acceptedPrunedRecovery = false;
+        for (const recovery of recoveries) {
+          const recoveryStatus = reconciledDeliveryStatus(persisted, recovery.id, acceptedAbsentIds);
+          if (recoveryStatus === "not_delivered") continue;
+          if (recoveryStatus === "accepted_pruned") acceptedPrunedRecovery = true;
+          if (!clearDeliveryDraft(recovery) || !removeRecoverableDraft(recovery.id)) {
+            hydratedEpoch.current = 0;
+            hydratingEpoch.current = 0;
+            updateHistoryReady(false);
+            scheduleHydrationRetry();
+            return;
+          }
+        }
+        if (pending) {
+          const status = reconciledDeliveryStatus(persisted, pending.id, acceptedAbsentIds);
+          let recoveryPersisted = true;
+          if (status === "delivered") {
+            recoveryPersisted = clearDeliveryDraft(pending);
+            recoveryPersisted = removeRecoverableDraft(pending.id) && recoveryPersisted;
+            if (recoveryPersisted) setDeliveryIssue(undefined);
+          } else if (status === "not_delivered") {
+            const recovery = preserveUndeliveredDraft(pending);
+            recoveryPersisted = recovery.persisted;
+            if (recoveryPersisted) {
+              setDeliveryIssue({
+                message: recovery.location !== "queued"
+                  ? "That message was not delivered. It has been restored to the composer; press Send again when ready."
+                  : "That message was not delivered. It is saved separately below so your newer draft remains intact.",
+                retryable: false,
+              });
+            }
+          } else {
+            recoveryPersisted = clearDeliveryDraft(pending);
+            recoveryPersisted = removeRecoverableDraft(pending.id) && recoveryPersisted;
+            if (recoveryPersisted) {
+              setDeliveryIssue({
+                message: status === "accepted_pruned"
+                  ? "That message reached Glide and is older than the retained room history. It will not be sent again."
+                  : "Your message reached Glide, but the assistant response was interrupted.",
+                retryable: status !== "accepted_pruned",
+              });
+            }
+          }
+          if (!recoveryPersisted) {
+            hydratedEpoch.current = 0;
+            hydratingEpoch.current = 0;
+            updateHistoryReady(false);
+            scheduleHydrationRetry();
+            return;
+          }
+          if (!clearPendingDelivery(pending.id)) {
+            hydratedEpoch.current = 0;
+            hydratingEpoch.current = 0;
+            updateHistoryReady(false);
+            scheduleHydrationRetry();
+            return;
+          }
+        } else {
+          const retryWasPending = Boolean(pendingRetryRef.current);
+          pendingRetryRef.current = undefined;
+          const retryTarget = interruptedRetryTarget(persisted);
+          if (acceptedPrunedRecovery) {
+            setDeliveryIssue({
+              message: "A delayed message reached Glide and is older than the retained room history. It will not be sent again.",
+              retryable: false,
+            });
+          } else if (retryTarget) {
+            setDeliveryIssue({ message: "The assistant response is interrupted and can be retried.", retryable: true });
+          } else if (retryWasPending) {
+            setDeliveryIssue(undefined);
+          }
+        }
+        deliverySyncSequence.current += 1;
+        deliverySyncingRef.current = false;
+        setDeliverySyncing(false);
+        hydrationFailures.current = 0;
+        if (hydrationRetryTimer.current) {
+          clearTimeout(hydrationRetryTimer.current);
+          hydrationRetryTimer.current = undefined;
+        }
+        hydratedEpoch.current = epoch;
+        hydratingEpoch.current = 0;
+        updateHistoryReady(true);
+        return;
+      }
+      throw new Error("room history changed while synchronizing");
+    })().catch((error: unknown) => {
+      if (cancelled || connectionEpoch.current !== epoch) return;
+      hydratingEpoch.current = 0;
+      hydratedEpoch.current = 0;
+      scheduleHydrationRetry();
+      setDeliveryIssue({
+        message:
+          error instanceof Error
+            ? `Glide could not synchronize room history: ${error.message} Retrying automatically.`
+            : "Glide could not synchronize room history. Retrying automatically; reload if it persists.",
+        retryable: false,
+      });
+    });
+    return () => {
+      cancelled = true;
+      if (hydratingEpoch.current === epoch) hydratingEpoch.current = 0;
+    };
+  }, [acceptedChatMessageIds, agent, busy, clearDeliveryDraft, clearPendingDelivery, connected, historyReady, hydrationRetry, legacyMigrationReady, preserveUndeliveredDraft, removeRecoverableDraft, room, scheduleHydrationRetry, updateHistoryReady]);
 
   // Escape hatch for a wedged turn. A chat stream can stop terminalizing —
   // e.g. the Durable Object was evicted mid-response (a deploy), the WebSocket
@@ -711,6 +1485,8 @@ function Room({ name }: { name: string }) {
   // — that re-enables Send and shows a hint, so the user can always recover.
   const STALL_MS = 20000;
   const [stalled, setStalled] = useState(false);
+  const stalledRef = useRef(stalled);
+  stalledRef.current = stalled;
   const lastMessage = messages[messages.length - 1];
   // A signature that grows as tokens/parts stream in; used to restart the
   // stall timer so a genuinely-progressing turn never trips it.
@@ -742,7 +1518,7 @@ function Room({ name }: { name: string }) {
   }, [visibleMessages.length, busy]);
 
   const reportClientChatIssue = useCallback(
-    (kind: "not_delivered" | "response_interrupted", messageId: string, epoch: number) => {
+    (kind: Exclude<ReconciledDeliveryStatus, "delivered">, messageId: string, epoch: number) => {
       void agent
         .call(
           "reportClientChatIssue",
@@ -756,107 +1532,326 @@ function Room({ name }: { name: string }) {
 
   const verifyDelivery = useCallback(
     async (messageId: string, text: string, epoch: number) => {
+      const syncId = ++deliverySyncSequence.current;
+      deliverySyncingRef.current = true;
+      setDeliverySyncing(true);
+      let settled = false;
       try {
-        const url = new URL(agent.getHttpUrl(), location.origin);
-        url.pathname = `${url.pathname.replace(/\/$/, "")}/get-messages`;
-        url.searchParams.delete("_pk");
-        const response = await fetch(url, { cache: "no-store", credentials: "same-origin" });
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        const persisted = (await response.json()) as Array<{ id?: string; role?: string }>;
-        const status = persistedDeliveryStatus(persisted, messageId);
+        let status: ReconciledDeliveryStatus = "not_delivered";
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          const revision = JSON.stringify(messagesRef.current);
+          const persisted = await fetchAgentMessages(agent.getHttpUrl());
+          if (deliverySyncSequence.current !== syncId) return;
+          const baseStatus = persistedDeliveryStatus(persisted, messageId);
+          const acceptedAbsentIds = baseStatus === "not_delivered"
+            ? await acceptedChatMessageIds([messageId])
+            : new Set<string>();
+          if (deliverySyncSequence.current !== syncId) return;
+          const fetchedStatus = reconciledDeliveryStatus(persisted, messageId, acceptedAbsentIds);
+          if (fetchedStatus !== "delivered" && fetchedStatus !== "accepted_pruned" && attempt < 2) {
+            if (revision !== JSON.stringify(messagesRef.current)) continue;
+            await new Promise((resolve) => setTimeout(resolve, 150 * (attempt + 1)));
+            continue;
+          }
+          let replaced = false;
+          setChatMessagesRef.current((current) => {
+            if (revision !== JSON.stringify(current)) return current;
+            replaced = true;
+            return persisted;
+          });
+          await Promise.resolve();
+          if (!replaced) continue;
+          status = fetchedStatus;
+          settled = true;
+          break;
+        }
+        if (!settled) throw new Error("room history changed while confirming delivery");
+        const pending = pendingDeliveryRef.current?.id === messageId
+          ? pendingDeliveryRef.current
+          : { id: messageId, text };
         if (status === "delivered") {
+          let persisted = clearDeliveryDraft(pending);
+          persisted = removeRecoverableDraft(messageId) && persisted;
+          if (!persisted) {
+            settled = false;
+            hydratedEpoch.current = 0;
+            updateHistoryReady(false);
+            scheduleHydrationRetry();
+            return;
+          }
+          if (!clearPendingDelivery(messageId)) {
+            settled = false;
+            hydratedEpoch.current = 0;
+            updateHistoryReady(false);
+            scheduleHydrationRetry();
+            return;
+          }
           setDeliveryIssue(undefined);
           return;
         }
 
         reportClientChatIssue(status, messageId, epoch);
         if (status === "not_delivered") {
-          chat.setMessages((current) => current.filter((message) => message.id !== messageId));
-          setDraft((current) => (current.trim() ? current : text));
+          const recovery = preserveUndeliveredDraft(pending);
+          if (!recovery.persisted) {
+            settled = false;
+            hydratedEpoch.current = 0;
+            updateHistoryReady(false);
+            scheduleHydrationRetry();
+            return;
+          }
+          if (!clearPendingDelivery(messageId)) {
+            settled = false;
+            hydratedEpoch.current = 0;
+            updateHistoryReady(false);
+            scheduleHydrationRetry();
+            return;
+          }
           setDeliveryIssue({
-            message:
-              "That message was not delivered. It has been restored to the composer; wait for Live, then press Send again.",
+            message: recovery.location !== "queued"
+              ? "That message was not delivered. It has been restored to the composer; press Send again when ready."
+              : "That message was not delivered. It is saved separately below so your newer draft remains intact.",
             retryable: false,
           });
           return;
         }
 
+        let persisted = clearDeliveryDraft(pending);
+        persisted = removeRecoverableDraft(messageId) && persisted;
+        if (!persisted) {
+          settled = false;
+          hydratedEpoch.current = 0;
+          updateHistoryReady(false);
+          scheduleHydrationRetry();
+          return;
+        }
+        if (!clearPendingDelivery(messageId)) {
+          settled = false;
+          hydratedEpoch.current = 0;
+          updateHistoryReady(false);
+          scheduleHydrationRetry();
+          return;
+        }
         setDeliveryIssue({
-          message: "Your message reached Glide, but the assistant response was interrupted.",
-          retryable: true,
+          message: status === "accepted_pruned"
+            ? "That message reached Glide and is older than the retained room history. It will not be sent again."
+            : "Your message reached Glide, but the assistant response was interrupted.",
+          retryable: status !== "accepted_pruned",
         });
       } catch {
+        if (deliverySyncSequence.current !== syncId) return;
+        const pending = pendingDeliveryRef.current?.id === messageId
+          ? pendingDeliveryRef.current
+          : { id: messageId, text };
+        const recovery = preserveUndeliveredDraft(pending);
+        hydratedEpoch.current = 0;
+        hydratingEpoch.current = 0;
+        updateHistoryReady(false);
+        scheduleHydrationRetry();
         setDeliveryIssue({
-          message:
-            "The connection was interrupted and delivery could not be confirmed. Reconnect, then retry the response.",
-          retryable: true,
+          message: recovery.location === "queued"
+            ? "Delivery could not be confirmed. The submission is saved separately below; reconnect or reload before sending."
+            : "Delivery could not be confirmed against authoritative history. Your draft is preserved; reconnect or reload before sending.",
+          retryable: false,
         });
+      } finally {
+        if (settled && deliverySyncSequence.current === syncId) {
+          deliverySyncingRef.current = false;
+          setDeliverySyncing(false);
+        }
       }
     },
-    [agent, chat, reportClientChatIssue],
+    [acceptedChatMessageIds, agent, clearDeliveryDraft, clearPendingDelivery, pendingStorageKey, preserveUndeliveredDraft, removeRecoverableDraft, reportClientChatIssue, scheduleHydrationRetry, updateHistoryReady],
   );
 
   const finishDeliveryCheck = useCallback(
     async (messageId: string, text: string, epoch: number) => {
-      // Let React publish the final streamed message before consulting the ref.
-      await new Promise((resolve) => setTimeout(resolve, 0));
-      const locallyDelivered = persistedDeliveryStatus(messagesRef.current, messageId) === "delivered";
-      if (connectionEpoch.current === epoch && locallyDelivered) return;
       await verifyDelivery(messageId, text, epoch);
     },
     [verifyDelivery],
   );
 
+  const sendChatText = useCallback(
+    async (rawText: string, clearComposer = false): Promise<boolean> => {
+      const text = rawText.trim();
+      if (!text) return false;
+      if (!isChatTextWithinLimit(text)) {
+        setDeliveryIssue({
+          message: `Messages can contain at most ${MAX_CHAT_TEXT_CHARS.toLocaleString()} characters.`,
+          retryable: false,
+        });
+        return false;
+      }
+      if (containsCloudflareApiToken(text)) {
+        setDeliveryIssue({
+          message: "For safety, API tokens cannot be sent in chat. Add it under Connection → Set token instead.",
+          retryable: false,
+        });
+        return false;
+      }
+      const retryRecovery =
+        recoverableDraftsRef.current.find(
+          (recovery) => recovery.id === draftRecoveryIdRef.current && recovery.text === text,
+        ) ?? recoverableDraftsRef.current.find((recovery) => recovery.text === text);
+      if (!retryRecovery && recoverableCountRef.current >= MAX_RECOVERABLE_DRAFTS) {
+        setDeliveryIssue({
+          message: "Restore or remove a saved undelivered message before sending another one.",
+          retryable: false,
+        });
+        return false;
+      }
+      if (
+        agent.readyState !== WebSocket.OPEN ||
+        legacyChatMigrationRef.current?.status !== "ready" ||
+        !historyReadyRef.current ||
+        deliverySyncingRef.current ||
+        pendingDeliveryRef.current
+      ) {
+        setDeliveryIssue({
+          message: "Glide is synchronizing authoritative history. Your message was not sent; try again when synchronization finishes.",
+          retryable: false,
+        });
+        return false;
+      }
+      if (submissionInFlightRef.current) {
+        setDeliveryIssue({ message: "Another message is still being submitted. Wait for delivery confirmation.", retryable: false });
+        return false;
+      }
+      if (busyRef.current && !stalledRef.current) {
+        setDeliveryIssue({ message: "Wait for Glide's current response, or stop it before sending another message.", retryable: false });
+        return false;
+      }
+      if (busyRef.current) {
+        stop();
+        setDeliveryIssue({ message: "Stopping the current response. Send again after Glide becomes idle.", retryable: false });
+        return false;
+      }
+      submissionInFlightRef.current = true;
+      const messageId = retryRecovery?.id ?? crypto.randomUUID();
+      const epoch = connectionEpoch.current;
+      chat.clearError();
+      setDeliveryIssue(undefined);
+      const acceptedDraftRevision =
+        clearComposer && draftRef.current.trim() === text ? draftRevisionRef.current : undefined;
+      const pending: PendingDelivery = {
+        id: messageId,
+        text,
+        ...(acceptedDraftRevision ? { acceptedDraftRevision } : {}),
+      };
+      if (!writeSessionValue(pendingStorageKey, JSON.stringify(pending))) {
+        preserveUndeliveredDraft(pending);
+        setDeliveryIssue({
+          message: "The message was not sent because browser session storage is unavailable. It remains in this tab; do not reload.",
+          retryable: false,
+        });
+        submissionInFlightRef.current = false;
+        return false;
+      }
+      pendingDeliveryRef.current = pending;
+      try {
+        if (clearComposer) clearDeliveryDraft(pending);
+        try {
+          await chat.sendMessage({
+            id: messageId,
+            role: "user",
+            parts: [{ type: "text", text }],
+            metadata: { name } satisfies GlideMessageMetadata,
+          });
+          await finishDeliveryCheck(messageId, text, epoch);
+          return true;
+        } catch {
+          await verifyDelivery(messageId, text, epoch);
+          return false;
+        }
+      } finally {
+        submissionInFlightRef.current = false;
+      }
+    },
+    [agent, clearDeliveryDraft, stop, chat, name, finishDeliveryCheck, pendingStorageKey, preserveUndeliveredDraft, verifyDelivery],
+  );
+
   const send = useCallback(() => {
     const text = draft.trim();
     if (!text) return;
-    if (containsCloudflareApiToken(text)) {
-      setDeliveryIssue({
-        message: "For safety, API tokens cannot be sent in chat. Add it under Connection → Set token instead.",
-        retryable: false,
-      });
-      return;
-    }
-    if (agent.readyState !== WebSocket.OPEN) {
-      setDeliveryIssue({
-        message: "Glide is reconnecting. Your draft is safe; send it when the Live badge returns.",
-        retryable: false,
-      });
-      return;
-    }
-    if (busy && !stalled) return; // a live turn is still streaming — let it finish
-    if (busy) stop(); // the turn looks wedged: cancel it before starting a new one
-    const messageId = crypto.randomUUID();
-    const epoch = connectionEpoch.current;
-    chat.clearError();
-    setDeliveryIssue(undefined);
-    setDraft("");
-    void chat
-      .sendMessage({
-        id: messageId,
-        role: "user",
-        parts: [{ type: "text", text }],
-        metadata: { name } satisfies GlideMessageMetadata,
-      })
-      .then(() => finishDeliveryCheck(messageId, text, epoch));
-  }, [draft, agent, busy, stalled, stop, chat, name, finishDeliveryCheck]);
+    void sendChatText(text, true);
+  }, [draft, sendChatText]);
 
   const retryInterruptedResponse = useCallback(() => {
-    const last = messagesRef.current[messagesRef.current.length - 1];
-    if (!last || last.role !== "user") {
+    const target = interruptedRetryTarget(messagesRef.current);
+    if (!target) {
       setDeliveryIssue({ message: "There is no interrupted user turn to retry.", retryable: false });
       return;
     }
-    if (agent.readyState !== WebSocket.OPEN) {
+    if (
+      agent.readyState !== WebSocket.OPEN ||
+      legacyChatMigrationRef.current?.status !== "ready" ||
+      !historyReadyRef.current ||
+      deliverySyncingRef.current
+    ) {
       setDeliveryIssue({ message: "Glide is still reconnecting. Retry when the Live badge returns.", retryable: true });
       return;
     }
-    const epoch = connectionEpoch.current;
-    const text = messageText(last).text;
+    const syncId = ++deliverySyncSequence.current;
+    deliverySyncingRef.current = true;
+    setDeliverySyncing(true);
+    pendingRetryRef.current = target;
+    let settled = false;
     chat.clearError();
     setDeliveryIssue(undefined);
-    void chat.sendMessage().then(() => finishDeliveryCheck(last.id, text, epoch));
-  }, [agent, chat, finishDeliveryCheck]);
+    void agent
+      .call("retryInterruptedResponse", [target.messageId, target.interruptedAssistantId], { timeout: 120_000 })
+      .then(async (value) => {
+        const result = value as { ok?: boolean; message?: string };
+        let persisted: UIMessage[] | undefined;
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          const revision = JSON.stringify(messagesRef.current);
+          const fetched = await fetchAgentMessages(agent.getHttpUrl());
+          if (deliverySyncSequence.current !== syncId) return;
+          let replaced = false;
+          setChatMessagesRef.current((current) => {
+            if (revision !== JSON.stringify(current)) return current;
+            replaced = true;
+            return fetched;
+          });
+          await Promise.resolve();
+          if (replaced) {
+            persisted = fetched;
+            break;
+          }
+        }
+        if (!persisted) throw new Error("room history changed while confirming the retry");
+        settled = true;
+        pendingRetryRef.current = undefined;
+        const retryTarget = interruptedRetryTarget(persisted);
+        if (result.ok && !retryTarget) {
+          setDeliveryIssue(undefined);
+        } else {
+          setDeliveryIssue({
+            message: result.ok
+              ? "The retried assistant response was interrupted again."
+              : result.message || "Glide could not retry that response.",
+            retryable: Boolean(retryTarget),
+          });
+        }
+      })
+      .catch((error: unknown) => {
+        if (deliverySyncSequence.current !== syncId) return;
+        hydratedEpoch.current = 0;
+        hydratingEpoch.current = 0;
+        updateHistoryReady(false);
+        scheduleHydrationRetry();
+        setDeliveryIssue({
+          message: error instanceof Error ? `Glide could not retry that response: ${error.message}` : "Glide could not retry that response.",
+          retryable: false,
+        });
+      })
+      .finally(() => {
+        if (settled && deliverySyncSequence.current === syncId) {
+          deliverySyncingRef.current = false;
+          setDeliverySyncing(false);
+        }
+      });
+  }, [agent, chat, scheduleHydrationRetry, updateHistoryReady]);
 
   const runRpc = useCallback(
     async <T = unknown>(
@@ -864,6 +1859,10 @@ function Room({ name }: { name: string }) {
       args: unknown[],
       options?: { timeout?: number },
     ): Promise<T | undefined> => {
+      if (agent.readyState !== WebSocket.OPEN) {
+        setNotice("Glide is reconnecting. Try again when the Live badge returns.");
+        return undefined;
+      }
       try {
         setNotice(undefined);
         return (await agent.call(method, args, options)) as T;
@@ -875,6 +1874,30 @@ function Room({ name }: { name: string }) {
     [agent],
   );
 
+  const discardLegacyChatArchive = useCallback(async () => {
+    if (
+      legacyChatMigration?.status !== "recovery_required" ||
+      legacyRecoveryConfirmation !== LEGACY_CHAT_RECOVERY_CONFIRMATION
+    ) return;
+    setLegacyRecoveryBusy(true);
+    try {
+      const result = await runRpc<{ ok: boolean; message: string }>(
+        "discardLegacyChatArchiveForRecovery",
+        [legacyRecoveryConfirmation],
+        { timeout: AGENT_MESSAGES_TIMEOUT_MS },
+      );
+      if (!result) return;
+      setNotice(result.message);
+      if (!result.ok) return;
+      setLegacyRecoveryConfirmation("");
+      await refreshLegacyChatMigrationStatus();
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Glide could not refresh migration status.");
+    } finally {
+      setLegacyRecoveryBusy(false);
+    }
+  }, [legacyChatMigration?.status, legacyRecoveryConfirmation, refreshLegacyChatMigrationStatus, runRpc]);
+
   // A token stored by an older build — or one whose `/user/tokens/verify` call
   // 401'd despite the token being perfectly usable — can get stuck showing
   // "token unverified" forever, since validity was only ever checked at save
@@ -883,11 +1906,11 @@ function Room({ name }: { name: string }) {
   // user having to re-enter it. The ref guard prevents a loop if it stays bad.
   useEffect(() => {
     if (reverifiedToken.current) return;
-    if (state?.tokenConfigured && state.tokenValid === false) {
+    if (connected && state?.tokenConfigured && state.tokenValid === false) {
       reverifiedToken.current = true;
       void runRpc("reverifyToken", []);
     }
-  }, [state?.tokenConfigured, state?.tokenValid, runRpc]);
+  }, [connected, state?.tokenConfigured, state?.tokenValid, runRpc]);
 
   const saveToken = useCallback(async () => {
     const value = tokenInput.trim();
@@ -954,28 +1977,27 @@ function Room({ name }: { name: string }) {
 
   // ---- Onboarding wizard callbacks ----
   const patchOnboarding = useCallback(
-    (patch: Record<string, unknown>) => runRpc("updateOnboarding", [patch, name]),
+    (patch: Record<string, unknown>) =>
+      runRpc<{ ok: boolean; message?: string }>("updateOnboarding", [patch, name]),
     [runRpc, name],
   );
   const previewMigration = useCallback(
     (args: {
       provider: string;
       config?: string;
-      configUrl?: string;
       configFiles?: Array<{ filename: string; content: string }>;
       format?: string;
     }) => runRpc<{ ok: boolean; message: string; totalRules?: number }>("previewMigration", [args, name]),
     [runRpc, name],
   );
   const finishOnboarding = useCallback(
-    (kickoff: string) => {
-      void runRpc("completeOnboarding", [name]);
+    async (kickoff: string) => {
+      const completed = await runRpc<{ ok: boolean; message?: string }>("completeOnboarding", [name]);
+      if (!completed?.ok) return;
       setFormOpen(false);
-      if (kickoff.trim()) {
-        void chat.sendMessage({ text: kickoff, metadata: { name } satisfies GlideMessageMetadata });
-      }
+      if (kickoff.trim()) await sendChatText(kickoff);
     },
-    [runRpc, name, chat],
+    [runRpc, name, sendChatText],
   );
 
   // Kick off the chat-led guided setup: start onboarding, optionally pin the
@@ -999,12 +2021,12 @@ function Room({ name }: { name: string }) {
             : path === "fresh"
               ? "I'm setting up Cloudflare fresh — walk me through it one step at a time."
               : "Help me get set up on Cloudflare — ask me what you need, one question at a time.";
-        await chat.sendMessage({ text, metadata: { name } satisfies GlideMessageMetadata });
+        await sendChatText(text);
       } finally {
         guidedStartInFlight.current = false;
       }
     },
-    [runRpc, name, chat],
+    [runRpc, name, sendChatText],
   );
 
   // Wipe this room's onboarding so the guided flow starts over. The room is
@@ -1024,7 +2046,8 @@ function Room({ name }: { name: string }) {
 
   // Persist "nature of the business" answers from the opt-in wizard step.
   const patchBusinessProfile = useCallback(
-    (patch: Partial<BusinessProfile>) => runRpc("updateBusinessProfile", [patch, name]),
+    (patch: Partial<BusinessProfile>) =>
+      runRpc<{ ok: boolean; message?: string }>("updateBusinessProfile", [patch, name]),
     [runRpc, name],
   );
 
@@ -1061,9 +2084,9 @@ function Room({ name }: { name: string }) {
   const askAboutRecommendation = useCallback(
     (rec: Recommendation) => {
       const text = `Help me set up this Cloudflare recommendation: "${rec.title}". ${rec.rationale} Walk me through it one step at a time and queue what's needed for me to Apply.`;
-      void chat.sendMessage({ text, metadata: { name } satisfies GlideMessageMetadata });
+      void sendChatText(text);
     },
-    [chat, name],
+    [sendChatText],
   );
 
   const onboarding = state?.onboarding;
@@ -1082,13 +2105,23 @@ function Room({ name }: { name: string }) {
       setNotice("Add a Cloudflare API token before applying queued changes.");
       return;
     }
-    const uncertainCount = pending.filter(isActionOutcomeUncertain).length;
+    const restoreCount = pending.filter(isSnapshotRestoreAction).length;
+    const uncertainCount = pending.filter(
+      (action) => !isSnapshotRestoreAction(action) && isActionOutcomeUncertain(action),
+    ).length;
     const ids = pending
-      .filter((action) => !isActionApplying(action) && !isActionOutcomeUncertain(action))
+      .filter(
+        (action) =>
+          !isSnapshotRestoreAction(action) &&
+          !isActionApplying(action) &&
+          !isActionOutcomeUncertain(action),
+      )
       .map((action) => action.id);
     if (!ids.length) {
       if (uncertainCount) {
         setNotice("Apply all skipped changes with uncertain outcomes. Verify each live configuration before retrying it individually.");
+      } else if (restoreCount) {
+        setNotice("Snapshot restore is disabled. Reject the legacy restore approval to remove it.");
       }
       return;
     }
@@ -1108,15 +2141,18 @@ function Room({ name }: { name: string }) {
       }
       const failures = results.filter((result) => result.status === "failed");
       const serverSkipped = Math.max(0, ids.length - results.length);
-      if (failures.length || uncertainCount || serverSkipped) {
+      if (failures.length || uncertainCount || restoreCount || serverSkipped) {
         const skipped = uncertainCount
           ? ` ${uncertainCount} uncertain action${uncertainCount === 1 ? " was" : "s were"} skipped pending live verification.`
           : "";
         const changed = serverSkipped
           ? ` ${serverSkipped} reviewed action${serverSkipped === 1 ? " was" : "s were"} skipped because the queue changed before Apply.`
           : "";
+        const restores = restoreCount
+          ? ` ${restoreCount} disabled snapshot restore approval${restoreCount === 1 ? " was" : "s were"} skipped; reject ${restoreCount === 1 ? "it" : "them"}.`
+          : "";
         setNotice(
-          `${failures.length ? `${failures.length} action${failures.length === 1 ? "" : "s"} failed and remain queued for retry.` : ""}${skipped}${changed}`.trim(),
+          `${failures.length ? `${failures.length} action${failures.length === 1 ? "" : "s"} failed and remain queued for retry.` : ""}${skipped}${restores}${changed}`.trim(),
         );
       }
     } finally {
@@ -1137,8 +2173,22 @@ function Room({ name }: { name: string }) {
           <span style={S.roomPill} className="glide-room-pill">
             #
             <input
-              value={room}
-              onChange={(e) => setRoom(e.target.value.trim() || "lobby")}
+              value={roomDraft}
+              maxLength={200}
+              onChange={(e) => setRoomDraft(e.target.value)}
+              onBlur={() => {
+                const next = roomDraft.trim();
+                if (next && next.length <= 200 && !/[\u0000-\u001f\u007f]/.test(next)) onRoomChange(next);
+                else setRoomDraft(room);
+              }}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  event.currentTarget.blur();
+                } else if (event.key === "Escape") {
+                  setRoomDraft(room);
+                  event.currentTarget.blur();
+                }
+              }}
               style={S.roomInput}
               aria-label="Room name"
             />
@@ -1160,12 +2210,18 @@ function Room({ name }: { name: string }) {
           <span
             style={{
               ...S.badge,
-              background: connected ? "rgba(34,197,94,.16)" : "rgba(245,158,11,.14)",
-              color: connected ? "#6ee7b7" : "#fcd34d",
-              border: connected ? "1px solid rgba(34,197,94,.4)" : "1px solid rgba(245,158,11,.4)",
+              background: connected && historyReady && legacyMigrationReady ? "rgba(34,197,94,.16)" : "rgba(245,158,11,.14)",
+              color: connected && historyReady && legacyMigrationReady ? "#6ee7b7" : "#fcd34d",
+              border: connected && historyReady && legacyMigrationReady ? "1px solid rgba(34,197,94,.4)" : "1px solid rgba(245,158,11,.4)",
             }}
           >
-            {connected ? "live" : "reconnecting"}
+            {connected && historyReady && legacyMigrationReady
+              ? "live"
+              : connected && legacyChatMigration?.status !== undefined && legacyChatMigration.status !== "ready"
+                ? "migration"
+                : connected
+                  ? "syncing"
+                  : "reconnecting"}
           </span>
           {state ? (
             state.tokenValid === false ? (
@@ -1185,7 +2241,14 @@ function Room({ name }: { name: string }) {
         </div>
       </header>
 
-      {state &&
+      {connected && legacyChatMigration && legacyChatMigration.status !== "ready" ? (
+        <div style={S.warnBar} className="glide-warn-bar">
+          <strong>Room history is locked.</strong> {legacyChatMigration.message}
+          {legacyChatMigration.status === "recovery_required" && (
+            <> Use the explicit recovery control under <strong>Connection</strong> only if the old archive may be permanently deleted.</>
+          )}
+        </div>
+      ) : state &&
         (state.tokenValid === false ? (
           <div style={S.warnBar} className="glide-warn-bar">
             The saved Cloudflare API token failed verification. Review or replace it in{" "}
@@ -1255,20 +2318,17 @@ function Room({ name }: { name: string }) {
               ))}
             {visibleMessages.map((m) => {
               const { text, tools } = messageText(m);
-              const who =
-                m.role === "user"
-                  ? (m.metadata as GlideMessageMetadata | undefined)?.name ?? "teammate"
-                  : "Glide";
+              const { who, userStyle } = messageAuthor(m);
               const mine = m.role === "user" && who === name;
               return (
                 <div key={m.id} style={{ ...S.msgRow, justifyContent: mine ? "flex-end" : "flex-start" }}>
                   {!mine && (
-                    <div style={{ ...S.avatar, ...(m.role === "user" ? S.avatarUser : S.avatarAi) }}>
-                      {m.role === "user" ? who.charAt(0).toUpperCase() : "G"}
+                    <div style={{ ...S.avatar, ...(userStyle ? S.avatarUser : S.avatarAi) }}>
+                      {userStyle ? who.charAt(0).toUpperCase() : "G"}
                     </div>
                   )}
-                  <div className="glide-bubble" style={{ ...S.bubble, ...(m.role === "user" ? S.userBubble : S.aiBubble), ...(mine ? S.mineBubble : null) }}>
-                    <div style={S.msgWho}>{m.role === "user" ? who : "Glide"}</div>
+                  <div className="glide-bubble" style={{ ...S.bubble, ...(userStyle ? S.userBubble : S.aiBubble), ...(mine ? S.mineBubble : null) }}>
+                    <div style={S.msgWho}>{who}</div>
                     {text && <div style={S.msgText}>{text}</div>}
                     {tools.map((tool) => (
                       <ToolChip key={tool.id} tool={tool} />
@@ -1321,7 +2381,7 @@ function Room({ name }: { name: string }) {
             )}
           </div>
 
-          {!connected && (
+          {(!connected || !historyReady) && (
             <div style={S.connectionNotice}>
               Reconnecting to this room. Drafts remain local and Send is paused until the connection is live.
             </div>
@@ -1332,7 +2392,7 @@ function Room({ name }: { name: string }) {
               {deliveryIssue.retryable && (
                 <button
                   style={S.deliveryRetryBtn}
-                  disabled={!connected}
+                  disabled={!connected || !historyReady || deliverySyncing}
                   onClick={retryInterruptedResponse}
                 >
                   Retry response
@@ -1340,11 +2400,30 @@ function Room({ name }: { name: string }) {
               )}
             </div>
           )}
+          {recoverableDrafts.length > 0 && (
+            <div style={S.deliveryNotice}>
+              <span>
+                {recoverableDrafts.length} undelivered {recoverableDrafts.length === 1 ? "message is" : "messages are"} saved in this tab.
+              </span>
+              <button
+                style={S.deliveryRetryBtn}
+                disabled={Boolean(draft.trim())}
+                title={draft.trim() ? "Clear or send the current draft first" : "Restore the oldest undelivered message"}
+                onClick={() => {
+                  const recovery = recoverableDrafts[0];
+                  updateDraft(recovery.text, recovery.id);
+                }}
+              >
+                Restore saved message
+              </button>
+            </div>
+          )}
 
           <div style={S.composer} className="glide-composer glide-glass-card">
             <textarea
               value={draft}
-              onChange={(e) => setDraft(e.target.value)}
+              maxLength={MAX_CHAT_TEXT_CHARS}
+              onChange={(e) => updateDraft(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === "Enter" && !e.shiftKey) {
                   e.preventDefault();
@@ -1352,8 +2431,8 @@ function Room({ name }: { name: string }) {
                 }
               }}
               placeholder={
-                !connected
-                  ? "Reconnecting… your draft is safe"
+                !connected || !historyReady || !legacyMigrationReady || deliverySyncing
+                  ? "Reconnecting and syncing... your draft is safe"
                   : showWizard
                   ? "Ask Glide a question while you set up…  (Enter to send)"
                   : `Message #${room}…  (Enter to send, Shift+Enter for newline)`
@@ -1366,7 +2445,11 @@ function Room({ name }: { name: string }) {
                 Stop
               </button>
             )}
-            <button onClick={send} disabled={!connected || !draft.trim() || (busy && !stalled)} style={S.sendBtn}>
+            <button
+              onClick={send}
+              disabled={!connected || !historyReady || !legacyMigrationReady || deliverySyncing || !draft.trim() || (busy && !stalled)}
+              style={S.sendBtn}
+            >
               Send
             </button>
           </div>
@@ -1377,7 +2460,49 @@ function Room({ name }: { name: string }) {
           {notice && <div style={S.errorBox}>{notice}</div>}
 
           <Section title="Connection">
-            {state?.tokenConfigured && !showTokenForm ? (
+            {legacyChatMigration?.status !== "ready" ? (
+              <div style={S.migrationRecovery}>
+                <div style={{ fontSize: 13, color: "#f8fafc", fontWeight: 700 }}>
+                  {legacyChatMigration?.status === "recovery_required"
+                    ? "Legacy archive recovery required"
+                    : legacyChatMigration?.status === "discarding"
+                      ? "Discarding legacy archive"
+                      : "Checking legacy room history"}
+                </div>
+                <p style={{ ...S.hint, color: "#cbd5e1" }}>
+                  {legacyChatMigration?.message ?? "Glide is checking the room migration state."}
+                </p>
+                {legacyChatMigration?.status === "recovery_required" && (
+                  <>
+                    <p style={{ ...S.hint, color: "#fda4af" }}>
+                      This permanently deletes only the unrecoverable legacy transcript archive. Current retained history and permanent replay protection are preserved.
+                    </p>
+                    <label style={{ ...S.label, marginTop: 10 }}>
+                      Type <code>{LEGACY_CHAT_RECOVERY_CONFIRMATION}</code>
+                    </label>
+                    <input
+                      value={legacyRecoveryConfirmation}
+                      maxLength={LEGACY_CHAT_RECOVERY_CONFIRMATION.length}
+                      onChange={(event) => setLegacyRecoveryConfirmation(event.target.value)}
+                      autoComplete="off"
+                      spellCheck={false}
+                      style={{ ...S.input, marginBottom: 8 }}
+                    />
+                    <button
+                      style={S.dangerBtn}
+                      disabled={
+                        !connected ||
+                        legacyRecoveryBusy ||
+                        legacyRecoveryConfirmation !== LEGACY_CHAT_RECOVERY_CONFIRMATION
+                      }
+                      onClick={() => void discardLegacyChatArchive()}
+                    >
+                      {legacyRecoveryBusy ? "Starting recovery..." : "Discard legacy archive"}
+                    </button>
+                  </>
+                )}
+              </div>
+            ) : state?.tokenConfigured && !showTokenForm ? (
               <>
                 <div style={S.tokenStatus}>
                   <span
@@ -1554,17 +2679,20 @@ function Room({ name }: { name: string }) {
             {pending.length === 0 && <Muted>Nothing queued. Ask Glide to make a change.</Muted>}
             {pending.map((a: PendingAction) => {
               const status = pendingActionStatus(a);
+              const disabledRestore = isSnapshotRestoreAction(a);
               const applying = busyIds.has(a.id) || isActionApplying(a);
               const failed = status === "failed" || (status === "applying" && !applying);
               const uncertain = isActionOutcomeUncertain(a);
-              const statusLabel = applying
+              const statusLabel = disabledRestore
+                ? "restore disabled"
+                : applying
                 ? "applying"
                 : uncertain
                   ? "outcome uncertain"
                   : failed
                     ? "failed - retryable"
                     : "pending";
-              const statusColor = applying ? "#fbbf24" : failed ? "#fda4af" : "#fdba74";
+              const statusColor = disabledRestore ? "#fda4af" : applying ? "#fbbf24" : failed ? "#fda4af" : "#fdba74";
               return (
                 <div
                   key={a.id}
@@ -1578,6 +2706,11 @@ function Room({ name }: { name: string }) {
                   </div>
                   <div style={S.actionSummary}>{a.summary}</div>
                   <code style={S.path}>{a.path}</code>
+                  {disabledRestore && (
+                    <div style={{ ...S.errorBox, marginTop: 8 }}>
+                      Snapshot restore is disabled because the migration service cannot guarantee complete, fail-safe recovery. Reject this legacy approval.
+                    </div>
+                  )}
                   {failed && a.error && <div style={{ ...S.errorBox, marginTop: 8 }}>{a.error}</div>}
                   <div style={S.actionMeta}>by {a.createdBy}</div>
                   {a.body !== undefined && (
@@ -1595,7 +2728,7 @@ function Room({ name }: { name: string }) {
                   <div style={S.actionBtns}>
                     <button
                       style={{ ...S.applyBtn, opacity: applying ? 0.6 : 1 }}
-                      disabled={applying}
+                      disabled={applying || disabledRestore}
                       onClick={() => {
                         if (!state?.tokenConfigured) {
                           setShowTokenForm(true);
@@ -1615,6 +2748,8 @@ function Room({ name }: { name: string }) {
                     >
                       {applying
                         ? "Applying…"
+                        : disabledRestore
+                          ? "Disabled"
                         : !state?.tokenConfigured
                           ? "Set token first"
                           : uncertain
@@ -1677,17 +2812,6 @@ function Room({ name }: { name: string }) {
                   style={S.miniBtn}
                   disabled={!!migBusy}
                   onClick={async () => {
-                    setMigBusy("validate");
-                    await runRpc("runValidate", [state?.defaultZone?.id, name]);
-                    setMigBusy(undefined);
-                  }}
-                >
-                  {migBusy === "validate" ? "Validating…" : "Validate"}
-                </button>
-                <button
-                  style={S.miniBtn}
-                  disabled={!!migBusy}
-                  onClick={async () => {
                     setMigBusy("csv");
                     await runRpc("exportMigrationCsv", [name]);
                     setMigBusy(undefined);
@@ -1696,7 +2820,7 @@ function Room({ name }: { name: string }) {
                   {migBusy === "csv" ? "Exporting…" : "Export CSV"}
                 </button>
               </div>
-              {state.migrationCheck && (
+              {state.migrationCheck && state.migrationCheck.kind !== "validate" && (
                 <div
                   style={{
                     ...S.checkBox,
@@ -1708,12 +2832,16 @@ function Room({ name }: { name: string }) {
                   <b>
                     {state.migrationCheck.kind === "preflight"
                       ? "Pre-flight"
-                      : state.migrationCheck.kind === "validate"
-                        ? "Validation"
-                        : "Diff"}
+                      : "Diff"}
                     :
                   </b>{" "}
                   {state.migrationCheck.summary}
+                  <MigrationCheckMeta
+                    check={state.migrationCheck}
+                    plan={state.migrationPlan}
+                    defaultAccountId={state.defaultAccountId}
+                    defaultZoneId={state.defaultZone?.id}
+                  />
                 </div>
               )}
             </Section>
@@ -1721,6 +2849,13 @@ function Room({ name }: { name: string }) {
 
           {state?.csv && state.csv.files.length > 0 && (
             <Section title={`CSV export · ${state.csv.files.length}`}>
+              <MigrationArtifactMeta
+                artifact={state.csv}
+                plan={state.migrationPlan}
+                defaultAccountId={state.defaultAccountId}
+                defaultZoneId={state.defaultZone?.id}
+                targetless
+              />
               {state.csv.files.map((f) => (
                 <div key={f.filename} style={S.tfRow}>
                   <code style={S.tfName}>{f.filename}</code>
@@ -1734,6 +2869,12 @@ function Room({ name }: { name: string }) {
 
           {state?.terraform && state.terraform.files.length > 0 && (
             <Section title={`Terraform export · ${state.terraform.files.length}`}>
+              <MigrationArtifactMeta
+                artifact={state.terraform}
+                plan={state.migrationPlan}
+                defaultAccountId={state.defaultAccountId}
+                defaultZoneId={state.defaultZone?.id}
+              />
               {state.terraform.files.map((f) => (
                 <div key={f.filename} style={S.tfRow}>
                   <code style={S.tfName}>{f.filename}</code>
@@ -1757,68 +2898,6 @@ function Room({ name }: { name: string }) {
               )}
             </Section>
           )}
-
-          {state?.migrationToolConfigured !== false &&
-            (state?.defaultZone || (state?.snapshots?.length ?? 0) > 0 || state?.migrationPlan) && (
-              <Section
-                title={`Zone snapshots${(state?.snapshots?.length ?? 0) ? ` · ${state!.snapshots!.length}` : ""}`}
-                action={
-                  <button
-                    style={S.miniBtn}
-                    disabled={!!snapBusy}
-                    onClick={async () => {
-                      setSnapBusy("new");
-                      const res = await runRpc<{ ok: boolean; message: string }>("snapshotZone", [
-                        state?.defaultZone?.id,
-                        name,
-                      ]);
-                      setSnapBusy(undefined);
-                      if (res) setNotice(res.message);
-                    }}
-                  >
-                    {snapBusy === "new" ? "Saving…" : "Snapshot now"}
-                  </button>
-                }
-              >
-                {(state?.snapshots?.length ?? 0) === 0 ? (
-                  <Muted>
-                    No restore points yet. Capture one (read-only) before applying migration changes, so you can
-                    roll back.
-                  </Muted>
-                ) : (
-                  state!.snapshots!.map((s) => (
-                    <div key={s.id} style={S.snapRow}>
-                      <div style={{ flex: 1, minWidth: 0 }}>
-                        <div style={S.snapZone}>{s.zoneName || s.zoneId}</div>
-                        <div style={S.snapMeta}>{new Date(s.created).toLocaleString()}</div>
-                      </div>
-                      <button
-                        style={S.snapRestore}
-                        disabled={!!snapBusy}
-                        onClick={async () => {
-                          const ok = window.confirm(
-                            `Restore ${s.zoneName || s.zoneId} to this snapshot?\n\nThis is DESTRUCTIVE: it reverts the zone to the snapshot state, removing rules/settings created since ${new Date(
-                              s.created,
-                            ).toLocaleString()}.`,
-                          );
-                          if (!ok) return;
-                          setSnapBusy(s.id);
-                          const res = await runRpc<{ ok: boolean; message: string }>("restoreSnapshot", [
-                            s.id,
-                            name,
-                          ]);
-                          setSnapBusy(undefined);
-                          if (res) setNotice(res.message);
-                        }}
-                      >
-                        {snapBusy === s.id ? "Restoring…" : "Restore"}
-                      </button>
-                    </div>
-                  ))
-                )}
-                <p style={S.hint}>Restore reverts the zone to a snapshot (destructive). It's a manual action — Glide never auto-restores.</p>
-              </Section>
-            )}
 
           <Section
             title={`Invite teammates${(state?.invites?.length ?? 0) ? ` · ${state!.invites.length}` : ""}`}
@@ -2232,14 +3311,19 @@ function RecommendationsPanel({
 
 function MigrationPlanPanel({ plan }: { plan: MigrationPlan }) {
   const queued = plan.rules.filter((r) => r.queued).length;
+  const retainedByPhase = new Map<string, number>();
+  for (const rule of plan.rules) retainedByPhase.set(rule.phase, (retainedByPhase.get(rule.phase) ?? 0) + 1);
   return (
     <>
       <KV k="provider" v={plan.providerLabel} />
-      <KV k="rules" v={`${plan.totalRules}${plan.truncated ? "+" : ""} · ${queued} queued`} />
+      <KV
+        k="rules"
+        v={`${plan.totalRules} total${plan.truncated ? ` · ${plan.rules.length} retained` : ""} · ${queued} queued`}
+      />
       <div style={S.phaseTags}>
         {plan.phases.map((ph) => (
           <span key={ph.key} style={S.phaseTag}>
-            {ph.label}: {ph.count}
+            {ph.label}: {plan.truncated ? `${retainedByPhase.get(ph.key) ?? 0} retained of ${ph.count}` : ph.count}
           </span>
         ))}
       </div>
@@ -2247,9 +3331,84 @@ function MigrationPlanPanel({ plan }: { plan: MigrationPlan }) {
   );
 }
 
+function shortRevision(value: string | undefined): string {
+  if (!value) return "unknown source";
+  return value.startsWith("sha256:") ? `SHA-256 ${value.slice(7, 19)}...` : `revision ${value.slice(0, 12)}...`;
+}
+
+function MigrationArtifactMeta({
+  artifact,
+  plan,
+  defaultAccountId,
+  defaultZoneId,
+  targetless = false,
+}: {
+  artifact: TerraformArtifact;
+  plan?: MigrationPlan;
+  defaultAccountId?: string;
+  defaultZoneId?: string;
+  targetless?: boolean;
+}) {
+  const staleSource = Boolean(artifact.sourceRevision && plan?.sourceRevision && artifact.sourceRevision !== plan.sourceRevision);
+  const sameId = (left: string | undefined, right: string | undefined) =>
+    Boolean(left && right && left.toLowerCase() === right.toLowerCase());
+  const targetScope = artifact.targetScope ?? (artifact.zoneId ? "zone" : "account");
+  const staleTarget = !targetless && Boolean(
+    (defaultAccountId && !sameId(artifact.accountId, defaultAccountId)) ||
+    (targetScope === "zone" && defaultZoneId && !sameId(artifact.zoneId, defaultZoneId)),
+  );
+  const target = artifact.zoneName || artifact.zoneId;
+  const targetText = targetScope === "zone"
+    ? target
+      ? ` · zone ${target}`
+      : " · placeholder zone"
+    : "";
+  return (
+    <div style={{ ...S.hint, color: staleSource || staleTarget ? "#fbbf24" : S.hint.color }}>
+      {artifact.provider} · {shortRevision(artifact.sourceRevision)}
+      {!targetless ? targetText : ""}
+      {!targetless && artifact.accountId ? ` · account ${artifact.accountId.slice(0, 8)}...` : ""}
+      {!targetless && !artifact.accountId ? " · placeholder account" : ""}
+      {staleSource ? " · stale source" : ""}
+      {staleTarget ? " · stale target" : ""}
+    </div>
+  );
+}
+
+function MigrationCheckMeta({
+  check,
+  plan,
+  defaultAccountId,
+  defaultZoneId,
+}: {
+  check: NonNullable<GlideState["migrationCheck"]>;
+  plan?: MigrationPlan;
+  defaultAccountId?: string;
+  defaultZoneId?: string;
+}) {
+  const stale = Boolean(
+    (check.sourceRevision && plan?.sourceRevision && check.sourceRevision !== plan.sourceRevision) ||
+    (check.accountId && defaultAccountId && check.accountId.toLowerCase() !== defaultAccountId.toLowerCase()) ||
+    (check.zoneId && defaultZoneId && check.zoneId.toLowerCase() !== defaultZoneId.toLowerCase()),
+  );
+  return (
+    <div style={{ marginTop: 4, fontSize: 11, opacity: 0.85 }}>
+      {check.provider ?? "legacy check"} · {shortRevision(check.sourceRevision)}
+      {check.accountId ? ` · account ${check.accountId.slice(0, 8)}...` : ""}
+      {check.zoneId ? ` · zone ${check.zoneId}` : ""}
+      {stale ? " · stale result" : ""}
+    </div>
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Onboarding wizard — a guided, branching setup flow.
 // ---------------------------------------------------------------------------
+
+interface WizardRpcResult {
+  ok: boolean;
+  message?: string;
+}
 
 interface WizardProps {
   onboarding?: OnboardingState;
@@ -2257,12 +3416,11 @@ interface WizardProps {
   tokenConfigured: boolean;
   migrationToolConfigured?: boolean;
   migrationPlan?: MigrationPlan;
-  onPatch: (patch: Record<string, unknown>) => Promise<unknown>;
-  onProfile: (patch: Partial<BusinessProfile>) => Promise<unknown>;
+  onPatch: (patch: Record<string, unknown>) => Promise<WizardRpcResult | undefined>;
+  onProfile: (patch: Partial<BusinessProfile>) => Promise<WizardRpcResult | undefined>;
   onPreview: (args: {
     provider: string;
     config?: string;
-    configUrl?: string;
     configFiles?: Array<{ filename: string; content: string }>;
     format?: string;
   }) => Promise<{ ok: boolean; message: string; totalRules?: number } | undefined>;
@@ -2294,7 +3452,7 @@ const WIZARD_COPY: Record<string, { title: string; why: string }> = {
   },
   config: {
     title: "Share your provider config",
-    why: "We parse it read-only and show exactly what will move to Cloudflare. Paste an export or link to one — JSON, XML, Terraform, and PAN-OS are supported. You can skip and do this later.",
+    why: "We parse it read-only and show exactly what will move to Cloudflare. Upload or paste an export — JSON, XML, Terraform, and PAN-OS are supported. You can skip and do this later.",
   },
   setup: {
     title: "Choose your DNS setup",
@@ -2371,16 +3529,17 @@ function OnboardingWizard({
   const [compliance, setCompliance] = useState<string[]>(businessProfile?.compliance ?? []);
   const [concerns, setConcerns] = useState<string[]>(businessProfile?.concerns ?? []);
   const [configText, setConfigText] = useState("");
-  const [configUrl, setConfigUrl] = useState("");
   const [configFiles, setConfigFiles] = useState<Array<{ filename: string; content: string }>>([]);
   const [fileLabel, setFileLabel] = useState<string>();
   const [configFormat, setConfigFormat] = useState<string>("auto");
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const fileReadVersion = useRef(0);
   const [tokenInput, setTokenInput] = useState("");
   const [step, setStep] = useState(onboarding?.path ? 1 : 0);
   const [busy, setBusy] = useState(false);
   const [previewMsg, setPreviewMsg] = useState<string>();
   const [tokenMsg, setTokenMsg] = useState<string>();
+  const [saveMsg, setSaveMsg] = useState<string>();
 
   const stepKeys = useMemo(() => {
     if (!path) return ["branch"];
@@ -2419,9 +3578,17 @@ function OnboardingWizard({
     }
   };
 
-  const choosePath = (p: OnboardingPath) => {
+  const choosePath = async (p: OnboardingPath) => {
+    if (busy) return;
+    setBusy(true);
+    setSaveMsg(undefined);
+    const result = await onPatch({ path: p });
+    setBusy(false);
+    if (!result?.ok) {
+      setSaveMsg(result?.message ?? "Glide could not save that choice. Reconnect and try again.");
+      return;
+    }
     setPath(p);
-    void onPatch({ path: p });
     setStep(1);
   };
 
@@ -2432,9 +3599,9 @@ function OnboardingWizard({
     setter((list) => (list.includes(id) ? list.filter((x) => x !== id) : [...list, id]));
 
   const clearFiles = () => {
+    fileReadVersion.current += 1;
     setConfigFiles([]);
     setConfigText("");
-    setConfigUrl("");
     setFileLabel(undefined);
     setConfigFormat("auto");
     setPreviewMsg(undefined);
@@ -2442,6 +3609,7 @@ function OnboardingWizard({
 
   const handleFiles = async (list: FileList | null) => {
     if (!list || !list.length) return;
+    const readVersion = ++fileReadVersion.current;
     const offered = Array.from(list);
     const allTf = offered.every((f) => /\.(tf|tfvars|hcl)$/i.test(f.name));
     const selected = offered.length > 1 && allTf ? offered : offered.slice(0, 1);
@@ -2459,21 +3627,27 @@ function OnboardingWizard({
       );
       return;
     }
-    const read = await Promise.all(
-      selected.map(async (f) => ({ filename: f.name, content: await f.text() })),
-    );
+    let read: Array<{ filename: string; content: string }>;
+    try {
+      read = await Promise.all(selected.map(async (f) => ({ filename: f.name, content: await f.text() })));
+    } catch {
+      if (readVersion === fileReadVersion.current) {
+        clearFiles();
+        setPreviewMsg("That config file could not be read. Choose it again or paste the contents.");
+      }
+      return;
+    }
+    if (readVersion !== fileReadVersion.current) return;
     if (read.length > 1 && allTf) {
       // A whole Terraform directory — the tool merges them.
       setConfigFiles(read);
       setConfigText("");
-      setConfigUrl("");
       setConfigFormat("terraform");
       setFileLabel(`${read.length} Terraform files`);
     } else {
       const f = read[0];
       setConfigFiles([]);
       setConfigText(f.content);
-      setConfigUrl("");
       setConfigFormat(formatFromName(f.filename));
       setFileLabel(
         offered.length > 1
@@ -2484,17 +3658,23 @@ function OnboardingWizard({
     setPreviewMsg(undefined);
   };
 
-  const advance = () => setStep((s) => Math.min(s + 1, stepKeys.length - 1));
+  const advance = () => {
+    setSaveMsg(undefined);
+    setStep((s) => Math.min(s + 1, stepKeys.length - 1));
+  };
   const back = () => setStep((s) => Math.max(0, s - 1));
 
   const commitAndNext = async () => {
     if (busy) return;
-    if (key === "provider") await onPatch({ migratingFrom: providerKey });
-    else if (key === "scope") await onPatch({ goals });
-    else if (key === "domain") await onPatch({ domain: domain.trim() });
-    else if (key === "setup") await onPatch({ setupType });
+    setSaveMsg(undefined);
+    let saved: WizardRpcResult | undefined;
+    if (["provider", "scope", "domain", "setup", "profile"].includes(key)) setBusy(true);
+    if (key === "provider") saved = await onPatch({ migratingFrom: providerKey });
+    else if (key === "scope") saved = await onPatch({ goals });
+    else if (key === "domain") saved = await onPatch({ domain: domain.trim() });
+    else if (key === "setup") saved = await onPatch({ setupType });
     else if (key === "profile")
-      await onProfile({
+      saved = await onProfile({
         industry,
         appTypes,
         audience: audience as BusinessProfile["audience"],
@@ -2506,17 +3686,18 @@ function OnboardingWizard({
         concerns,
       });
     else if (key === "config") {
-      const hasConfig = !!(configText.trim() || configUrl.trim() || configFiles.length);
+      const hasConfig = !!(configText.trim() || configFiles.length);
       if (hasConfig && providerKey) {
         if (!migrationToolConfigured) {
-          setPreviewMsg("Migration tool isn't connected here — you can skip and do this in chat later.");
+          setPreviewMsg(
+            "Migration import isn't configured here. Ask a workspace admin to configure it, or continue with DNS-first setup.",
+          );
         } else {
           setBusy(true);
           setPreviewMsg("Parsing your config (read-only)…");
           const res = await onPreview({
             provider: providerKey,
             config: configText.trim() || undefined,
-            configUrl: configUrl.trim() || undefined,
             configFiles: configFiles.length ? configFiles : undefined,
             format: configFormat,
           });
@@ -2530,6 +3711,13 @@ function OnboardingWizard({
         }
       }
     }
+    if (["provider", "scope", "domain", "setup", "profile"].includes(key)) {
+      setBusy(false);
+      if (!saved?.ok) {
+        setSaveMsg(saved?.message ?? "Glide could not save this step. Reconnect and try again.");
+        return;
+      }
+    }
     advance();
   };
 
@@ -2538,7 +3726,7 @@ function OnboardingWizard({
     setBusy(true);
     const res = await onSaveToken(tokenInput.trim());
     setBusy(false);
-    setTokenInput("");
+    if (res?.ok) setTokenInput("");
     setTokenMsg(res?.message);
   };
 
@@ -2547,9 +3735,7 @@ function OnboardingWizard({
     const goalsTxt = goals.map(goalLabel).join(", ");
     if (path === "migrate") {
       const prov = PROVIDER_OPTIONS.find((p) => p.key === providerKey)?.label ?? "my current provider";
-      const previewed = Boolean(
-        onboarding?.configProvided || configText || configUrl || configFiles.length,
-      );
+      const previewed = Boolean(onboarding?.configProvided && migrationPlan?.provider === providerKey);
       kickoff =
         `I'm migrating from ${prov} to Cloudflare for ${domain || "my domain"}. ` +
         `I want to migrate: ${goalsTxt || "my configuration"}. DNS setup: ${setupLabel(setupType)}. ` +
@@ -2619,13 +3805,13 @@ function OnboardingWizard({
                 selected={path === "migrate"}
                 title="Migrate from another provider"
                 desc="Akamai, Fastly, Imperva, Zscaler, Prisma Access, and more → Cloudflare."
-                onClick={() => choosePath("migrate")}
+                onClick={() => void choosePath("migrate")}
               />
               <ChoiceCard
                 selected={path === "fresh"}
                 title="Start fresh on Cloudflare"
                 desc="Set up DNS, security, and performance from scratch."
-                onClick={() => choosePath("fresh")}
+                onClick={() => void choosePath("fresh")}
               />
             </div>
           )}
@@ -2633,9 +3819,24 @@ function OnboardingWizard({
           {key === "provider" && (
             <div style={S.chipWrap}>
               {PROVIDER_OPTIONS.map((p) => (
-                <Chip key={p.key} on={providerKey === p.key} label={p.label} onClick={() => setProviderKey(p.key)} />
+                <Chip
+                  key={p.key}
+                  on={providerKey === p.key}
+                  label={p.label}
+                  onClick={() => {
+                    setProviderKey(p.key);
+                    setPreviewMsg(undefined);
+                  }}
+                />
               ))}
-              <Chip on={providerKey === "other"} label="Other / not sure" onClick={() => setProviderKey("other")} />
+              <Chip
+                on={providerKey === "other"}
+                label="Other / not sure"
+                onClick={() => {
+                  setProviderKey("other");
+                  setPreviewMsg(undefined);
+                }}
+              />
             </div>
           )}
 
@@ -2651,6 +3852,7 @@ function OnboardingWizard({
             <input
               autoFocus
               value={domain}
+              maxLength={MAX_ONBOARDING_DOMAIN_CHARS}
               onChange={(e) => setDomain(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === "Enter" && valid()) void commitAndNext();
@@ -2664,8 +3866,8 @@ function OnboardingWizard({
             <div>
               {migrationToolConfigured === false && (
                 <div style={S.wizNote}>
-                  The migration tool isn't connected in this environment — you can skip this and do it from chat
-                  later.
+                  Migration import isn't configured in this environment. Ask a workspace admin to configure it,
+                  or skip this step and continue with DNS-first setup.
                 </div>
               )}
 
@@ -2704,6 +3906,7 @@ function OnboardingWizard({
                   <textarea
                     value={configText}
                     onChange={(e) => {
+                      fileReadVersion.current += 1;
                       setConfigText(e.target.value);
                       setFileLabel(undefined);
                       setConfigFormat("auto");
@@ -2713,13 +3916,6 @@ function OnboardingWizard({
                     } export here (JSON / XML / Terraform / PAN-OS)…`}
                     rows={6}
                     style={{ ...S.wizInput, resize: "vertical", fontFamily: "ui-monospace, monospace", fontSize: 12 }}
-                  />
-                  <div style={{ ...S.wizMutedRow, margin: "8px 0" }}>— or link to it —</div>
-                  <input
-                    value={configUrl}
-                    onChange={(e) => setConfigUrl(e.target.value)}
-                    placeholder="https://link-to-your-export.json"
-                    style={S.wizInput}
                   />
                 </>
               )}
@@ -2906,6 +4102,8 @@ function OnboardingWizard({
           )}
         </div>
 
+        {saveMsg && <div style={S.wizPreviewMsg}>{saveMsg}</div>}
+
         {summaryChips.length > 0 && (
           <div style={S.wizSummary}>
             {summaryChips.map((c) => (
@@ -2943,6 +4141,13 @@ function OnboardingWizard({
 /** True when the current path is the admin route (`/admin`). */
 function isAdminPath(): boolean {
   return /^\/admin\/?$/i.test(location.pathname);
+}
+
+let adminDocsPromise: Promise<GlideDocsManifest> | undefined;
+
+function loadAdminDocs(): Promise<GlideDocsManifest> {
+  adminDocsPromise ??= import("virtual:glide-docs").then((module) => module.docsManifest);
+  return adminDocsPromise;
 }
 
 // --- Minimal, dependency-free Markdown renderer (dev-docs viewer) -----------
@@ -3190,18 +4395,28 @@ function GuidanceTab({
   const reindex = async () => {
     if (reindexing) return;
     setReindexing(true);
-    const res = (await onReindex()) as { ok?: boolean; message?: string } | undefined;
-    setReindexing(false);
-    setNotice(res?.message ?? "Reindex requested.");
+    try {
+      const res = (await onReindex()) as { ok?: boolean; message?: string } | undefined;
+      setNotice(res?.message ?? "Reindex requested.");
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Guidance reindex failed.");
+    } finally {
+      setReindexing(false);
+    }
   };
 
   const save = async () => {
     if (!draft || busy) return;
     setBusy(true);
-    const res = (await onSave(draft)) as { ok?: boolean; message?: string } | undefined;
-    setBusy(false);
-    if (res?.message) setNotice(res.message);
-    if (res?.ok !== false) setDraft(null);
+    try {
+      const res = (await onSave(draft)) as { ok?: boolean; message?: string } | undefined;
+      if (res?.message) setNotice(res.message);
+      if (res?.ok !== false) setDraft(null);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Guidance save failed.");
+    } finally {
+      setBusy(false);
+    }
   };
 
   const toggle = (d: GuidanceDoc) =>
@@ -3241,6 +4456,7 @@ function GuidanceTab({
             autoFocus
             style={S.input}
             value={draft.title}
+            maxLength={120}
             placeholder="e.g. Our stack, Compliance, Preferred DNS setup"
             onChange={(e) => setDraft({ ...draft, title: e.target.value })}
           />
@@ -3248,6 +4464,7 @@ function GuidanceTab({
           <textarea
             style={S.guidanceTextarea}
             value={draft.body}
+            maxLength={4_000}
             placeholder={
               "What should Glide know about this team so it asks the right questions?\n\ne.g. We're migrating from Akamai; we only care about WAF + rate limiting. DNS stays at Route 53 (partial/CNAME setup), so don't ask about nameserver changes. Always ask about PCI scope."
             }
@@ -3337,6 +4554,7 @@ function AdminPickRoom({ onPick }: { onPick: (room: string) => void }) {
         <input
           autoFocus
           value={value}
+          maxLength={200}
           onChange={(e) => setValue(e.target.value.trim())}
           onKeyDown={(e) => {
             if (e.key === "Enter" && value.trim()) onPick(value.trim());
@@ -3366,8 +4584,10 @@ function AdminGate() {
     return (
       <AdminPickRoom
         onPick={(r) => {
-          location.hash = r;
-          setRoom(r);
+          const normalized = r.trim();
+          if (!normalized || normalized.length > 200 || /[\u0000-\u001f\u007f]/.test(normalized)) return;
+          location.hash = encodeURIComponent(normalized);
+          setRoom(normalized);
         }}
       />
     );
@@ -3388,6 +4608,7 @@ function AdminGate() {
 /** The room-scoped admin dashboard: comms, actions, dev docs, onboarding & migration. */
 
 function AdminRoom({ room, name }: { room: string; name: string }) {
+  const docsManifest = use(loadAdminDocs());
   const [state, setState] = useState<GlideState>();
   const [tab, setTab] = useState<AdminTab>("comms");
   const [openDoc, setOpenDoc] = useState<string | null>(null);
@@ -3399,11 +4620,15 @@ function AdminRoom({ room, name }: { room: string; name: string }) {
   });
   const chat = useAgentChat({
     agent,
-    getInitialMessages: null,
+    getInitialMessages: loadInitialAgentMessages,
     body: () => ({ name }),
     experimental_throttle: 100,
   });
-  const messages = chat.messages.filter((message) => !isSystemEvent(message));
+  const verifiedActionResultEvents = useVerifiedActionResultEvents(agent, chat.messages);
+  const messages = chat.messages.filter((message) => {
+    const candidate = actionResultEventCandidate(message);
+    return !candidate || !verifiedActionResultEvents.has(actionResultEventKey(candidate));
+  });
 
   const chatLink = `/#${encodeURIComponent(room)}`;
   const pending = state?.pendingActions ?? [];
@@ -3482,18 +4707,15 @@ function AdminRoom({ room, name }: { room: string; name: string }) {
               <div style={S.transcript}>
                 {messages.map((m) => {
                   const { text, tools } = messageText(m);
-                  const who =
-                    m.role === "user"
-                      ? (m.metadata as GlideMessageMetadata | undefined)?.name ?? "teammate"
-                      : "Glide";
+                  const { who, userStyle, role } = messageAuthor(m);
                   return (
                     <div key={m.id} style={S.commRow}>
-                      <div style={{ ...S.avatar, ...(m.role === "user" ? S.avatarUser : S.avatarAi) }}>
-                        {m.role === "user" ? who.charAt(0).toUpperCase() : "G"}
+                      <div style={{ ...S.avatar, ...(userStyle ? S.avatarUser : S.avatarAi) }}>
+                        {userStyle ? who.charAt(0).toUpperCase() : "G"}
                       </div>
                       <div style={{ flex: 1, minWidth: 0 }}>
                         <div style={S.commWho}>
-                          {who} <span style={S.commRole}>{m.role}</span>
+                          {who} <span style={S.commRole}>{role}</span>
                         </div>
                         {text && <div style={S.commText}>{text}</div>}
                         {tools.length > 0 && (
@@ -3711,12 +4933,12 @@ function AdminRoom({ room, name }: { room: string; name: string }) {
               {!plan ? (
                 <Muted>
                   No migration plan in this room
-                  {state?.migrationToolConfigured === false ? " (migration tool not connected)." : "."}
+                  {state?.migrationToolConfigured === false ? " (migration import not configured)." : "."}
                 </Muted>
               ) : (
                 <>
                   <MigrationPlanPanel plan={plan} />
-                  {state?.migrationCheck && (
+                  {state?.migrationCheck && state.migrationCheck.kind !== "validate" && (
                     <div
                       style={{
                         ...S.checkBox,
@@ -3726,25 +4948,28 @@ function AdminRoom({ room, name }: { room: string; name: string }) {
                       }}
                     >
                       <b>{state.migrationCheck.kind}:</b> {state.migrationCheck.summary}
+                      <MigrationCheckMeta
+                        check={state.migrationCheck}
+                        plan={plan}
+                        defaultAccountId={state.defaultAccountId}
+                        defaultZoneId={state.defaultZone?.id}
+                      />
                     </div>
                   )}
                 </>
               )}
             </Panel>
 
-            {(state?.snapshots?.length ?? 0) > 0 && (
-              <Panel title={`Zone snapshots · ${state!.snapshots!.length}`}>
-                {state!.snapshots!.map((s) => (
-                  <div key={s.id} style={S.listRow}>
-                    <span style={{ fontSize: 13, wordBreak: "break-all" }}>{s.zoneName || s.zoneId}</span>
-                    <span style={S.listMeta}>{new Date(s.created).toLocaleString()}</span>
-                  </div>
-                ))}
-              </Panel>
-            )}
-
             {(state?.terraform || state?.csv) && (
               <Panel title="Exports">
+                {state?.terraform && (
+                  <MigrationArtifactMeta
+                    artifact={state.terraform}
+                    plan={plan}
+                    defaultAccountId={state.defaultAccountId}
+                    defaultZoneId={state.defaultZone?.id}
+                  />
+                )}
                 {state?.terraform?.files.map((f) => (
                   <div key={`tf-${f.filename}`} style={S.tfRow}>
                     <code style={S.tfName}>{f.filename}</code>
@@ -3753,6 +4978,15 @@ function AdminRoom({ room, name }: { room: string; name: string }) {
                     </button>
                   </div>
                 ))}
+                {state?.csv && (
+                  <MigrationArtifactMeta
+                    artifact={state.csv}
+                    plan={plan}
+                    defaultAccountId={state.defaultAccountId}
+                    defaultZoneId={state.defaultZone?.id}
+                    targetless
+                  />
+                )}
                 {state?.csv?.files.map((f) => (
                   <div key={`csv-${f.filename}`} style={S.tfRow}>
                     <code style={S.tfName}>{f.filename}</code>
@@ -3820,7 +5054,14 @@ class ErrorBoundary extends Component<{ children: ReactNode }, { error: Error | 
 }
 
 function App() {
-  const [name, setName] = useState<string | null>(() => localStorage.getItem(NAME_KEY));
+  const [name, setName] = useState<string | null>(() => {
+    const stored = localStorage.getItem(NAME_KEY);
+    if (!stored || chatParticipantNameError(stored)) {
+      localStorage.removeItem(NAME_KEY);
+      return null;
+    }
+    return stored.trim();
+  });
 
   if (!name) {
     return (
@@ -3832,11 +5073,8 @@ function App() {
       />
     );
   }
-  // `useAgentChat` (inside Room) calls React `use()` on a pending fetch for the
-  // room's initial messages. Without a Suspense ancestor, that suspends the root
-  // shell on every render (a network promise never resolves synchronously), which
-  // trips React 19's shell-suspend limit and throws error #482. This boundary lets
-  // React show a fallback, yield, and re-render Room once the messages resolve.
+  // The bounded history loader suspends this route while the complete persisted
+  // transcript is fetched, preventing partial-history sends and destructive retries.
   return (
     <Suspense
       fallback={
@@ -3957,6 +5195,7 @@ const S: Record<string, React.CSSProperties> = {
 
   sidebar: { width: 356, flexShrink: 0, border: "1px solid rgba(148,163,184,.15)", borderRadius: 14, background: "rgba(17,23,34,.68)", backdropFilter: "blur(18px)", WebkitBackdropFilter: "blur(18px)", boxShadow: "0 14px 36px rgba(0,0,0,.22), inset 0 1px 0 rgba(255,255,255,.035)", overflowY: "auto", padding: 11, display: "flex", flexDirection: "column", gap: 10 },
   errorBox: { background: "rgba(244,63,94,.14)", border: "1px solid rgba(244,63,94,.5)", color: "#fecdd3", padding: "9px 12px", borderRadius: 10, fontSize: 13 },
+  migrationRecovery: { padding: 11, borderRadius: 8, border: "1px solid rgba(244,63,94,.35)", background: "rgba(127,29,29,.14)" },
   section: { flexShrink: 0, background: "rgba(23,31,44,.68)", border: "1px solid rgba(148,163,184,.13)", borderRadius: 9, padding: "12px 13px", boxShadow: "inset 0 1px 0 rgba(255,255,255,.025)" },
   sectionHead: { display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 },
   sectionTitle: { margin: 0, fontSize: 11.5, fontWeight: 700, color: "#a5b4c9", textTransform: "uppercase", letterSpacing: 0.8, fontFamily: DISPLAY },
@@ -3975,6 +5214,7 @@ const S: Record<string, React.CSSProperties> = {
   actionMeta: { fontSize: 11, color: "#64748b", margin: "6px 0" },
   actionBtns: { display: "flex", gap: 8 },
   applyBtn: { flex: 1, padding: "8px 0", borderRadius: 6, border: "1px solid #f6821f", background: "#f6821f", color: "#1a1008", fontWeight: 800, cursor: "pointer" },
+  dangerBtn: { width: "100%", padding: "9px 10px", borderRadius: 6, border: "1px solid rgba(244,63,94,.62)", background: "rgba(190,24,93,.22)", color: "#fecdd3", fontWeight: 800, cursor: "pointer" },
   rejectBtn: { flex: 1, padding: "8px 0", borderRadius: 6, border: "1px solid rgba(148,163,184,.2)", background: "rgba(148,163,184,.055)", color: "#cbd5e1", cursor: "pointer" },
 
   kv: { display: "flex", justifyContent: "space-between", gap: 10, fontSize: 13, padding: "5px 0", borderBottom: "1px solid rgba(148,163,184,.1)" },

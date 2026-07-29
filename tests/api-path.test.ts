@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { canonicalizeApiPath, canonicalizeDomainName } from "../src/api-path.ts";
+import { canonicalizeApiPath, canonicalizeDomainName, zoneIdFromApiPath } from "../src/api-path.ts";
 
 test("canonicalizes ordinary Cloudflare API paths", () => {
   assert.equal(canonicalizeApiPath(" /zones/z1/dns_records?type=A "), "/zones/z1/dns_records?type=A");
@@ -40,4 +40,12 @@ test("normalizes internationalized domains and rejects non-host input", () => {
   for (const value of ["https://example.com", "user@example.com", "example.com/path", "localhost", "127.0.0.1"]) {
     assert.equal(canonicalizeDomainName(value), undefined, value);
   }
+});
+
+test("derives snapshot zone ids only from canonical zone-scoped paths", () => {
+  const zoneId = "a".repeat(32);
+  assert.equal(zoneIdFromApiPath(`/zones/${zoneId}/dns_records`), zoneId);
+  assert.equal(zoneIdFromApiPath(`/zones/${zoneId}?include=account`), zoneId);
+  assert.equal(zoneIdFromApiPath("/zones/not-a-zone/dns_records"), undefined);
+  assert.equal(zoneIdFromApiPath(`/accounts/${zoneId}/zones`), undefined);
 });

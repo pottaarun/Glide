@@ -46,9 +46,10 @@ the Durable Object for its persisted transcript and classifies the send:
 
 | Status | Authoritative transcript | UI recovery |
 | --- | --- | --- |
-| `delivered` | The user message id exists and the next message is from the assistant. | Clear any delivery warning. |
-| `not_delivered` | The user message id is absent. | Remove the optimistic bubble, restore its text to the composer, and wait for **live** before sending again. |
-| `response_interrupted` | The user message exists with no following assistant message. | Show **Retry response**; retry continues from that user turn without duplicating it. |
+| `delivered` | The user id exists and a correlated assistant message records `responseTo: <user id>` plus `delivery: "completed"`. | Clear any delivery warning. |
+| `not_delivered` | The user id is absent from both retained history and the permanent accepted-id ledger. | Remove the optimistic bubble, restore its text to the composer, and wait for **live** before sending again. |
+| `response_interrupted` | The user message exists without a correlated completed assistant response. | Show **Retry response**; retry continues from that user turn without duplicating it. |
+| `accepted_pruned` | The id has aged out of retained history but remains in the accepted-id ledger. | Do not restore or resend it; explain that Glide already accepted the older turn. |
 
 If both the WebSocket and the transcript check are unavailable, delivery remains
 unconfirmed. Do not manually paste and resend the same text while reconnecting;
@@ -58,6 +59,28 @@ best-effort because its RPC also needs a working connection.
 The **Stop** button cancels a live or wedged response. A 20-second no-progress
 timer also marks the turn stalled and re-enables the composer; it does not delete
 the persisted user message.
+
+## Legacy room-history migration
+
+An upgraded room can temporarily show **migration** instead of **live**. During
+this state Glide returns a structured 503 for transcript reads, rejects chat
+submissions server-side, and keeps the composer draft safe. The client polls the
+durable migration status and reloads authoritative history automatically when it
+becomes ready.
+
+| Status | Meaning | Operator action |
+| --- | --- | --- |
+| `migrating` | The quarantined legacy transcript is being redacted in bounded scheduled batches, or `GLIDE_TOKEN_KEY` is unavailable. | Wait. If the message mentions `GLIDE_TOKEN_KEY`, restore the correct Worker secret instead of deleting history. |
+| `recovery_required` | A stored token exists but cannot decrypt, so exact-token redaction cannot continue. | Confirm the old key cannot be restored, then use the recovery control under **Connection**. |
+| `discarding` | Confirmed recovery is deleting only the unrecoverable legacy archive in bounded background batches. | Keep the room open; status polling recreates a missing schedule and unlocks the room when complete. |
+| `ready` | Sanitization and the durable completion marker both succeeded. | No action; Glide rehydrates the authoritative transcript. |
+
+Recovery is intentionally destructive. It appears only for the durable
+token-decryption-failed state and requires typing
+`DISCARD LEGACY CHAT ARCHIVE` exactly. It preserves current retention archives
+and permanent replay tombstones, but the old legacy transcript itself cannot be
+restored through Glide. If the previous `GLIDE_TOKEN_KEY` is recoverable, restore
+that key and let migration continue instead.
 
 ## Token verification
 

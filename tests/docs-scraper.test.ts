@@ -3,7 +3,9 @@ import test from "node:test";
 
 import {
   deleteDocPages,
+  fetchDocText,
   indexDocPage,
+  MAX_DOC_FETCH_BYTES,
   parseProductIndex,
   parseTopIndex,
 } from "../src/docs-scraper.ts";
@@ -25,6 +27,36 @@ test("docs indexes accept only official HTTPS Cloudflare URLs", () => {
   assert.deepEqual(pages.map((page) => page.url), [
     "https://developers.cloudflare.com/dns/manage-dns-records/index.md",
   ]);
+});
+
+test("docs fetches reject non-official URLs, redirects, and oversized bodies", async () => {
+  const realFetch = globalThis.fetch;
+  let calls = 0;
+  try {
+    globalThis.fetch = (async () => {
+      calls += 1;
+      return new Response("not used");
+    }) as typeof fetch;
+    assert.equal(await fetchDocText("https://example.com/fake.md"), null);
+    assert.equal(calls, 0);
+
+    globalThis.fetch = (async (_input, init) => {
+      assert.equal(init?.redirect, "manual");
+      return new Response(null, {
+        status: 302,
+        headers: { location: "https://example.com/large.md" },
+      });
+    }) as typeof fetch;
+    assert.equal(await fetchDocText("https://developers.cloudflare.com/dns/page.md"), null);
+
+    globalThis.fetch = (async () =>
+      new Response("small", {
+        headers: { "content-length": String(MAX_DOC_FETCH_BYTES + 1) },
+      })) as typeof fetch;
+    assert.equal(await fetchDocText("https://developers.cloudflare.com/dns/page.md"), null);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
 });
 
 test("docs cleanup deletes known vector ids in bounded batches", async () => {

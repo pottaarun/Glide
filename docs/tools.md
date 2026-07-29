@@ -3,12 +3,13 @@
 Glide exposes two distinct surfaces:
 
 1. **LLM tools** — what the chat model can call during a turn (`buildTools()`,
-   `src/server.ts:1791`). **READ** tools execute against Cloudflare immediately;
+   `src/server.ts`). **READ** tools execute against Cloudflare immediately;
    **QUEUE** tools only append a `PendingAction` for human approval.
-2. **`@callable` RPCs** — methods the React client invokes over the WebSocket
-   (token management, approvals, the onboarding wizard, business-profile capture
-   and recommendation queueing, migration checks, snapshots, delivery
-   diagnostics, and room-scoped guidance controls).
+2. **`@callable` RPCs** — active methods the React client invokes over the
+   WebSocket (token management, approvals, the onboarding wizard,
+   business-profile capture and recommendation queueing, migration checks/exports,
+   delivery diagnostics, and room-scoped guidance controls), plus fail-closed
+   compatibility stubs documented separately.
 
 A turn runs **at most 8 tool-steps** (`stepCountIs(8)`), and read payloads echoed
 to the model are clipped to ~6 KB. See [Architecture](./architecture.md#the-chat-turn-lifecycle).
@@ -25,11 +26,11 @@ to the model are clipped to ~6 KB. See [Architecture](./architecture.md#the-chat
 | `list_zones` | `accountId?` | List zones, optionally filtered to one account. |
 | `find_zone` | `name` | Resolve a zone id by domain name and **save it as the room's default zone**. |
 | `list_dns_records` | `zoneId`, `type?` | List DNS records for a zone (optionally by record type). During an active onboarding it also sets `dnsReviewed`, ticking the "review DNS records" checklist step. |
-| `cf_get` | `path` | Generic READ against any Cloudflare API `GET` endpoint (path after `…/client/v4`). |
+| `cf_get` | `path` | Generic READ against v4 JSON REST endpoints using the standard Cloudflare API envelope (path after `…/client/v4`). |
 | `recommend_configuration` | `focus?` (`all\|security\|performance\|reliability\|privacy\|bots\|api\|tls`) | Turn the room's captured `businessProfile` into tailored, priority-ranked Cloudflare recommendations (rationale, triggering profile signals, and a docs citation). **Read-only — it proposes and QUEUES NOTHING**; the model then presents the items grouped by theme and offers to queue the concrete ones via the write builders. Runs the local engine (`src/recommendations.ts`), so it never calls Cloudflare. |
 
 The Cloudflare reads never change anything, and their failures come back through
-`readError()` (`src/server.ts:2262`), which appends a permission hint when
+`readError()` (`src/server.ts`), which appends a permission hint when
 relevant. `recommend_configuration` reads only the room's own captured
 `businessProfile`, so it makes no Cloudflare call and can never queue an action —
 it only returns text for the model to relay (`formatRecommendationsForModel()`,
@@ -54,7 +55,7 @@ None of these call Cloudflare. Each appends a `PendingAction`; a human must
 | `create_dns_record` | `zoneId`, `type`, `name`, `content`, `ttl?`, `proxied?`, `priority?` | `POST /zones/<id>/dns_records`. |
 | `set_zone_setting` | `zoneId`, `setting`, `value` | `PATCH /zones/<id>/settings/<setting>`. |
 | `create_waf_custom_rule` | `zoneId`, `rulesetId`, `description`, `expression`, `action` | `POST /zones/<id>/rulesets/<rulesetId>/rules`. (First `cf_get` the `http_request_firewall_custom` ruleset id.) |
-| `cf_write` | `product`, `summary`, `method` (`POST\|PUT\|PATCH\|DELETE`), `path`, `body?`, `zoneId?` | Any Cloudflare API change for products without a dedicated builder (Gateway, Access, Tunnels, R2, Load Balancing, cache/redirect rules, …). It refuses `POST /zones`; zone creation must use `add_domain` so existing-zone and duplicate-approval checks cannot be bypassed. |
+| `cf_write` | `product`, `summary`, `method` (`POST\|PUT\|PATCH\|DELETE`), `path`, `body?`, `zoneId?` | JSON REST changes for products without a dedicated builder (Gateway, Access, Tunnels, Load Balancing, cache/redirect rules, …). Raw, multipart, binary, GraphQL, and nonstandard response APIs are unsupported. It refuses `POST /zones`; zone creation must use `add_domain` so existing-zone and duplicate-approval checks cannot be bypassed. |
 
 > `expression` fields take Cloudflare wirefilter syntax, e.g.
 > `ip.geoip.country eq "RU"` or `http.request.uri.path contains "/admin"`.
@@ -67,18 +68,16 @@ None of these call Cloudflare. Each appends a `PendingAction`; a human must
 | `update_onboarding` | state | Record the path (migrate vs fresh), domain, DNS setup, provider, and goals — call it after **each** answer in the chat-led flow. Captured info **auto-completes** the matching checklist steps, so `checkOff` is only needed for external go-live steps (TTLs, nameservers, verify, DNSSEC, proxy). |
 | `update_business_profile` | state | Record answers to the "nature of the business" discovery questions (industry, app type, audience, traffic, whether users log in / expose an API, sensitive data, compliance, top concerns) into the room's `businessProfile`. **Only stores context — it changes nothing on the account.** Ask one question at a time; array answers are unioned with what's already captured so a partial call never drops earlier ones. Feeds `recommend_configuration`. Runs during onboarding **and** on-demand after go-live. |
 | `list_migration_providers` | READ | List providers the migration tool can parse and their phases. |
-| `preview_provider_migration` | READ | Translate an exported provider config into Cloudflare-equivalent rules; stores a migration plan. Accepts inline `config` or a `configUrl`; formats `json\|xml\|terraform\|panos\|auto`. Config input is capped at 2,000,000 UTF-8 bytes. |
-| `queue_migration_rules` | QUEUE | Convert supported plan rules into pending actions (`zoneId` required; optional `phases` subset). |
+| `preview_provider_migration` | READ | Translate inline or wizard-uploaded provider config into Cloudflare-equivalent rules; stores a migration plan. Formats: `json\|xml\|terraform\|panos\|auto`. Config input is capped at 850,000 UTF-8 bytes. |
+| `queue_migration_rules` | QUEUE | Convert supported retained plan rules into pending actions (`zoneId` required; optional `phases` subset). Truncated plans queue only their displayed subset; Terraform export uses the complete stored source. |
 | `generate_migration_terraform` | READ | Emit Terraform for the plan (reuses the last previewed config unless overridden). Downloadable from the sidebar. |
 | `migration_preflight` | READ | Check the token has the permissions the plan's provider needs. |
 | `migration_diff_report` | READ | Show what already exists in the target zone (migration-owned vs manual). |
-| `migration_validate` | READ | After Apply, verify the queued rules exist in the zone. |
 | `export_migration_csv` | READ | Export the plan's config as CSV. Downloadable from the sidebar. |
-| `snapshot_zone` | READ* | Capture a full zone snapshot (restore point). Read-only on Cloudflare. |
-| `list_zone_snapshots` | READ | List captured snapshots. Restoring is a **human-only** UI action, never a tool. |
 
-\* `snapshot_zone` reads Cloudflare and writes a record into the migration tool's
-snapshot store; it makes no changes to your zone.
+Automated post-migration validation and zone snapshot capture/list/restore/rollback
+are disabled fail-closed and are not exposed as LLM tools. Verify the reviewed
+Cloudflare configuration directly after Apply.
 
 See [Onboarding & migration](./onboarding-and-migration.md) for the end-to-end
 pipeline and what `queue_migration_rules` can and can't translate.
@@ -88,21 +87,22 @@ pipeline and what `queue_migration_rules` can and can't translate.
 ## `@callable` RPCs
 
 These are invoked by the client via `agent.call(method, args)`
-(`src/client/main.tsx:407`). Most take a trailing `by` (the actor's display name)
+(`src/client/main.tsx`). Most take a trailing `by` (the actor's display name)
 for attribution.
 
 ### Approvals — the only place real writes happen
 
 | RPC | Args | Returns | Notes |
 | --- | --- | --- | --- |
-| `applyAction` | `id`, `by?`, `confirmUncertain?` | `ActionResult` | **Executes** a queued action against Cloudflare. Publishes applying status, snapshots the zone first (best-effort), and safely re-merges ruleset entrypoints. Success removes the action; failure retains it. An uncertain/interrupted attempt is rejected unless the UI has completed the live-state warning and passes `confirmUncertain: true`. |
+| `applyAction` | `id`, `by?`, `confirmUncertain?` | `ActionResult` | **Executes** a queued action against Cloudflare. Publishes applying status and safely re-merges ruleset entrypoints; it does not capture a pre-mutation snapshot. Success removes the action; an ordinary API failure retains it. An uncertain/interrupted attempt is rejected unless the UI has completed the live-state warning and passes `confirmUncertain: true`. Legacy snapshot-restore approvals fail closed and are removed rather than retained for retry. |
 | `rejectAction` | `id`, `by?` | `ActionResult` | Discards a queued action. |
 | `applyAll` | `ids`, `by?` | `ActionResult[]` | Applies only the exact reviewed action IDs supplied by the client, in queue order. Newly queued actions, currently applying actions, and uncertain/interrupted attempts are excluded server-side. The UI confirms the reviewed count and reports if the queue changed before Apply. |
 
 `applyAction` delegates to the single server path that executes queued
 `PendingAction` writes. `applyAll` supplies reviewed IDs to that same path; it
-does not bypass action validation, lifecycle state, or resource fences. Snapshot
-restore is a separate human-only migration operation. See [Security model](./security.md).
+does not bypass action validation, lifecycle state, or resource fences. Disabled
+legacy snapshot-restore approvals are excluded from bulk Apply and rejected by the
+individual server path. See [Security model](./security.md).
 
 ### Token management
 
@@ -121,11 +121,13 @@ the token has every permission needed by later product-specific operations.
 | --- | --- | --- | --- |
 | `reportClientChatIssue` | `{ kind, messageId, connectionEpoch }` | `{ ok: true }` | Records a privacy-safe `chat.client_issue` structured event. `kind` is `not_delivered` or `response_interrupted`; invalid input becomes `unknown`. The RPC accepts no message text or token value. |
 
-The authoritative delivery check itself uses the Agents SDK `/get-messages` HTTP
-endpoint, not a callable RPC. The client compares its generated message id with
-the persisted transcript: it restores the draft when the id is absent, or offers
-**Retry response** when the user message exists without a following assistant
-message. See [Architecture: client delivery lifecycle](./architecture.md#the-client-delivery-lifecycle).
+The authoritative delivery check uses the Agents SDK `/get-messages` HTTP endpoint
+plus `acceptedChatMessageIds` for ids that have aged out of retained history. A
+turn is delivered only when a correlated assistant message records the user id in
+`responseTo` and `delivery: "completed"`. The client restores a truly absent draft,
+offers **Retry response** for an accepted turn without a completed response, and
+never resends an `accepted_pruned` turn. See
+[Architecture: client delivery lifecycle](./architecture.md#the-client-delivery-lifecycle).
 
 ### Invites
 
@@ -137,15 +139,14 @@ message. See [Architecture: client delivery lifecycle](./architecture.md#the-cli
 
 Both the chat-led flow and the opt-in form drive the same `OnboardingState`, and
 its checklist **auto-completes** from captured answers + the action queue
-(`autoDoneSteps()`, `src/server.ts:217`; re-derived by
-`recomputeOnboardingChecklist()`, `src/server.ts:900`).
+(`autoDoneSteps()` and `recomputeOnboardingChecklist()` in `src/server.ts`).
 
 | RPC | Args | Notes |
 | --- | --- | --- |
-| `startOnboarding` | `by?` | Begin onboarding (creates the checklist once a path is chosen). Called by **Start in chat** and the branch quick-replies (`startGuided()`, `src/client/main.tsx:494`). |
+| `startOnboarding` | `by?` | Begin onboarding (creates the checklist once a path is chosen). Called by **Start in chat** and the branch quick-replies (`startGuided()`, `src/client/main.tsx`). |
 | `updateOnboarding` | `patch`, `by?` | Merge a partial answer set (`path`, `domain`, `setupType`, `migratingFrom`, `goals`, `configProvided`, `completed`, `checkOff`). Auto-completes the matching checklist steps. |
 | `completeOnboarding` | `by?` | Mark the guided setup finished. |
-| `resetOnboarding` | `by?` | Clear onboarding entirely (`onboarding: undefined`) so the room can start over. Wired to the sidebar **Reset** button behind a `window.confirm` (`resetOnboarding()`, `src/client/main.tsx:514`). |
+| `resetOnboarding` | `by?` | Clear onboarding entirely (`onboarding: undefined`) so the room can start over. Wired to the sidebar **Reset** button behind a `window.confirm` (`resetOnboarding()`, `src/client/main.tsx`). |
 | `toggleOnboardingStep` | `id`, `done`, `by?` | Manually check/uncheck a single step — the override for the human-only go-live steps; most steps auto-complete. |
 | `previewMigration` | `args`, `by?` | Run a read-only provider-config preview from the form wizard; accepts uploaded `configFiles`. |
 
@@ -158,8 +159,8 @@ buttons, and the sidebar **Reset**.
 
 | RPC | Args | Returns | Notes |
 | --- | --- | --- | --- |
-| `updateBusinessProfile` | `patch`, `by?` | `{ ok: true }` | Merge answers into `state.businessProfile` (`applyBusinessProfilePatch()`, `src/server.ts:1193`). Array fields replace (the form sends the full selection); scalars/booleans overwrite when provided. Capturing a profile changes **nothing** on the account. |
-| `resetBusinessProfile` | `by?` | `{ ok: true }` | Clear the captured profile (`businessProfile: undefined`) so discovery can start over. Wired to the sidebar **Reset** behind a `window.confirm` (`src/client/main.tsx:1030`). |
+| `updateBusinessProfile` | `patch`, `by?` | `{ ok: true }` | Merge answers into `state.businessProfile` (`applyBusinessProfilePatch()`, `src/server.ts`). Array fields replace (the form sends the full selection); scalars/booleans overwrite when provided. Capturing a profile changes **nothing** on the account. |
+| `resetBusinessProfile` | `by?` | `{ ok: true }` | Clear the captured profile (`businessProfile: undefined`) so discovery can start over. Wired to the sidebar **Reset** behind a `window.confirm` (`src/client/main.tsx`). |
 | `queueRecommendation` | `recId`, `zoneId`, `by?` | `{ ok, message, id? }` | One-click **Queue** for a concrete recommendation. The client sends only the recommendation id + target zone id; the server **recomputes the set from the room's trusted `businessProfile` and rebuilds the exact Cloudflare call from its own catalog** (`recommendationToPending()`), never from a client-supplied path/body. Requires a 32-hex `zoneId`, de-duplicates against the queue, and refuses anything not concretely queueable — routing it to chat instead. |
 
 Only a narrow set of recommendations are one-click queueable: `set_zone_setting`
@@ -186,40 +187,54 @@ manually editable and does not affect the shared Vectorize index.
 | --- | --- | --- |
 | `runPreflight` | `zoneId?`, `by?` | Token-permission preflight for the plan's provider. |
 | `runDiffReport` | `zoneId?`, `by?` | What already exists in the target zone. |
-| `runValidate` | `zoneId?`, `by?` | Verify queued rules landed (post-Apply). |
 | `exportMigrationCsv` | `by?` | Export the plan as CSV. |
 
-### Zone snapshots
+### Legacy chat-history recovery
+
+These room-scoped RPCs support the pre-upgrade transcript safety migration. The
+client calls them automatically; they do not change Cloudflare configuration.
 
 | RPC | Args | Notes |
 | --- | --- | --- |
-| `snapshotZone` | `zoneId?`, `by?` | Capture a restore point (read-only on Cloudflare). |
-| `refreshSnapshots` | `zoneId?` | Pull the stored snapshot list into synced state. |
-| `restoreSnapshot` | `snapshotId`, `by?` | **DESTRUCTIVE** — reverts the snapshot's recorded zone. Guarded by a `window.confirm`; the server requires the recorded account to match the active account and verifies the room token can read that exact live zone. Never automated. |
+| `legacyChatMigrationStatus` | none | Returns `ready`, `migrating`, `recovery_required`, or `discarding`; also recreates a missing continuation schedule while work remains. |
+| `discardLegacyChatArchiveForRecovery` | exact confirmation string | Available only after a durable stored-token decryption failure. Requires `DISCARD LEGACY CHAT ARCHIVE`, preserves retention rows and replay tombstones, and starts bounded archive deletion. |
+
+### Disabled migration compatibility RPCs
+
+These callable methods remain only as fail-closed compatibility stubs. The React
+client exposes no validation or snapshot controls.
+
+| RPC | Behaviour |
+| --- | --- |
+| `runValidate` | Always returns `{ ok: false }` with the automated-validation-disabled explanation. |
+| `snapshotZone` | Always returns `{ ok: false }`; no snapshot is captured. |
+| `refreshSnapshots` | Always returns `{ ok: false }`; no snapshot list is loaded. |
+| `restoreSnapshot` | Always returns `{ ok: false }`; no restore or rollback is queued or executed. |
 
 ### Team guidance
 
 Invoked from the read-only [admin dashboard](./architecture.md#the-admin-dashboard-admin)
-(**Team guidance** tab, `src/client/main.tsx:2538`). Each write keeps the
+(**Team guidance** tab, `src/client/main.tsx`). Each write keeps the
 Vectorize RAG index in sync best-effort — see
 [Architecture → Team guidance](./architecture.md#team-guidance-rag--srcguidance-ragts).
 
 | RPC | Args | Returns | Notes |
 | --- | --- | --- | --- |
-| `upsertGuidanceDoc` | `input` (`{ id?, title?, body?, enabled? }`), `by?` | `{ ok, message, id? }` | Add or (when `id` matches) update a doc (`src/server.ts:1169`). Title clipped to 120 chars, body to `MAX_GUIDANCE_BODY`; rejects if both are empty or the room already has `MAX_GUIDANCE_DOCS` (25) docs. Then `syncGuidanceVectors()` (re)embeds it if enabled+non-empty, else drops its vector (`src/guidance-rag.ts:105`). |
-| `deleteGuidanceDoc` | `id` | `{ ok: true }` | Remove the doc from state and delete its vector (`src/server.ts:1202`). |
-| `reindexGuidance` | — | `{ ok, indexed, message }` | Re-embed every doc (upsert enabled, drop the rest). Use to backfill docs created before RAG existed or to repair the index; returns `ok: false` when Vectorize isn't configured (`src/server.ts:1215`). |
+| `upsertGuidanceDoc` | `input` (`{ id?, title?, body?, enabled? }`), `by?` | `{ ok, message, id? }` | Add or (when `id` matches) update a doc (`src/server.ts`). Title clipped to 120 chars, body to `MAX_GUIDANCE_BODY`; rejects if both are empty or the room already has `MAX_GUIDANCE_DOCS` (25) docs. Then `syncGuidanceVectors()` (re)embeds it if enabled+non-empty, else drops its vector (`src/guidance-rag.ts`). |
+| `deleteGuidanceDoc` | `id` | `{ ok: true }` | Remove the doc from state and delete its vector (`src/server.ts`). |
+| `reindexGuidance` | — | `{ ok, indexed, message }` | Re-embed every doc (upsert enabled, drop the rest). Use to backfill docs created before RAG existed or to repair the index; returns `ok: false` when Vectorize isn't configured (`src/server.ts`). |
 
 These are the only mutating guidance paths; retrieval happens automatically each
-turn via the private `selectGuidanceForPrompt()` (`src/server.ts:1241`), not an RPC.
+turn via the private `selectGuidanceForPrompt()` (`src/server.ts`), not an RPC.
 
 ### Cloudflare docs (internal RAG index job)
 
 The shared Cloudflare-docs index has no room-callable RPC controls. A **weekly
 cron** (`Sun 02:00 UTC`) invokes `startDocsReindex` directly on one fixed internal
-Durable Object. The job deletes vectors recorded by the previous canonical run,
-then enumerates, embeds, and upserts current pages in bounded scheduled batches.
-Per-turn retrieval remains automatic via the private `selectDocsForPrompt()`.
+Durable Object; public HTTP and WebSocket routes to its reserved name return `404`.
+The job enumerates, embeds, and upserts current pages in bounded scheduled batches,
+with durable startup reconciliation if a delayed tick is lost. Per-turn retrieval
+remains automatic via the private `selectDocsForPrompt()`.
 See [Architecture → Cloudflare-docs RAG](./architecture.md#cloudflare-docs-rag--srcdocs-scraperts).
 
 ---
@@ -228,12 +243,12 @@ See [Architecture → Cloudflare-docs RAG](./architecture.md#cloudflare-docs-rag
 
 1. The user asks for a change in chat.
 2. The model calls a QUEUE tool (e.g. `create_dns_record`) → `queuePending()`
-   appends a `PendingAction` to `state.pendingActions` (`src/server.ts:2274`).
+   appends a `PendingAction` to `state.pendingActions` (`src/server.ts`).
 3. The action shows up in every client's **Pending approvals** panel.
 4. A human reviews the method, path, request body, and warnings before the
    controls, then clicks **Apply** → `applyAction` →
-   best-effort zone snapshot → (for ruleset phases) re-read + merge current rules
-   → `cfRequest(method, path, token, body)`.
+   (for ruleset phases) re-read + merge current rules →
+   `cfRequest(method, path, token, body)`. No local pre-mutation snapshot is taken.
 5. The action is first marked `applying`, which syncs to every client and fences
    duplicate Apply calls. The outcome is prepended to `recentResults` (capped at
    25). Applied/rejected actions are removed; failed actions remain queued with

@@ -44,6 +44,10 @@ const MAX_META_TEXT = 1_200;
 const MAX_QUERY_CHARS = 1_024;
 /** Per-request timeout for a docs fetch. */
 const FETCH_TIMEOUT_MS = 20_000;
+/** Bound indexes and pages before decoding them into Worker memory. */
+export const MAX_DOC_FETCH_BYTES = 2_000_000;
+const MAX_DOC_PRODUCTS = 500;
+const MAX_DOC_PAGES_PER_PRODUCT = 20_000;
 
 /** A product discovered in the top-level index. */
 export interface DocProduct {
@@ -81,18 +85,49 @@ function vectorizeIndex(env: Cloudflare.Env): VectorizeIndex | undefined {
  * it) and applies a timeout. Returns the body text, or null on any failure.
  */
 export async function fetchDocText(url: string): Promise<string | null> {
+  if (!isCloudflareDocsUrl(url)) return null;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
   try {
     const res = await fetch(url, {
       headers: { Accept: "text/markdown, text/plain, */*" },
       signal: controller.signal,
+      redirect: "manual",
     });
-    if (!res.ok) {
+    if (!res.ok || (res.status >= 300 && res.status < 400)) {
+      await res.body?.cancel().catch(() => undefined);
       console.warn(`[docs-scraper] fetch ${url} → ${res.status}`);
       return null;
     }
-    return await res.text();
+    const contentLength = Number(res.headers.get("content-length"));
+    if (Number.isFinite(contentLength) && contentLength > MAX_DOC_FETCH_BYTES) {
+      await res.body?.cancel().catch(() => undefined);
+      return null;
+    }
+    if (!res.body) return "";
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder("utf-8", { fatal: true });
+    const chunks: string[] = [];
+    let bytes = 0;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        bytes += value.byteLength;
+        if (bytes > MAX_DOC_FETCH_BYTES) {
+          await reader.cancel().catch(() => undefined);
+          return null;
+        }
+        chunks.push(decoder.decode(value, { stream: true }));
+      }
+      chunks.push(decoder.decode());
+      return chunks.join("");
+    } catch (error) {
+      await reader.cancel().catch(() => undefined);
+      throw error;
+    } finally {
+      reader.releaseLock();
+    }
   } catch (err) {
     console.warn(`[docs-scraper] fetch ${url} failed:`, (err as Error)?.message ?? err);
     return null;
@@ -132,13 +167,15 @@ export function parseTopIndex(md: string): DocProduct[] {
     }
     const m = /^-\s*\[([^\]]+)\]\((https?:\/\/[^)]+?)\)/.exec(line.trim());
     if (!m) continue;
-    const label = m[1].trim();
+    const label = m[1].trim().slice(0, 200);
     const url = m[2].trim();
     if (!isCloudflareDocsUrl(url)) continue;
     if (!/\/llms\.txt$/i.test(url)) continue; // only per-product indexes
     if (seen.has(url)) continue;
     seen.add(url);
-    out.push({ product: productKeyFromUrl(url), label, url, category });
+    if (url.length > 2_048) continue;
+    out.push({ product: productKeyFromUrl(url).slice(0, 60), label, url, category: category.slice(0, 120) });
+    if (out.length >= MAX_DOC_PRODUCTS) break;
   }
   return out;
 }
@@ -163,13 +200,15 @@ export function parseProductIndex(md: string): DocPage[] {
     }
     const m = /^-\s*\[([^\]]+)\]\((https?:\/\/[^)]+?)\)/.exec(line.trim());
     if (!m) continue;
-    const title = m[1].trim();
+    const title = m[1].trim().slice(0, 200);
     const url = m[2].trim();
     if (!isCloudflareDocsUrl(url)) continue;
     if (!/\.md$/i.test(url)) continue; // only Markdown page links
     if (seen.has(url)) continue;
     seen.add(url);
-    out.push({ url, title, section });
+    if (url.length > 2_048) continue;
+    out.push({ url, title, section: section.slice(0, 120) });
+    if (out.length >= MAX_DOC_PAGES_PER_PRODUCT) break;
   }
   return out;
 }

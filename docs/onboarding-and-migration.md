@@ -7,21 +7,20 @@ tailored, docs-cited recommendations. Everything keeps the safety contract —
 nothing changes until a human Applies a queued action.
 
 - Chat-led setup: Glide asks one question at a time and records each answer; the
-  sidebar checklist fills itself in. System prompt: `src/system-prompt.ts:52`.
-- Chat opener + branch quick-replies: `GuidedIntro` (`src/client/main.tsx:1148`)
-  and `startGuided()` (`src/client/main.tsx:494`).
-- Opt-in form wizard: `OnboardingWizard` (`src/client/main.tsx:1339`).
-- Onboarding state/RPCs: `src/server.ts:920` onward (`startOnboarding`,
+  sidebar checklist fills itself in. System prompt: `src/system-prompt.ts`.
+- Chat opener + branch quick-replies: `GuidedIntro` and `startGuided()`
+  (`src/client/main.tsx`).
+- Opt-in form wizard: `OnboardingWizard` (`src/client/main.tsx`).
+- Onboarding state/RPCs: `src/server.ts` (`startOnboarding`,
   `updateOnboarding`, `completeOnboarding`, `resetOnboarding`, …). Checklist
-  auto-completion: `autoDoneSteps()` (`src/server.ts:217`) +
-  `recomputeOnboardingChecklist()` (`src/server.ts:900`).
+  auto-completion: `autoDoneSteps()` + `recomputeOnboardingChecklist()`.
 - Restart: the sidebar **Reset** button clears onboarding via `resetOnboarding`
-  (`src/client/main.tsx:514`).
+  (`src/client/main.tsx`).
 - Business discovery + recommendations: the `update_business_profile` and
   `recommend_configuration` tools, the engine `src/recommendations.ts`, and the
-  `RecommendationsPanel` (`src/client/main.tsx:2058`); RPCs `updateBusinessProfile`,
-  `resetBusinessProfile`, `queueRecommendation` (`src/server.ts:1224` onward).
-- Migration client: `src/migration.ts`; queueing logic: `src/server.ts:2392`.
+  `RecommendationsPanel` (`src/client/main.tsx`); RPCs `updateBusinessProfile`,
+  `resetBusinessProfile`, `queueRecommendation` (`src/server.ts`).
+- Migration client: `src/migration.ts`; queueing logic: `src/server.ts`.
 
 ---
 
@@ -32,36 +31,36 @@ question at a time** — migrate vs. fresh, domain, provider, goals, DNS setup,
 and whether a token is connected — explaining the *why* and recording each answer
 into the synced
 `OnboardingState` with the `update_onboarding` tool. It is told never to re-ask
-anything already captured (`src/system-prompt.ts:52`).
+anything already captured (`src/system-prompt.ts`).
 
 Glide never needs a token value in chat. When a credential is missing, it directs
 the user to **Connection → Set token**; recognizable `cfat_...`, `cfut_...`, and
 `cfk_...` values are blocked from the normal composer and redacted before persistence.
 
-The empty-chat opener is three-way (`src/client/main.tsx:605`): if onboarding is
+The empty-chat opener is three-way (`src/client/main.tsx`): if onboarding is
 **completed** it shows a done card, if it is **active** (already started, but no
 messages have hydrated yet) it shows an *"Onboarding in progress 👉"* resume hint
 rather than re-asking the first question, and otherwise it shows the `GuidedIntro`
-opener (`src/client/main.tsx:1148`) with one-tap branch replies. Choosing a branch
-calls `startGuided()` (`src/client/main.tsx:494`), which starts onboarding, pins
+opener (`src/client/main.tsx`) with one-tap branch replies. Choosing a branch
+calls `startGuided()` (also in `src/client/main.tsx`), which starts onboarding, pins
 the branch, and hands the conversation to Glide. You can also kick it off from the
 sidebar (**Start in chat**) or just type. To start over, the sidebar **Reset**
-button clears onboarding via `resetOnboarding` (`src/client/main.tsx:514`, guarded
+button clears onboarding via `resetOnboarding` (`src/client/main.tsx`, guarded
 by a `window.confirm`).
 
 ### Opt-in form wizard
 
 Prefer clicking through a form? The `OnboardingWizard`
-(`src/client/main.tsx:1339`) is available on demand — via **Use the guided form**
+(`src/client/main.tsx`) is available on demand — via **Use the guided form**
 in the chat opener, or **Use form** in the sidebar — but it **no longer pops up
 automatically**. It writes the same `OnboardingState` via the `updateOnboarding`
 RPC, and **Finish & open chat** seeds the chat with a kickoff message describing
-the plan (`finish()`, `src/client/main.tsx:1495`).
+the plan (`finish()`, `src/client/main.tsx`).
 
 #### First branch: migrate vs. fresh
 
 Everything is tailored from one choice (the branch question / `key === "branch"`,
-`src/client/main.tsx:1548`):
+`src/client/main.tsx`):
 
 - **Migrate from another provider** — pull existing WAF/CDN/DNS config into
   Cloudflare equivalents.
@@ -70,7 +69,7 @@ Everything is tailored from one choice (the branch question / `key === "branch"`
 
 #### Form step sequence
 
-The step sequence depends on the path (`stepKeys`, `src/client/main.tsx:1367`).
+The step sequence depends on the path (`stepKeys`, `src/client/main.tsx`).
 The `token` step is skipped when a token is already connected:
 
 | Path | Steps |
@@ -78,7 +77,7 @@ The `token` step is skipped when a token is already connected:
 | **migrate** | `branch → provider → scope → domain → config → [token] → review` |
 | **fresh** | `branch → scope → domain → setup → [token] → review` |
 
-Each step shows a **why** explanation (`WIZARD_COPY`, `src/client/main.tsx:1272`).
+Each step shows a **why** explanation (`WIZARD_COPY`, `src/client/main.tsx`).
 The `review` step summarises captured answers and reminds you Glide only queues
 changes.
 
@@ -118,23 +117,23 @@ See [Troubleshooting & observability](./troubleshooting.md) for recovery details
 ### Goals (`scope`)
 
 The selectable goals differ by path (`MIGRATE_GOALS` / `FRESH_GOALS`,
-`src/client/main.tsx:149`): DNS, WAF/security, cache/performance, rate limiting,
+`src/client/main.tsx`): DNS, WAF/security, cache/performance, rate limiting,
 load balancing or redirects, and Zero Trust (Gateway / Access).
 
 ### Onboarding checklist (auto-completing)
 
-Once a path is chosen, `checklistForPath()` (`src/server.ts:175`) fills a live
+Once a path is chosen, `checklistForPath()` (`src/server.ts`) fills a live
 checklist mirroring Cloudflare's recommended go-live path. **The checklist
 completes itself as Glide gathers the required info** — you rarely tick a box by
 hand:
 
-- `autoDoneSteps()` (`src/server.ts:217`) derives which steps are done from the
+- `autoDoneSteps()` (`src/server.ts`) derives which steps are done from the
   captured answers (domain set, Full/Partial DNS chosen, provider config
   previewed, scanned DNS records reviewed) **and** the action queue (a
   queued/applied SSL setting, WAF rule, or migration rules).
 - It's applied on every onboarding update (`applyOnboardingPatch`,
-  `src/server.ts:844`) and re-derived whenever the queue changes
-  (`recomputeOnboardingChecklist`, `src/server.ts:900`, called from
+  `src/server.ts`) and re-derived whenever the queue changes
+  (`recomputeOnboardingChecklist`, also in `src/server.ts`, called from
   `queuePending` / `queueMigrationRules` / `finish`).
 - `find_zone` / `add_domain` establish the target before downstream work.
   `add_domain` performs an exact lookup in the resolved account; when the zone
@@ -188,8 +187,8 @@ traffic profile, sensitive data, compliance regimes, and top concerns — record
 each answer with the `update_business_profile` tool into the room's
 `businessProfile`. Capturing a profile changes **nothing** on the account; it is
 only context for the recommendation engine. The loop is driven by the
-"discovery → tailored config" block of the system prompt (`src/system-prompt.ts:85`)
-and a rendered profile snapshot (`renderBusinessProfile()`, `src/system-prompt.ts:224`)
+"discovery → tailored config" block of the system prompt (`src/system-prompt.ts`)
+and a rendered profile snapshot (`renderBusinessProfile()`, also in `src/system-prompt.ts`)
 that tells the model which dimensions are still blank, so it never re-asks.
 
 This runs during onboarding **and on-demand at any time** — if someone asks "what
@@ -197,16 +196,16 @@ should we turn on?", "how do we harden this?", or "make it faster", Glide runs t
 same loop even after go-live. The profile lives at the room level (not inside
 `OnboardingState`), so the advisor keeps working once onboarding is complete.
 
-- **Chat backfill.** `inferBusinessProfileFromText()` (`src/server.ts:392`)
+- **Chat backfill.** `inferBusinessProfileFromText()` (`src/server.ts`)
   deterministically recovers obvious answers from free text (e.g. "we take card
-  payments") and merges them via `applyBusinessProfilePatch()` (`src/server.ts:1193`,
-  called at `src/server.ts:2052`). It only **fills blanks and unions arrays** — it
+  payments") and merges them via `applyBusinessProfilePatch()` (`src/server.ts`).
+  It only **fills blanks and unions arrays** — it
   never overwrites an explicit tool answer or flips a boolean to `false`.
 - **Form step.** The opt-in wizard has a matching "nature of the business" step
   that writes the same state through the `updateBusinessProfile` RPC
-  (`patchBusinessProfile()`, `src/client/main.tsx:1024`).
+  (`patchBusinessProfile()`, `src/client/main.tsx`).
 - **Reset.** The sidebar **Reset** clears the captured profile via
-  `resetBusinessProfile` (`src/client/main.tsx:1030`, guarded by `window.confirm`).
+  `resetBusinessProfile` (`src/client/main.tsx`, guarded by `window.confirm`).
 
 ### From profile to recommendations
 
@@ -222,7 +221,7 @@ still pass through the human-Apply safety contract, and nothing plan-gated or
 destructive is queued without confirmation.
 
 The same engine drives the sidebar **Recommendations** panel (`RecommendationsPanel`,
-`src/client/main.tsx:2058`), which runs client-side against the synced profile:
+`src/client/main.tsx`), which runs client-side against the synced profile:
 
 - **Queue** (one-click) appears only for concretely queueable items and calls the
   `queueRecommendation` RPC. The client sends only the recommendation id and the
@@ -232,7 +231,7 @@ The same engine drives the sidebar **Recommendations** panel (`RecommendationsPa
   [Tools & RPC reference](./tools.md#business-discovery--recommendations) and the
   [Security model](./security.md).
 - **Ask Glide** appears for everything else and hands the setup to chat
-  (`askAboutRecommendation()`, `src/client/main.tsx:1054`) so the model can do the
+  (`askAboutRecommendation()`, `src/client/main.tsx`) so the model can do the
   required discovery first.
 
 Only a narrow set is one-click queueable: `set_zone_setting` for `ssl`,
@@ -246,7 +245,7 @@ its recommendations are also shown read-only in the `/admin` dashboard.
 
 ### `BusinessProfile` reference
 
-`BusinessProfile` (`src/shared.ts:299`) — every field is optional so the profile
+`BusinessProfile` (`src/shared.ts`) — every field is optional so the profile
 fills in gradually; the arrays default to `[]`:
 
 | Field | Meaning |
@@ -272,7 +271,7 @@ If a team is moving off another vendor, Glide uses the migration tool to read
 their **exported** config and translate it into Cloudflare rules. The whole
 preview path is **read-only** — nothing changes until queued rules are Applied.
 
-> Requires a connected migration tool (the `MIGRATION` service binding or
+> Requires configured migration import (the `MIGRATION` service binding or
 > `MIGRATION_API_URL`). Without one, the tools explain how to enable it and the
 > rest of Glide keeps working. See [Setup](./setup.md#the-migration-service-binding).
 
@@ -280,12 +279,12 @@ preview path is **read-only** — nothing changes until queued rules are Applied
 
 `akamai`, `fastly`, `imperva` (Incapsula), `zscaler_zia`, `zscaler_zpa`,
 `prisma_access`, `cisco_umbrella`, `akamai_eaa`, `proofpoint`
-(`PROVIDER_OPTIONS`, `src/client/main.tsx:137`). `list_migration_providers`
+(`PROVIDER_OPTIONS`, `src/client/main.tsx`). `list_migration_providers`
 returns the authoritative list and each provider's phases at runtime.
 
 CDN-style providers (`akamai`, `fastly`, `imperva`) are **zone-scoped** —
 preflight and queueing need a target zone id (`CDN_MIGRATION_PROVIDERS`,
-`src/server.ts:146`).
+`src/server.ts`).
 
 ### Config input
 
@@ -293,42 +292,45 @@ Accepted formats: **JSON, XML, Terraform, PAN-OS** (`auto`-detected by default).
 Config can be:
 
 - pasted inline (`config`),
-- fetched from a URL (`configUrl`, read-only, capped at 2 MB), or
 - uploaded as files in the wizard (`configFiles`) — multiple `.tf`/`.tfvars`/
   `.hcl` files are merged as a Terraform directory (`resolveConfigData()`,
-  `src/server.ts:2297`; format sniffing, `src/migration.ts:152`).
+  `src/server.ts`; format sniffing, `src/migration.ts`).
+
+Inline and uploaded input is capped at 850,000 UTF-8 bytes so even worst-case
+JSON escaping keeps its server-side source below the Durable Object SQLite row limit.
 
 ### The pipeline
 
 1. **`preview_provider_migration`** — parse the export into Cloudflare-equivalent
-   rules and store a `MigrationPlan` in the room (rules capped at 300 in synced
-   state; the full raw config is kept server-side for reuse). Summarises counts
-   per phase.
+   rules and store a `MigrationPlan` in the room (up to 300 rules, or fewer when
+   required by the synced-state byte budget; the full raw config is kept
+   server-side for export reuse). Truncated plans show retained versus total
+   counts per phase.
 2. **`migration_preflight`** _(recommended)_ — probe whether the configured token
    has the permissions the plan's provider needs, per phase. Read-only.
 3. **`migration_diff_report`** _(recommended)_ — show what already exists in the
    target zone (migration-owned vs. manually created), plus IP lists and load
    balancers, so nothing is clobbered.
-4. **`queue_migration_rules`** — convert supported rules into pending actions for
-   human Apply (needs a `zoneId`; optional `phases` subset). See the translation
-   table below.
+4. **`queue_migration_rules`** — convert supported retained rules into pending
+   actions for human Apply (needs a `zoneId`; optional `phases` subset). A
+   truncated plan queues only the visible subset; export Terraform for the full
+   source. See the translation table below.
 5. **`generate_migration_terraform`** / **`export_migration_csv`** — export the
    plan as Infrastructure-as-Code or CSV for phases best managed outside the
    queue. Downloaded from the sidebar.
-6. **`migration_validate`** — after Apply, verify the queued rule types actually
-   exist in the zone (verified vs. missing).
 
-Also: **`snapshot_zone`** captures a restore point before applying; restoring is a
-human-only UI action (never automated).
+After Apply, verify the reviewed Cloudflare rules and setting values directly.
+Automated post-migration validation is disabled fail-closed because the migration
+service does not compare complete live values.
 
 ### What `queue_migration_rules` can translate
 
-`queueMigrationRules()` (`src/server.ts:2392`) maps plan rule types to Cloudflare
+`queueMigrationRules()` (`src/server.ts`) maps plan rule types to Cloudflare
 API calls:
 
 | Plan rule type | Cloudflare target | Fidelity |
 | --- | --- | --- |
-| `waf_custom`, `access_control` | `http_request_firewall_custom` phase entrypoint (`PUT`) | Faithful. Action mapped via `mapWafActionToCf()` (`src/server.ts:311`). |
+| `waf_custom`, `access_control` | `http_request_firewall_custom` phase entrypoint (`PUT`) | Faithful. Action mapped via `mapWafActionToCf()` (`src/server.ts`). |
 | `rate_limit` | `http_ratelimit` phase entrypoint (`PUT`) | Rate parsed from the preview detail and snapped to a supported period (`10/60/120/300/600/3600`s). |
 | `redirect` | `http_request_dynamic_redirect` | **Best-effort** — flagged "review before Apply". |
 | `cache` | `http_request_cache_settings` | **Best-effort.** |
@@ -346,28 +348,27 @@ Zero Trust are intentionally left to `generate_migration_terraform`.
 
 WAF, rate-limit, and the best-effort ruleset phases are queued as a whole-phase
 `PUT`. To avoid overwriting rules added since queueing, each carries a
-`mergeEntrypoint` (`src/shared.ts:28`). At **Apply** time, `applyAction` re-reads
+`mergeEntrypoint` (`src/shared.ts`). At **Apply** time, `applyAction` re-reads
 the phase's current rules and appends the new ones (`mergeEntrypointRules()`,
-`src/server.ts:2594`). If the current phase cannot be read safely, Apply fails
+`src/server.ts`). If the current phase cannot be read safely, Apply fails
 without writing and retains the action for correction; it never replaces the
-phase from an empty baseline. A best-effort zone snapshot is also captured. See
-[Security model](./security.md).
+phase from an empty baseline. Apply does not capture a local pre-mutation
+snapshot. See [Security model](./security.md).
 
-### Zone snapshots
+### Disabled validation and snapshot paths
 
-`snapshotZone` / `restoreSnapshot` capture and roll back a full read-only zone
-snapshot (rulesets, settings, IP lists, load balancers) via the migration tool's
-store. **Restoring is destructive** and always a human-confirmed UI action
-(`window.confirm`) — Glide never auto-restores. The browser sends only the
-snapshot id. The server uses the snapshot's recorded account and zone, requires
-the active room account to match, and verifies that the room token can read that
-exact live zone before restoring.
+Zone snapshot capture, listing, restore, and rollback are disabled because the
+migration service cannot guarantee complete, fail-safe recovery. Glide exposes no
+LLM tools or UI controls for these operations. `runValidate`, `snapshotZone`,
+`refreshSnapshots`, and `restoreSnapshot` remain only as compatibility RPCs and
+always return `{ ok: false }`; legacy restore approvals are refused by Apply. On
+room startup, Glide drops the legacy local `glide_snapshots` breadcrumb table.
 
 ---
 
 ## Onboarding state reference
 
-`OnboardingState` (`src/shared.ts:242`):
+`OnboardingState` (`src/shared.ts`):
 
 | Field | Meaning |
 | --- | --- |
@@ -380,10 +381,10 @@ exact live zone before restoring.
 | `configProvided` | An exported config has been previewed. |
 | `dnsReviewed` | Scanned DNS records have been reviewed (`list_dns_records` ran during onboarding). Auto-ticks the "review DNS records" step. |
 | `goals` | What to migrate/set up. |
-| `checklist` | Ordered go-live steps (tailored to `path`). **Auto-completes** from captured answers + the action queue; see `autoDoneSteps()` (`src/server.ts:217`). |
+| `checklist` | Ordered go-live steps (tailored to `path`). **Auto-completes** from captured answers + the action queue; see `autoDoneSteps()` (`src/server.ts`). |
 | `updatedBy` / `ts` | Attribution + timestamp. |
 
-`MigrationPlan` (`src/shared.ts:291`) holds `provider`/`providerLabel`,
+`MigrationPlan` (`src/shared.ts`) holds `provider`/`providerLabel`,
 `totalRules`, per-phase counts, the (possibly truncated) `rules`, and attribution.
 Each `MigrationPlanRule` gains `queued: true` once it's been turned into a pending
 action (a dedup guard).

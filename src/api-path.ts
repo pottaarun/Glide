@@ -52,6 +52,12 @@ export function canonicalizeApiPath(raw: string): string | undefined {
   }
 }
 
+/** Extract the authoritative zone id from a canonical zone-scoped API path. */
+export function zoneIdFromApiPath(path: string): string | undefined {
+  const match = /^\/zones\/([^/?]+)(?:[/?]|$)/.exec(path);
+  return match && /^[a-f0-9]{32}$/i.test(match[1]) ? match[1] : undefined;
+}
+
 /** Convert a bare Unicode domain to the canonical ASCII hostname Cloudflare uses. */
 export function canonicalizeDomainName(raw: string): string | undefined {
   const value = raw.trim().replace(/\.$/, "");

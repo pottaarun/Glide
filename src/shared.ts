@@ -7,6 +7,14 @@ import type { PendingActionStatus } from "./action-lifecycle";
 
 export type WriteMethod = "POST" | "PUT" | "PATCH" | "DELETE";
 
+export const LEGACY_CHAT_RECOVERY_CONFIRMATION = "DISCARD LEGACY CHAT ARCHIVE";
+
+export interface LegacyChatMigrationStatus {
+  status: "ready" | "migrating" | "recovery_required" | "discarding";
+  message: string;
+  recoveryConfirmation?: typeof LEGACY_CHAT_RECOVERY_CONFIRMATION;
+}
+
 /** A Cloudflare-changing action the LLM proposed but that has NOT run yet. */
 export interface PendingAction {
   id: string;
@@ -20,6 +28,16 @@ export interface PendingAction {
   path: string;
   /** JSON body to send (omitted for DELETE with no body). */
   body?: unknown;
+  /** Dedicated destructive operation executed by the migration service after Apply. */
+  /** Legacy disabled action type retained only so persisted approvals can fail closed. */
+  actionType?: "snapshot_restore";
+  /** Legacy snapshot id retained only for fail-closed validation. */
+  restoreSnapshotId?: string;
+  /** Legacy reviewed payload retained only for fail-closed validation. */
+  restoreSnapshotAccountId?: string;
+  restoreSnapshotZoneId?: string;
+  restoreSnapshotVersion?: number;
+  restoreSnapshotDigest?: string;
   /**
    * Set when this action replaces a ruleset phase entrypoint (a PUT that would
    * otherwise overwrite the whole phase). At Apply time the server re-reads the
@@ -30,7 +48,7 @@ export interface PendingAction {
   mergeEntrypoint?: { phase: string; newRules: Array<Record<string, unknown>> };
   /** Display name of the room participant whose message triggered this. */
   createdBy: string;
-  /** Optional zone id this action targets (used to snapshot before applying). */
+  /** Optional zone id used for resource locking and target-aware approval handling. */
   zoneId?: string;
   /** Missing on legacy persisted actions, which are treated as pending. */
   status?: PendingActionStatus;
@@ -113,9 +131,9 @@ export interface GlideState {
   csv?: TerraformArtifact;
   /** Result of the most recent pre-flight or diff check (shown in the UI). */
   migrationCheck?: MigrationCheck;
-  /** Zone snapshots (restore points) captured via the migration tool. */
+  /** Legacy state shape; current snapshot RPCs never populate it. */
   snapshots?: SnapshotInfo[];
-  /** Whether the room is connected to a migration tool (MIGRATION_API_URL set). */
+  /** Whether the room is connected to a migration tool service. */
   migrationToolConfigured?: boolean;
   /**
    * Admin-authored guidance docs for THIS room (see {@link GuidanceDoc}). Edited
@@ -142,6 +160,8 @@ export interface DocsIndexState {
   status: "idle" | "enumerating" | "indexing" | "done" | "error" | "cancelled";
   /** Opaque id for the current run; stale scheduled ticks self-cancel when it changes. */
   runId?: string;
+  /** Durable handoff marker: the SQL work queue is complete and safe to resume. */
+  queueSeeded?: boolean;
   /** Products discovered from the top-level docs index. */
   productsTotal: number;
   /** Products whose page list has been enumerated into the work queue. */
@@ -290,11 +310,17 @@ export interface MigrationCheck {
   kind: "preflight" | "diff" | "validate";
   ok: boolean;
   summary: string;
+  /** Missing only on legacy persisted checks. */
+  provider?: string;
+  sourceRevision?: string;
+  /** Missing only on legacy persisted checks. */
+  accountId?: string;
+  zoneId?: string;
   by: string;
   ts: number;
 }
 
-/** A stored zone snapshot (a restore point), surfaced in the UI. */
+/** Legacy snapshot metadata retained for persisted-state compatibility only. */
 export interface SnapshotInfo {
   id: string;
   zoneId: string;
@@ -452,8 +478,10 @@ export interface MigrationPlan {
   totalRules: number;
   phases: Array<{ key: string; label: string; count: number }>;
   rules: MigrationPlanRule[];
-  /** True if `rules` was truncated for sync size; full config still lives server-side. */
+  /** True if `rules` is a bounded subset; the complete source remains available for export. */
   truncated?: boolean;
+  /** Exact SQL-only source revision used to produce this plan. Missing on legacy plans. */
+  sourceRevision?: string;
   createdBy: string;
   ts: number;
 }
@@ -461,6 +489,12 @@ export interface MigrationPlan {
 /** A generated Terraform artifact the room can download. */
 export interface TerraformArtifact {
   provider: string;
+  sourceRevision?: string;
+  /** Target shape used when this artifact was generated. Missing on legacy artifacts. */
+  targetScope?: "account" | "zone";
+  accountId?: string;
+  zoneId?: string;
+  zoneName?: string;
   files: Array<{ filename: string; content: string }>;
   rulesetCount?: number;
   ipListCount?: number;
@@ -471,6 +505,10 @@ export interface TerraformArtifact {
 /** Metadata attached to each chat message so the room knows who said what. */
 export interface GlideMessageMetadata {
   name?: string;
+  /** Server-authored correlation between an assistant response and its triggering user turn. */
+  responseTo?: string;
+  /** Server-authored terminal state used for durable delivery confirmation. */
+  delivery?: "completed" | "interrupted";
   /** Internal event that should inform the model but stay hidden in the human transcript. */
   systemEvent?: "action_result";
 }

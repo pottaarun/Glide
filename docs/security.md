@@ -135,6 +135,13 @@ Authorization is a server-only SQLite ACL in each room's Durable Object:
 - Only the owner can remove a non-owner. Revocation atomically removes the ACL and
   invitation audit row, then closes every matching socket with `1008` and reason
   `Room membership revoked`.
+- Only the owner can **delete** a room. `destroyRoom` resolves the live connection
+  identity (not the untrusted `by` label), requires that identity's role to be
+  `owner`, and requires the exact `DELETE THIS ROOM` phrase before it deregisters
+  the room and calls `storage.deleteAll()`, wiping members, transcript, queue,
+  memory, business profile, invites, and the encrypted token. Naming a room
+  (`setRoomName`) is any-member and display-only; it never affects routing,
+  storage identity, or the ACL.
 - A nonemployee cannot create or claim a room. A second employee does not gain
   access merely because they are an employee; an existing member must invite them.
 - The Worker requires an exact same-origin `Origin` for Agent WebSocket upgrades
@@ -184,6 +191,16 @@ and should not be posted publicly, but possessing one grants no data or Apply ac
 admitted member can use room controls, including Apply and invitations, so invite
 only people trusted to operate that room's Cloudflare credential. Opening admin
 itself uses inspect-only authorization and cannot create or claim a room.
+
+The deployment-wide **room registry** (`GET /api/rooms`, backed by the fixed
+`__registry__` Durable Object) powers the admin **All rooms** list. It is
+`GET`-only, same-origin, and restricted to verified Cloudflare employees; it is a
+convenience index that rooms self-report into, **not** an authorization boundary.
+Listing a room reveals only its id, optional display name, owner, member count, and
+timestamps — never its transcript, token, or state — and opening any listed room
+still enforces that room's server-only membership ACL. Both reserved system
+instances (`__system__` and `__registry__`) are rejected by browser HTTP/WebSocket
+Agent routes.
 
 Worker-served HTML adds `Content-Security-Policy: frame-ancestors 'none'` and
 `X-Frame-Options: DENY` to prevent clickjacking of authenticated controls.
@@ -350,6 +367,8 @@ These limits bound resource use and protect the model's context window:
 | Inbound WebSocket frames per Access identity | 120 per 60 seconds | `AGENT_RATE_LIMITER`, `src/server.ts` |
 | Chat submissions/expensive RPCs per Access identity and per room | 20 per 60 seconds for each bucket | `CHAT_RATE_LIMITER`, `src/server.ts` |
 | Room members | 100 | `MAX_ROOM_MEMBERS`, `src/server.ts` |
+| Room display name | 60 chars | `MAX_ROOM_NAME_CHARS`, `src/shared.ts` |
+| Rooms returned by `GET /api/rooms` | 1 000, most-recently-active first | `listRoomRegistry()`, `src/server.ts` |
 | Session/room-access request | 128 000 response bytes; 15-second deadline | `MAX_ACCESS_RESPONSE_BYTES`, `ACCESS_REQUEST_TIMEOUT_MS`, `src/client/main.tsx` |
 | Read payload echoed to the model | ~6 000 chars | `MAX_READ_CHARS`, `src/server.ts` |
 | Synced action-result history | 25 | `MAX_RECENT_RESULTS`, `src/server.ts` |
@@ -378,6 +397,8 @@ These limits bound resource use and protect the model's context window:
 | Authenticated users create Agent facets | `onBeforeSubAgent()` rejects every `/sub/` route with `404` | Revisit this deny-all hook before intentionally adopting sub-agents. |
 | Admin inspection creates or claims a room | Admin and transient-close checks use read-only `intent=inspect`; only the chat activation flow can insert the first owner | A Cloudflare employee using the normal chat activation flow can still intentionally create or claim. |
 | Legacy-room takeover | Only a verified Cloudflare employee may perform the one-time atomic claim | The first employee who knows an unclaimed legacy room id becomes owner; migrate sensitive legacy rooms promptly. |
+| Accidental or malicious room deletion | `destroyRoom` requires the live owner identity **and** the exact `DELETE THIS ROOM` phrase; the untrusted `by` label is never used | Deletion is intentional and irreversible — a legitimate owner can still delete a room; there is no built-in restore. |
+| Room registry leaks room contents | `GET /api/rooms` is employee-only and returns only id/name/owner/counts/timestamps; it is not an authorization boundary and each room is still membership-gated | A verified employee can enumerate room ids and names, but cannot read a room's data without being a member. |
 | Authenticated probing reserves arbitrary room storage | Previously absent storage stays provisional and denied probes trigger idempotent cleanup with bounded scheduling retries and a final serialized state recheck | Cleanup is asynchronous; transient storage can exist until the scheduled or fallback attempt completes. |
 | Cleanup races first-owner activation | Owner insertion atomically clears the provisional marker; cleanup rechecks marker, members, and durable data under `blockConcurrencyWhile()`; activation retries once with a replay id | A persistent platform failure can still make the activation request fail, but cannot intentionally destroy an activated room through this cleanup path. |
 | Client floods Agent/RPC/AI paths | Layered network request, identity protocol, per-identity chat/RPC, and per-room chat binding checks; rejected work does not mutate state | Counters are permissive and location-local; NATs can affect HTTP admission and rotating IPs/locations can raise the effective ceiling. |

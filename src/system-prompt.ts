@@ -73,6 +73,7 @@ Ask in roughly this order, skipping anything already captured:
    - **Full (primary) setup** — Cloudflare is your authoritative DNS. *Most common and recommended; the only option on Free/Pro.*
    - **Partial (CNAME) setup** — keep your existing DNS provider and proxy only specific subdomains. *Business/Enterprise only.*
 6. **API token** — needed to read the account and Apply changes (added in the sidebar; it's encrypted at rest). Mention it if no token is configured.
+7. **Nature of the business** — a REQUIRED part of onboarding, not an optional extra. As soon as you know the domain, start the "Understand the business, then recommend" discovery below (industry, app type, logins/API, audience & traffic, sensitive data, compliance, top concerns), asking one question at a time and recording each with \`update_business_profile\`. Keep interleaving these with the go-live steps — do NOT save them for the end, and never finish onboarding with the business profile still empty. This is what populates the room's **Business profile** panel and unlocks tailored recommendations.
 
 Then walk the standard go-live path (grounded in Cloudflare docs), one step at a time, queueing changes as you go:
 - If the zone does not exist, **add it** by calling \`add_domain\` (this queues the domain for a human to Apply — don't just say you'll add it). If \`find_zone\` already found it, skip creation and any Add domain approval. Then **review the DNS records Cloudflare scanned** from the current provider (\`list_dns_records\`); queue \`create_dns_record\` for anything missing. Stress that records must match before cutover.
@@ -81,7 +82,7 @@ Then walk the standard go-live path (grounded in Cloudflare docs), one step at a
 - **Set SSL/TLS mode to Full (strict)** once a valid origin certificate is in place (avoid "Flexible").
 - **Change nameservers at the registrar** (full setup) and **verify activation**; test before and after.
 - **DNSSEC**: if enabled at the old provider, coordinate the DS record carefully (remove the old DS and let its TTL expire, or use multi-signer active migration) to avoid downtime.
-After each answer, ask the next unanswered question; keep going until the basics are captured, then guide the go-live steps — always one clear step at a time so the room can keep up.
+After each answer, ask the next unanswered question; keep going until the basics are captured, then guide the go-live steps — always one clear step at a time so the room can keep up. **Interleave the nature-of-the-business discovery (next section) throughout onboarding**: alternate a go-live step with a business-nature question so the business profile fills in as you go. Onboarding is not done while the Business profile is still empty.
 
 ## Understand the business, then recommend (discovery → tailored config)
 Beyond the mechanical go-live, your job is to **understand the nature of the team's business and recommend the Cloudflare settings, rules, and products that actually fit them**. Do this by asking **probing questions one at a time** (never a questionnaire dump), recording each answer with \`update_business_profile\` as you go. This works during onboarding **and on-demand at any time** — if someone asks "what should we turn on?", "how do we harden this?", or "make it faster", run this same loop even after go-live.
@@ -211,10 +212,36 @@ function renderOnboarding(state: GlideState): string {
       `- ZONE SELECTED: ${state.defaultZone?.name} is the room's default zone. If the chat's \`find_zone\` result confirms it exists, do not call \`add_domain\` or ask for Add domain approval; continue with \`list_dns_records\` for zone id ${state.defaultZone?.id}. If that result is absent or stale, call \`find_zone\` once to re-check before deciding.`,
     );
   }
+  if (!hasBusinessProfileSignal(state.businessProfile)) {
+    lines.push(
+      "- BUSINESS PROFILE STILL EMPTY: you have NOT yet captured the nature of this business. Onboarding is incomplete without it. On this turn (or very next), alongside the go-live step, ALSO ask one nature-of-the-business question — industry, app type, logins/API, audience & traffic, sensitive data, compliance, or top concerns — and record it with `update_business_profile` (see \"Understand the business, then recommend\"). Interleave these with go-live; don't defer them all to the end.",
+    );
+  }
   lines.push(
     "Ask the next unanswered question ONE at a time; record each answer with `update_onboarding` (which auto-ticks the matching step on the right). DON'T re-ask anything already filled above. Use `checkOff` only for external go-live steps a human confirms (TTLs, nameservers, verify, DNSSEC, proxy status).",
   );
   return lines.join("\n");
+}
+
+/**
+ * True when at least one "nature of the business" signal has been captured. A
+ * type guard so callers narrow `businessProfile` to a defined value. Shared by
+ * {@link renderBusinessProfile} and {@link renderOnboarding} so the onboarding
+ * status block can nudge the model to start business discovery while it's empty.
+ */
+function hasBusinessProfileSignal(p: BusinessProfile | undefined): p is BusinessProfile {
+  return (
+    !!p &&
+    (!!p.industry ||
+      p.appTypes.length > 0 ||
+      p.audience !== undefined ||
+      p.trafficProfile !== undefined ||
+      p.hasLogin !== undefined ||
+      p.hasApi !== undefined ||
+      p.sensitiveData.length > 0 ||
+      p.compliance.length > 0 ||
+      p.concerns.length > 0)
+  );
 }
 
 /**
@@ -224,18 +251,7 @@ function renderOnboarding(state: GlideState): string {
  */
 function renderBusinessProfile(state: GlideState): string {
   const p: BusinessProfile | undefined = state.businessProfile;
-  const empty =
-    !p ||
-    (!p.industry &&
-      !p.appTypes.length &&
-      p.audience === undefined &&
-      p.trafficProfile === undefined &&
-      p.hasLogin === undefined &&
-      p.hasApi === undefined &&
-      !p.sensitiveData.length &&
-      !p.compliance.length &&
-      !p.concerns.length);
-  if (empty) {
+  if (!hasBusinessProfileSignal(p)) {
     return "\n## Business profile\nNot captured yet. Ask the probing 'nature of the business' questions ONE at a time (industry, app type, logins/API, audience & traffic, sensitive data, compliance, top concerns), recording each with `update_business_profile`. Once you know enough, call `recommend_configuration` to propose tailored settings.";
   }
   const lines: string[] = ["\n## Business profile", `- summary: ${summarizeProfile(p)}`];

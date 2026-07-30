@@ -69,6 +69,14 @@ This README is the overview. In-depth docs live in [`docs/`](docs/):
   application JWTs before dynamic routing. Verified `@cloudflare.com` employees
   can create or claim rooms; current members can grant another verified email
   access. Membership is durable, server-only, and checked on every WebSocket frame.
+- **Nameable rooms with an owner-only delete.** Any member can give a room a
+  human-friendly name (e.g. "arubhe.com go-live") that labels it in the header,
+  invites, and admin view without changing its routing id. The room **owner** can
+  permanently delete a room — wiping all of its Durable Object storage — behind a
+  typed `DELETE THIS ROOM` confirmation. A verified employee can browse an **all
+  rooms** list in `/admin` (`GET /api/rooms`), backed by a deployment-wide room
+  registry that is a convenience index only — per-room membership still gates every
+  room.
 - **Layered production abuse controls.** Cloudflare Rate Limiting bounds dynamic
   HTTP requests to 120/minute per hashed client network and WebSocket frames to
   120/minute per verified identity. AI chat is stricter at 20 submissions/minute
@@ -93,8 +101,10 @@ This README is the overview. In-depth docs live in [`docs/`](docs/):
 - **Guided, chat-led onboarding.** Glide greets a new room and walks a team
   through going live **one question at a time** — _migrate from a provider_ or
   _start fresh_ — recording each answer and **auto-completing a checklist**
-  grounded in Cloudflare's recommended go-live path. A click-through form wizard is
-  available as an opt-in.
+  grounded in Cloudflare's recommended go-live path. Understanding the **nature of
+  the business** is a required, interleaved part of that flow (not an optional
+  extra), so onboarding never finishes with an empty business profile. A
+  click-through form wizard is available as an opt-in.
 - **Business-aware recommendations.** Glide asks probing questions about the
   _nature of the business_ — industry, app type, logins/API, audience & traffic,
   sensitive data, compliance, and top concerns — one at a time, and stores them as
@@ -436,6 +446,8 @@ follow the room-by-room migration and secret-removal steps in
    up to 100 members. The recipient must authenticate to Access as that exact email;
    possessing the URL alone grants nothing. Only the owner can remove a non-owner;
    removal immediately closes all of that member's room sockets.
+   Any member can also **name** the room from the header (a display-only label,
+   capped at 60 characters, that never changes the routing id).
 4. **Chat.** Wait for the **live** badge, then ask Glide to inspect or change your
    Cloudflare setup. Reads stream back immediately; changes appear in the
    **Pending approvals** panel.
@@ -445,6 +457,11 @@ follow the room-by-room migration and secret-removal steps in
    queued for correction; uncertain network/interruption outcomes are excluded
    from bulk apply and require a live-state check before **Retry anyway**.
    Outcomes also land in **Recent results**, and Glide receives the result in chat.
+6. **Delete (owner only).** The room owner can permanently delete the room from the
+   sidebar **Danger zone**. It requires a typed `DELETE THIS ROOM` confirmation,
+   then wipes every trace of the room — chat history, pending approvals, memory,
+   business profile, invites, and the encrypted Cloudflare token — deregisters it
+   from the room registry, and drops all connected clients. This is irreversible.
 
 If the WebSocket drops during a send, Glide checks the persisted transcript by
 message id. A missing message is removed from the optimistic transcript and
@@ -455,7 +472,8 @@ disabling the composer.
 
 ### Synced room state (`GlideState`)
 
-Everything in the sidebar is live-synced read-only to every client: room `memory`,
+Everything in the sidebar is live-synced read-only to every client: the optional
+`roomName`, room `memory`,
 `pendingActions`, `recentResults`, `invites`, `defaultAccountId` / `defaultZone`,
 token status (`tokenConfigured`, masked `tokenLast4`, `tokenValid`), the
 `onboarding` progress, the captured `businessProfile`, the current
@@ -599,7 +617,9 @@ room member for a
 read-only control room over the same `GlideAgent`. It reads the live synced state,
 the chat transcript, and a build-time docs manifest — there are **no** Apply/Reject
 controls here (do that from the chat room), and opening admin cannot create or
-claim a room. Tabs:
+claim a room. The admin landing screen also shows verified Cloudflare employees an
+**All rooms** list (from `GET /api/rooms`) so they can jump straight into any room's
+dashboard; opening a room there still enforces that room's membership. Tabs:
 
 | Tab | Shows |
 | --- | --- |
@@ -684,6 +704,15 @@ answers that drive `recommend_configuration`), `list_migration_providers`,
   work before further room state is persisted. Authorization closes remount the browser access gate.
   HTML responses deny framing with CSP `frame-ancestors 'none'` and
   `X-Frame-Options`.
+- **Room deletion is owner-gated and confirmed.** `destroyRoom` verifies the live
+  connection identity, requires the caller's role to be `owner`, and requires the
+  exact `DELETE THIS ROOM` phrase before it deregisters the room and calls
+  `storage.deleteAll()`. Naming a room (`setRoomName`) is any-member and
+  display-only. The deployment-wide **room registry** and `GET /api/rooms` are a
+  convenience index for the employee-only admin list — not an authorization
+  boundary; opening any listed room still requires that room's membership, and the
+  registry lives in a reserved `__registry__` Durable Object that browser routes
+  cannot reach.
 - **Unknown-room probes do not reserve storage.** The API and Agent client use one
   shared, bounded display-to-storage-name mapping. Storage created only by a
   denied probe remains provisional and is destroyed after a final serialized

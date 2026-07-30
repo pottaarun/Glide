@@ -79,6 +79,13 @@ export default {
   routing calls the read-only authorization method and cannot activate a room.
   `intent=inspect` gives the admin and unexpected-close checks that same read-only
   decision, so opening admin cannot create or claim.
+- `/api/rooms` returns the deployment-wide room list for the admin **All rooms**
+  view. It is `GET`-only (`405` with `Allow: GET` otherwise), requires an exact
+  same-origin `Origin`, and — after Access verification — is restricted to verified
+  Cloudflare employees (`403 forbidden` otherwise). It reads the fixed
+  `__registry__` Durable Object (`503 registry_unavailable` if that read fails).
+  The list is a convenience index only; opening any listed room still runs the
+  normal per-room membership check.
 - `AGENT_RATE_LIMITER` is checked before JWT verification on dynamic root, API,
   and Agent traffic; hashed JS/CSS assets do not consume that bucket.
 - Anything else falls through to the `ASSETS` binding, which serves the built
@@ -190,7 +197,9 @@ the same object and shipped custom links retain their original storage.
 Current members who open the same link share the same agent, chat transcript,
 pending queue, and memory. The link alone never establishes membership.
 
-New room ids match `^[A-Za-z0-9_-]{1,128}$`; `__system__` is reserved. The default
+New room ids match `^[A-Za-z0-9_-]{1,128}$`; `__system__` (Cloudflare-docs reindex
+coordinator) and `__registry__` (deployment-wide room registry) are reserved
+system instances that browser HTTP/WebSocket routes reject. The default
 is a 32-character hyphenless UUIDv4
 (`crypto.randomUUID().replace(/-/g, "")`, `src/client/main.tsx`). Shipped
 non-control ids up to 200 characters remain lookup-only so existing custom links
@@ -198,6 +207,38 @@ can be claimed, but cannot create empty rooms. Their serialized storage name mus
 also fit the Durable Object's 1,024-byte name limit. Random ids reduce accidental
 discovery; Access identity and the server-only membership table are the actual
 authorization boundary — see [Security model](./security.md).
+
+## Room naming, deletion, and the room registry
+
+Three room-lifecycle features share one deployment-wide index:
+
+- **Naming** — `setRoomName(name, by)` (`@callable`, `src/server.ts`) lets **any
+  current member** set `state.roomName`. The value is run through
+  `normalizeRoomName()` (`src/shared.ts`: strips control chars, collapses
+  whitespace, trims, caps at `MAX_ROOM_NAME_CHARS` = 60); an empty value clears it.
+  It is display-only — the header input, `/admin` header tag, and invite emails use
+  it, but it never affects `roomStorageName()` routing or the ACL.
+- **Deletion** — `destroyRoom(confirmation, by)` (`@callable`, `src/server.ts`) is
+  **owner-only and confirmed**: it resolves the live connection identity, requires
+  that identity's `glide_room_members` role to be `owner`, and requires the exact
+  `ROOM_DELETE_CONFIRMATION` (`"DELETE THIS ROOM"`, `src/shared.ts`). It then
+  deregisters the room (awaited), calls `ctx.storage.deleteAll()`, and defers an
+  `ctx.abort()` so the success reply reaches the caller before every socket drops.
+  The `by` label is never trusted for this destructive path.
+- **The registry** — a fixed `__registry__` `GlideAgent` instance holds a lazily
+  created `glide_room_registry` table (one row per room). Real rooms self-report a
+  `RoomSummary` (id, optional name/owner, member count, created/last-active
+  timestamps) via `syncRoomToRegistry()`, which fires on activation, rename,
+  invite, member removal, and (throttled to ~5 min) on chat activity. Sync is
+  best-effort `waitUntil` work and never blocks or fails a room turn; a
+  `roomDestroyed` guard stops an in-flight sync from resurrecting a just-deleted
+  room. `removeRoomFromRegistry()` is awaited before a delete wipes storage. The
+  registry RPCs (`upsertRoomRegistryEntry`, `removeRoomRegistryEntry`,
+  `listRoomRegistry`) are inert unless `this.name === "__registry__"`, and
+  `listRoomRegistry()` returns the most-recently-active rooms first (capped at
+  1,000). The Worker's `GET /api/rooms` (employee-only) reads this index; it is a
+  convenience list, **not** an authorization boundary — opening any listed room
+  still runs the per-room membership check.
 
 ## `GlideAgent`: an `AIChatAgent` with synced state
 
@@ -237,6 +278,7 @@ flags. No local pre-mutation snapshot storage remains.
 | `glide_docs_pages` | `url` PK, `product`, `title`, `section`, `status`, `chunks` | Per-page work queue and progress for the docs reindex job. |
 | `glide_docs_previous_pages` | `url` PK, `chunks` | Previous docs-index generation used to remove stale vectors safely. |
 | `glide_docs_product_attempts` | `product` PK, `attempts` | Bounded retry counts for product-index enumeration. |
+| `glide_room_registry` | `id` PK, `name`, `owner`, `member_count`, `created_at`, `last_active_at` | Deployment-wide room index for the admin **All rooms** view. Created lazily and populated **only on the fixed `__registry__` instance**; each room self-reports its own summary. A convenience index, never an authorization boundary. |
 
 `sanitizeMessageForPersistence()` also protects every newly persisted text part.
 On startup, older messages are rewritten idempotently if they contain a
@@ -372,6 +414,7 @@ field is broadcast to all clients via `onStateUpdate` (`src/client/main.tsx`).
 
 | Field | Type | Meaning |
 | --- | --- | --- |
+| `roomName` | `string?` | Optional human-friendly room label any member can set (header, invites, admin view). Normalized/length-capped (`normalizeRoomName()`, `MAX_ROOM_NAME_CHARS` = 60, `src/shared.ts`); display-only, never the routing id. |
 | `memory` | `Record<string,string>` | Durable free-form facts (account ids, naming conventions, preferences). |
 | `pendingActions` | `PendingAction[]` | Changes awaiting human approval, currently applying, or retained after a failed attempt for Retry. |
 | `recentResults` | `ActionResult[]` | Last applied/failed/rejected outcomes, newest first (capped at `MAX_RECENT_RESULTS` = 25, `src/server.ts`). |
@@ -589,7 +632,10 @@ client is a single SPA: `Root()` (`src/client/main.tsx`) checks
 `AdminGate` instead of the chat `App`; the room id comes from the URL hash, so
 `/admin#<room>` and `/#<room>` address the same Durable Object.
 `AdminGate` uses `/api/room-access?intent=inspect`, so inspecting an absent or
-unclaimed room is denied rather than creating it or assigning ownership.
+unclaimed room is denied rather than creating it or assigning ownership. The admin
+landing screen (`AdminPickRoom`, `src/client/main.tsx`) also fetches `GET /api/rooms`
+for verified Cloudflare employees and renders a clickable **All rooms** list; every
+pick still routes through the same `intent=inspect` membership check.
 
 It **reads** three sources — it defines no dedicated read RPCs:
 
@@ -630,7 +676,7 @@ The convention: inline `S` wins on the base property; `index.css` layers on the
 
 | File | Responsibility |
 | --- | --- |
-| `src/server.ts` | Worker entry + the `GlideAgent` Durable Object: authenticated routing hooks, room ACL, chat brain, structured chat events, secret-safe persistence, LLM tools, approval/token/diagnostic RPCs, RAG jobs, and migration helpers. |
+| `src/server.ts` | Worker entry + the `GlideAgent` Durable Object: authenticated routing hooks, room ACL, room naming/deletion + the `__registry__` room index (`GET /api/rooms`), chat brain, structured chat events, secret-safe persistence, LLM tools, approval/token/diagnostic RPCs, RAG jobs, and migration helpers. |
 | `src/access-auth.ts` | Cloudflare Access JWT verification, identity canonicalization, trusted internal headers, fail-closed auth responses, and the loopback-only development identity. |
 | `src/client/main.tsx` | The React client: verified session/room gates, delivery-aware chat room, member invitations, connection recovery, chat-led onboarding + opt-in form wizard, sidebar, read-only `/admin` dashboard, and inline styles. |
 | `src/client/index.css` | Global visual layer: font wiring, restrained ambient light and pointer glow, hover/focus/entrance motion, responsive layouts, scrollbars, and the reduced-motion reset. See [Client styling](#client-styling). |

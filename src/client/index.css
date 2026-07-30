@@ -280,6 +280,15 @@ textarea:focus {
   color: #64748b;
   opacity: 1;
 }
+
+/* Clickable room rows in the admin "all rooms" list. */
+.glide-room-row {
+  transition: border-color 0.15s ease, background 0.15s ease, transform 0.15s ease;
+}
+.glide-room-row:hover {
+  border-color: rgba(246, 130, 31, 0.5) !important;
+  background: rgba(246, 130, 31, 0.08) !important;
+}
 ::selection {
   background: rgba(246, 130, 31, 0.34);
   color: #fff;
@@ -471,6 +480,10 @@ textarea:focus {
 
   .glide-room-pill input {
     width: min(28vw, 110px) !important;
+  }
+
+  .glide-room-name {
+    width: min(34vw, 150px) !important;
   }
 
   .glide-warn-bar {

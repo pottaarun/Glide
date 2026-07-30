@@ -74,7 +74,10 @@ import {
   isValidRoomStorageName,
   isValidRoomId,
   LEGACY_CHAT_RECOVERY_CONFIRMATION,
+  MAX_ROOM_STORAGE_NAME_BYTES,
   mergeDocLinks,
+  normalizeRoomName,
+  ROOM_DELETE_CONFIRMATION,
   roomStorageName,
   type ActionResult,
   type BusinessProfile,
@@ -94,6 +97,7 @@ import {
   type PendingAction,
   type RoomAccessStatus,
   type RoomMember,
+  type RoomSummary,
   type SetupType,
   type TerraformArtifact,
   type WriteMethod,
@@ -186,6 +190,7 @@ import {
 } from "./action-lifecycle";
 import {
   normalizeActor,
+  MAX_ACTOR_CHARS,
   MAX_ONBOARDING_DOMAIN_CHARS,
   MAX_PROFILE_NOTES_CHARS,
   isSafeSyncedStateTransition,
@@ -399,12 +404,29 @@ function prepareRoomAccessStorage(
  */
 const DOCS_SYSTEM_ROOM = "__system__";
 
-/** Never expose the deployment-wide docs coordinator through browser Agent routes. */
-function rejectDocsSystemRoute(
+/**
+ * Stable, well-known DO name that holds the deployment-wide room registry — a
+ * convenience index of every activated room (id, name, owner, member count,
+ * timestamps) powering the admin "all rooms" view. Like {@link DOCS_SYSTEM_ROOM}
+ * it reuses the GlideAgent namespace but is never a real room: browser Agent
+ * routes reject it and rooms only ever call its registry methods via a stub.
+ */
+const REGISTRY_SYSTEM_ROOM = "__registry__";
+
+/** Reserved GlideAgent instance names that are internal system objects, not rooms. */
+const RESERVED_SYSTEM_ROOMS: ReadonlySet<string> = new Set([DOCS_SYSTEM_ROOM, REGISTRY_SYSTEM_ROOM]);
+
+/** True when a DO instance name is a reserved internal system object (docs/registry). */
+function isReservedSystemRoom(name: string): boolean {
+  return RESERVED_SYSTEM_ROOMS.has(name);
+}
+
+/** Never expose the deployment-wide system coordinators through browser Agent routes. */
+function rejectReservedSystemRoute(
   _request: Request,
   lobby: { className: string; name: string },
 ): Response | undefined {
-  if (lobby.className !== "GlideAgent" || lobby.name !== DOCS_SYSTEM_ROOM) return undefined;
+  if (lobby.className !== "GlideAgent" || !isReservedSystemRoom(lobby.name)) return undefined;
   return new Response("Not found", {
     status: 404,
     headers: { "Cache-Control": "no-store" },
@@ -1681,6 +1703,153 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
       }));
   }
 
+  // ---------------------------------------------------------------------------
+  // Deployment-wide room registry (a convenience index for the admin "all rooms"
+  // view). Rooms self-report their metadata to a fixed {@link REGISTRY_SYSTEM_ROOM}
+  // instance as they are activated and used; the Worker reads it for GET /api/rooms.
+  // It is NOT an authorization boundary — per-room membership still governs access.
+  // ---------------------------------------------------------------------------
+
+  /** True when this instance is an internal system object (docs/registry), not a room. */
+  private isReservedSystemInstance(): boolean {
+    return isReservedSystemRoom(this.name);
+  }
+
+  /** Best-effort in-memory throttle so chat activity doesn't hammer the registry. */
+  private lastRegistrySyncAt = 0;
+  /** Set once this room is being permanently deleted, to cancel any in-flight registry re-sync. */
+  private roomDestroyed = false;
+
+  /** Create the registry table lazily; only ever used on the registry instance. */
+  private ensureRoomRegistrySchema(): void {
+    this.sql`CREATE TABLE IF NOT EXISTS glide_room_registry (
+      id TEXT PRIMARY KEY,
+      name TEXT,
+      owner TEXT,
+      member_count INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL,
+      last_active_at INTEGER NOT NULL
+    )`;
+  }
+
+  /**
+   * Build this room's registry summary from its own membership table + state.
+   * Returns undefined for reserved instances or rooms with no members (nothing
+   * to advertise). `id` is the DO instance name, which is the URL-hash room id.
+   */
+  private roomRegistrySummary(now = Date.now()): RoomSummary | undefined {
+    if (this.isReservedSystemInstance()) return undefined;
+    const agg = this.sql<{ count: number; created: number | null }>`
+      SELECT COUNT(*) AS count, MIN(joined_at) AS created FROM glide_room_members`[0];
+    const memberCount = agg?.count ?? 0;
+    if (memberCount <= 0) return undefined;
+    const owner = this.sql<{ email: string }>`
+      SELECT email FROM glide_room_members WHERE role = 'owner' ORDER BY joined_at ASC LIMIT 1`[0]?.email;
+    return {
+      id: this.name,
+      ...(this.state.roomName ? { name: this.state.roomName } : {}),
+      ...(owner ? { owner } : {}),
+      memberCount,
+      createdAt: agg?.created ?? now,
+      lastActiveAt: now,
+    };
+  }
+
+  /**
+   * Best-effort upsert of this room's summary into the registry. Fire-and-forget
+   * (never blocks or fails the caller). Pass `throttleMs` for high-frequency
+   * callers (chat turns) so we only refresh `lastActiveAt` periodically.
+   */
+  private syncRoomToRegistry(options?: { throttleMs?: number }): void {
+    if (this.isReservedSystemInstance()) return;
+    const now = Date.now();
+    const throttleMs = options?.throttleMs ?? 0;
+    if (throttleMs > 0 && now - this.lastRegistrySyncAt < throttleMs) return;
+    const summary = this.roomRegistrySummary(now);
+    if (!summary) return;
+    this.lastRegistrySyncAt = now;
+    this.ctx.waitUntil(
+      (async () => {
+        try {
+          const registry = await getAgentByName(this.env.GlideAgent, REGISTRY_SYSTEM_ROOM);
+          // A delete may have raced ahead of this deferred sync — don't resurrect it.
+          if (this.roomDestroyed) return;
+          await registry.upsertRoomRegistryEntry(summary);
+        } catch {
+          this.logChatEvent("room.registry_sync_failed", {}, "warn");
+        }
+      })(),
+    );
+  }
+
+  /** Remove this room from the registry and await it (used before a destroy wipes storage). */
+  private async removeRoomFromRegistry(id = this.name): Promise<void> {
+    if (this.isReservedSystemInstance()) return;
+    try {
+      const registry = await getAgentByName(this.env.GlideAgent, REGISTRY_SYSTEM_ROOM);
+      await registry.removeRoomRegistryEntry(id);
+    } catch {
+      this.logChatEvent("room.registry_remove_failed", {}, "warn");
+    }
+  }
+
+  /**
+   * Registry RPC (invoked only on {@link REGISTRY_SYSTEM_ROOM} via a stub):
+   * insert or refresh a room row. Guarded so it is inert on real rooms. Inputs
+   * are treated defensively even though callers are trusted room DOs.
+   */
+  async upsertRoomRegistryEntry(entry: RoomSummary): Promise<void> {
+    if (this.name !== REGISTRY_SYSTEM_ROOM) return;
+    const id = typeof entry?.id === "string" ? entry.id.slice(0, MAX_ROOM_STORAGE_NAME_BYTES) : "";
+    if (!id) return;
+    this.ensureRoomRegistrySchema();
+    const name = typeof entry.name === "string" ? entry.name.slice(0, 200) || null : null;
+    const owner = typeof entry.owner === "string" ? entry.owner.slice(0, MAX_ACTOR_CHARS) || null : null;
+    const memberCount = Number.isFinite(entry.memberCount) ? Math.max(0, Math.trunc(entry.memberCount)) : 0;
+    const now = Date.now();
+    const createdAt = Number.isFinite(entry.createdAt) && entry.createdAt > 0 ? Math.trunc(entry.createdAt) : now;
+    const lastActiveAt = Number.isFinite(entry.lastActiveAt) && entry.lastActiveAt > 0
+      ? Math.trunc(entry.lastActiveAt)
+      : now;
+    this.sql`INSERT INTO glide_room_registry (id, name, owner, member_count, created_at, last_active_at)
+      VALUES (${id}, ${name}, ${owner}, ${memberCount}, ${createdAt}, ${lastActiveAt})
+      ON CONFLICT(id) DO UPDATE SET
+        name = ${name},
+        owner = ${owner},
+        member_count = ${memberCount},
+        last_active_at = ${lastActiveAt}`;
+  }
+
+  /** Registry RPC: drop a room row (called when a room is deleted). */
+  async removeRoomRegistryEntry(id: string): Promise<void> {
+    if (this.name !== REGISTRY_SYSTEM_ROOM) return;
+    if (typeof id !== "string" || !id) return;
+    this.ensureRoomRegistrySchema();
+    this.sql`DELETE FROM glide_room_registry WHERE id = ${id}`;
+  }
+
+  /** Registry RPC: list all known rooms, most-recently-active first (bounded). */
+  async listRoomRegistry(): Promise<RoomSummary[]> {
+    if (this.name !== REGISTRY_SYSTEM_ROOM) return [];
+    this.ensureRoomRegistrySchema();
+    return this.sql<{
+      id: string;
+      name: string | null;
+      owner: string | null;
+      member_count: number;
+      created_at: number;
+      last_active_at: number;
+    }>`SELECT id, name, owner, member_count, created_at, last_active_at
+      FROM glide_room_registry ORDER BY last_active_at DESC LIMIT 1000`.map((row) => ({
+        id: row.id,
+        ...(row.name ? { name: row.name } : {}),
+        ...(row.owner ? { owner: row.owner } : {}),
+        memberCount: row.member_count,
+        createdAt: row.created_at,
+        lastActiveAt: row.last_active_at,
+      }));
+  }
+
   private roomInvitationAudit(): Invite[] {
     return this.sql<{
       email: string;
@@ -1999,6 +2168,9 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
       });
     }
     if (!activation.inserted) return this.evaluateRoomAuthorization(identity);
+
+    // Advertise the newly created/claimed room to the deployment-wide registry.
+    this.syncRoomToRegistry();
 
     const entry = hadExistingData ? "claimed" : "created";
     return {
@@ -3472,6 +3644,69 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     return { ok: true };
   }
 
+  /**
+   * UI: set (or clear) the room's human-friendly display name — the editable
+   * label in the header. Any room member may rename the room; the name is
+   * normalized and length-capped and is display-only, so it never affects room
+   * routing, storage identity, or membership. Passing an empty value clears it.
+   */
+  @callable()
+  async setRoomName(name: unknown, by = "someone"): Promise<{ ok: true; roomName?: string }> {
+    // Attribution/membership is enforced for the calling connection like the
+    // other room-mutating RPCs; `by` is accepted for signature parity.
+    void this.verifiedActor(by);
+    const roomName = normalizeRoomName(name);
+    if (roomName === this.state.roomName) return { ok: true, roomName };
+    if (roomName === undefined) {
+      const { roomName: _drop, ...rest } = this.state;
+      this.setState(rest as GlideState);
+    } else {
+      this.setState({ ...this.state, roomName });
+    }
+    this.syncRoomToRegistry();
+    return { ok: true, roomName };
+  }
+
+  /**
+   * UI: permanently delete this room — owner only. Wipes ALL of the room's
+   * Durable Object storage (chat history + ledger, pending approvals, recent
+   * results, memory, business profile, onboarding/migration artifacts, members,
+   * invites, and the encrypted Cloudflare token), removes it from the registry,
+   * and aborts the instance so every connected client drops. Irreversible.
+   *
+   * Requires the exact {@link ROOM_DELETE_CONFIRMATION} phrase and a current
+   * verified OWNER session (not the untrusted `by` label) so a member or a stale
+   * socket can't trigger it. Mirrors the destructive-op checks used elsewhere.
+   */
+  @callable()
+  async destroyRoom(
+    confirmation: unknown,
+    _by = "someone",
+  ): Promise<{ ok: boolean; message: string }> {
+    const { connection } = getCurrentAgent<GlideAgent>();
+    const identity = this.connectionIdentity(connection);
+    if (!identity || this.isAccessIdentityExpired(identity) || !this.isRoomMember(identity.email)) {
+      return { ok: false, message: "A current room owner session is required to delete this room." };
+    }
+    const actor = this.sql<{ role: RoomMember["role"] }>`SELECT role FROM glide_room_members
+      WHERE email = ${identity.email} LIMIT 1`[0];
+    if (actor?.role !== "owner") {
+      return { ok: false, message: "Only the room owner can delete this room." };
+    }
+    if (confirmation !== ROOM_DELETE_CONFIRMATION) {
+      return { ok: false, message: `Type ${ROOM_DELETE_CONFIRMATION} to confirm deleting this room.` };
+    }
+
+    // Mark destroyed so any in-flight registry sync bails instead of resurrecting
+    // this room, then deregister (awaited) so it never lingers in the list.
+    this.roomDestroyed = true;
+    await this.removeRoomFromRegistry();
+    await this.ctx.storage.deleteAll();
+    // Defer the abort so this RPC result reaches the caller before the socket drops.
+    setTimeout(() => this.ctx.abort("room deleted by owner"), 0);
+    return { ok: true, message: "Room deleted." };
+  }
+
   /** UI: clear the running "Cloudflare docs from this chat" reading list. */
   @callable()
   async clearDocLinks(_by = "someone"): Promise<{ ok: true }> {
@@ -4099,6 +4334,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
       return { ok: false, message: "Glide could not grant that room membership. Try again." };
     }
     this.publishInvitationAudit(nextInvites);
+    this.syncRoomToRegistry();
     return {
       ok: true,
       message: `Invited ${e}.`,
@@ -4159,6 +4395,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
         /* The removed member's connection already closed. */
       }
     }
+    this.syncRoomToRegistry();
     return {
       ok: true,
       message: `Removed ${targetEmail} from this room.`,
@@ -4797,6 +5034,9 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     if (accessLease && !this.isRoomAccessLeaseCurrent(accessLease)) {
       throw new Error("Room access ended before the chat turn started.");
     }
+    // Refresh this room's "last active" in the registry, throttled so a busy room
+    // doesn't write on every turn. Best-effort; never blocks the chat turn.
+    this.syncRoomToRegistry({ throttleMs: 5 * 60_000 });
     const turn: ChatTurnContext = {
       actor: accessLease?.email ?? this.resolveServerActor(options?.body),
       queuedActions: [],
@@ -7940,11 +8180,11 @@ export default {
       }
       const room = requestUrl.searchParams.get("room")?.trim();
       const storageRoom = roomStorageName(room);
-      if (!storageRoom || storageRoom === DOCS_SYSTEM_ROOM) {
+      if (!storageRoom || isReservedSystemRoom(storageRoom)) {
         return Response.json(
           { code: "invalid_room", message: "Provide a valid room id." },
           {
-            status: storageRoom === DOCS_SYSTEM_ROOM ? 404 : 400,
+            status: storageRoom && isReservedSystemRoom(storageRoom) ? 404 : 400,
             headers: { "Cache-Control": "no-store" },
           },
         );
@@ -7974,6 +8214,41 @@ export default {
       );
     }
 
+    // Deployment-wide room list for the admin "all rooms" view. Verified
+    // Cloudflare employees only (the same class that can create/claim rooms).
+    // Same-origin like /api/room-access. Reads the fixed registry DO; membership
+    // to any individual room is still enforced when that room is opened.
+    if (requestUrl.pathname === "/api/rooms") {
+      if (request.method !== "GET") {
+        return new Response("Method not allowed", { status: 405, headers: { Allow: "GET" } });
+      }
+      if (!isSameOriginRequest(request)) {
+        return Response.json(
+          { code: "invalid_origin", message: "Room list requests require a same-origin request." },
+          { status: 403, headers: { "Cache-Control": "no-store" } },
+        );
+      }
+      const authenticated = await authenticatedDynamicRequest(request, env);
+      if (authenticated instanceof Response) return authenticated;
+      if (!isCloudflareEmployeeEmail(authenticated.identity.email)) {
+        return Response.json(
+          { code: "forbidden", message: "Only Cloudflare employees can list rooms." },
+          { status: 403, headers: { "Cache-Control": "no-store" } },
+        );
+      }
+      try {
+        const registry = await getAgentByName(env.GlideAgent, REGISTRY_SYSTEM_ROOM);
+        const rooms = await registry.listRoomRegistry();
+        return Response.json({ rooms }, { headers: { "Cache-Control": "no-store" } });
+      } catch (err) {
+        console.error({ glideEvent: "room.registry_list_failed", error: (err as Error)?.message ?? String(err) });
+        return Response.json(
+          { code: "registry_unavailable", message: "The room registry is temporarily unavailable." },
+          { status: 503, headers: { "Cache-Control": "no-store", "Retry-After": "10" } },
+        );
+      }
+    }
+
     let rootAuthentication: { request: Request; identity: AccessIdentity } | undefined;
     if (request.method === "GET" && requestUrl.pathname === "/") {
       const authenticated = await authenticatedDynamicRequest(request, env);
@@ -7995,7 +8270,7 @@ export default {
       candidate: Request,
       lobby: { className: string; name: string },
     ): Promise<Request | Response | undefined> => {
-      const reserved = rejectDocsSystemRoute(candidate, lobby);
+      const reserved = rejectReservedSystemRoute(candidate, lobby);
       if (reserved) return reserved;
       if (lobby.className !== "GlideAgent" || !validRoomStorageName(lobby.name)) {
         return new Response("Not found", { status: 404, headers: { "Cache-Control": "no-store" } });

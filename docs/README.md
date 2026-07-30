@@ -11,11 +11,11 @@ These pages document how Glide actually works, drawn directly from the source in
 
 | Doc | What's inside |
 | --- | --- |
-| [Architecture](./architecture.md) | The Worker + `GlideAgent` Durable Object, room-name mapping, Access authorization and provisional-room lifecycle, layered rate limiting, request/chat-turn and delivery lifecycles, the source-file map, synced state, SQLite tables, structured events, both RAG paths, the weekly cron, and `/admin`. |
+| [Architecture](./architecture.md) | The Worker + `GlideAgent` Durable Object, room-name mapping, Access authorization and provisional-room lifecycle, room naming/deletion + the room registry (`GET /api/rooms`), layered rate limiting, request/chat-turn and delivery lifecycles, the source-file map, synced state, SQLite tables, structured events, both RAG paths, the weekly cron, and `/admin`. |
 | [Setup & configuration](./setup.md) | Prerequisites, local development, Access application and membership setup, every env var / secret and binding, rate-limit namespace/tuning details, Cloudflare-docs RAG, API-token permissions, and production deployment. |
-| [Tools & RPC reference](./tools.md) | Every LLM tool (reads run, writes queue), rate-limited active client RPCs, and fail-closed compatibility stubs: approvals, token setup, delivery reports, onboarding, recommendations, migration, and guidance. |
+| [Tools & RPC reference](./tools.md) | Every LLM tool (reads run, writes queue), rate-limited active client RPCs, and fail-closed compatibility stubs: approvals, token setup, invites, room naming/deletion, delivery reports, onboarding, recommendations, migration, and guidance. |
 | [Onboarding & migration](./onboarding-and-migration.md) | The guided wizard, rate-limit-safe retries, onboarding checklists, business discovery, tailored recommendations, and the read-only provider-migration pipeline. |
-| [Security model](./security.md) | Signed Access identity, durable room ACLs and denied-probe cleanup, at-rest token encryption, redaction, authenticated-traffic abuse controls, writes-always-through-a-human, disabled recovery paths, and the threat model. |
+| [Security model](./security.md) | Signed Access identity, durable room ACLs and denied-probe cleanup, owner-gated room deletion and the employee-only room registry, at-rest token encryption, redaction, authenticated-traffic abuse controls, writes-always-through-a-human, disabled recovery paths, and the threat model. |
 | [Troubleshooting & observability](./troubleshooting.md) | LIVE/RECONNECTING recovery, `429`/`503` handling, authoritative delivery checks, structured events, production log queries, and incident workflow. |
 
 ## The one thing to remember

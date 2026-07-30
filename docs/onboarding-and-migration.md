@@ -36,10 +36,20 @@ creating a duplicate accepted message.
 
 Onboarding is **conversational**: Glide greets a new room and asks **one focused
 question at a time** — migrate vs. fresh, domain, provider, goals, DNS setup,
-and whether a token is connected — explaining the *why* and recording each answer
-into the synced
-`OnboardingState` with the `update_onboarding` tool. It is told never to re-ask
-anything already captured (`src/system-prompt.ts`).
+whether a token is connected, and the **nature of the business** — explaining the
+*why* and recording each answer into the synced
+`OnboardingState` (via `update_onboarding`) or the room's `businessProfile` (via
+`update_business_profile`). It is told never to re-ask anything already captured
+(`src/system-prompt.ts`).
+
+Business discovery is a **required, interleaved** part of onboarding, not an
+optional add-on: the system prompt lists "nature of the business" in the
+onboarding question order and instructs Glide to alternate go-live steps with
+business-nature questions and to never finish onboarding while the business
+profile is still empty. When it is empty, `renderOnboarding()`
+(`src/system-prompt.ts`) injects a `BUSINESS PROFILE STILL EMPTY` nudge so the
+model asks a discovery question on the current (or very next) turn. See
+[Business discovery & tailored recommendations](#business-discovery--tailored-recommendations) below.
 
 Glide never needs a token value in chat. When a credential is missing, it directs
 the user to **Connection → Set token**; recognizable `cfat_...`, `cfut_...`, and
@@ -198,6 +208,12 @@ only context for the recommendation engine. The loop is driven by the
 "discovery → tailored config" block of the system prompt (`src/system-prompt.ts`)
 and a rendered profile snapshot (`renderBusinessProfile()`, also in `src/system-prompt.ts`)
 that tells the model which dimensions are still blank, so it never re-asks.
+During an active onboarding these questions are **interleaved** with the go-live
+steps (one business-nature question alternating with a go-live step), and the
+`BUSINESS PROFILE STILL EMPTY` nudge from `renderOnboarding()` keeps onboarding
+from completing with no captured profile. The `hasBusinessProfileSignal()` guard
+(`src/system-prompt.ts`) is the shared "is the profile still empty?" check behind
+both the nudge and the profile snapshot.
 
 This runs during onboarding **and on-demand at any time** — if someone asks "what
 should we turn on?", "how do we harden this?", or "make it faster", Glide runs the

@@ -8,8 +8,12 @@ import type { PendingActionStatus } from "./action-lifecycle";
 export type WriteMethod = "POST" | "PUT" | "PATCH" | "DELETE";
 
 export const LEGACY_CHAT_RECOVERY_CONFIRMATION = "DISCARD LEGACY CHAT ARCHIVE";
+/** Exact phrase the owner must send to confirm permanently deleting a room. */
+export const ROOM_DELETE_CONFIRMATION = "DELETE THIS ROOM";
 export const MAX_ROOM_ID_CHARS = 128;
 export const MAX_LEGACY_ROOM_ID_CHARS = 200;
+/** Max length of the room's human-friendly display name (see {@link GlideState.roomName}). */
+export const MAX_ROOM_NAME_CHARS = 60;
 /** Durable Object names are limited to 1,024 bytes; URL path serialization is ASCII. */
 export const MAX_ROOM_STORAGE_NAME_BYTES = 1_024;
 
@@ -57,6 +61,22 @@ export function isValidRoomStorageName(value: unknown): value is string {
   return typeof value === "string" &&
     value.length <= MAX_ROOM_STORAGE_NAME_BYTES &&
     routeStorageName(value) === value;
+}
+
+/**
+ * Clean a user-supplied room display name (see {@link GlideState.roomName}).
+ * Strips control characters, collapses whitespace, trims, and caps the length.
+ * Returns `undefined` when the result is empty, which clears the name. This is a
+ * free-form label only — it never affects room routing or storage identity.
+ */
+export function normalizeRoomName(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const name = value
+    .replace(/[\u0000-\u001f\u007f]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, MAX_ROOM_NAME_CHARS);
+  return name || undefined;
 }
 
 export interface LegacyChatMigrationStatus {
@@ -134,6 +154,27 @@ export interface RoomAccessStatus {
   entry: "member" | "created" | "claimed";
 }
 
+/**
+ * A row in the deployment-wide room registry, returned by `GET /api/rooms` for
+ * the admin "all rooms" view. Rooms self-report this metadata to a fixed
+ * registry Durable Object as they are activated and used; it is a convenience
+ * index, not an authorization boundary. Membership is still enforced per room.
+ */
+export interface RoomSummary {
+  /** Room id used in the URL hash (the Durable Object instance name). */
+  id: string;
+  /** Human-friendly room name, when one has been set (see {@link GlideState.roomName}). */
+  name?: string;
+  /** Canonical email of the room owner, when known. */
+  owner?: string;
+  /** Number of members with access. */
+  memberCount: number;
+  /** ms epoch the room was first activated. */
+  createdAt: number;
+  /** ms epoch of the most recent recorded activity. */
+  lastActiveAt: number;
+}
+
 /** The outcome of applying or rejecting a pending action. */
 export interface ActionResult {
   id: string;
@@ -151,6 +192,13 @@ export interface ActionResult {
  * This is also the room's persistent memory — it survives restarts.
  */
 export interface GlideState {
+  /**
+   * Optional human-friendly name any room member can set for this room (e.g.
+   * "arubhe.com go-live"). Display-only: it labels the room in the header, admin
+   * view, and invites, but never changes the room's routing id or storage
+   * identity. Normalized and length-capped via {@link normalizeRoomName}.
+   */
+  roomName?: string;
   /** Durable free-form facts the room has learned (account id, conventions, etc.). */
   memory: Record<string, string>;
   /** Changes awaiting human approval. */

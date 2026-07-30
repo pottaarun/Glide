@@ -7,7 +7,8 @@ Glide exposes two distinct surfaces:
    **QUEUE** tools only append a `PendingAction` for human approval.
 2. **`@callable` RPCs** — active methods the React client invokes over the
    WebSocket (token management, approvals, the onboarding wizard,
-   business-profile capture and recommendation queueing, migration checks/exports,
+   business-profile capture and recommendation queueing, invites, room
+   naming/deletion, migration checks/exports,
    delivery diagnostics, and room-scoped guidance controls), plus fail-closed
    compatibility stubs documented separately.
 
@@ -172,6 +173,22 @@ never resends an `accepted_pruned` turn. See
 | `roomAccessStatus` | none | `RoomAccessStatus` | Rechecks the current connection identity/membership and returns canonical email, role, entry status, and the bounded member list. |
 | `inviteTeammate` | `email`, `by?`, `link?` | `{ ok, message, members? }` | Only a current member can call it. Atomically adds the canonical ACL member and durable invite-audit row with the verified inviter, then updates the repairable UI projection. Refuses a 101st member. The optional link is metadata, not the credential. |
 | `removeRoomMember` | `email` | `{ ok, message, members? }` | Owner-only. Refuses owner removal, atomically deletes the target's ACL/audit rows, and immediately closes every matching socket with `1008 Room membership revoked`. |
+
+### Room settings & lifecycle
+
+| RPC | Args | Returns | Notes |
+| --- | --- | --- | --- |
+| `setRoomName` | `name`, `by?` | `{ ok, roomName? }` | **Any current member** may set the room's display name. The value is normalized and capped by `normalizeRoomName()` (`MAX_ROOM_NAME_CHARS` = 60, `src/shared.ts`); an empty/blank value clears it. Display-only — it labels the header, `/admin`, and invites but never changes routing/storage identity. Syncs the room's summary to the registry. |
+| `destroyRoom` | `confirmation`, `by?` | `{ ok, message }` | **Owner-only, confirmed, irreversible.** Resolves the live connection identity, requires its `glide_room_members` role to be `owner`, and requires `confirmation === "DELETE THIS ROOM"` (`ROOM_DELETE_CONFIRMATION`, `src/shared.ts`). Deregisters the room from the registry (awaited), then `ctx.storage.deleteAll()` and a deferred `ctx.abort()`, dropping every client. The untrusted `by` label is never used for authorization. Wired to the sidebar **Danger zone → Delete this room** behind a `window.confirm` (`src/client/main.tsx`). |
+
+> **Deployment-wide room list (`GET /api/rooms`).** Not a callable RPC — an HTTP
+> endpoint the admin **All rooms** screen calls. `GET`-only, same-origin, and
+> restricted to verified Cloudflare employees (`403 forbidden` otherwise). It reads
+> the fixed `__registry__` Durable Object (`503 registry_unavailable` on read
+> failure). The registry is a convenience index that rooms self-report into as they
+> are used; it is **not** an authorization boundary — opening any listed room still
+> enforces that room's membership. See
+> [Architecture → Room naming, deletion, and the room registry](./architecture.md#room-naming-deletion-and-the-room-registry).
 
 ### Onboarding
 

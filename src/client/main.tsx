@@ -40,6 +40,9 @@ import {
   isCloudflareDocsUrl,
   LEGACY_CHAT_RECOVERY_CONFIRMATION,
   MAX_LEGACY_ROOM_ID_CHARS,
+  MAX_ROOM_NAME_CHARS,
+  normalizeRoomName,
+  ROOM_DELETE_CONFIRMATION,
   roomStorageName,
   type ActionResult,
   type BusinessProfile,
@@ -54,6 +57,7 @@ import {
   type PendingAction,
   type RoomAccessStatus,
   type RoomMember,
+  type RoomSummary,
   type SetupType,
   type TerraformArtifact,
 } from "../shared";
@@ -328,6 +332,28 @@ function parsedAccessSession(value: unknown): AccessSession | undefined {
     typeof session.isEmployee === "boolean"
     ? { email: session.email, isEmployee: session.isEmployee }
     : undefined;
+}
+
+/** Parse the `GET /api/rooms` payload into a bounded, sanitized room list. */
+function parsedRoomSummaries(value: unknown): RoomSummary[] {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+  const rooms = (value as { rooms?: unknown }).rooms;
+  if (!Array.isArray(rooms)) return [];
+  const out: RoomSummary[] = [];
+  for (const raw of rooms.slice(0, 1000)) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+    const room = raw as Record<string, unknown>;
+    if (typeof room.id !== "string" || !room.id) continue;
+    out.push({
+      id: room.id,
+      ...(typeof room.name === "string" && room.name ? { name: room.name } : {}),
+      ...(typeof room.owner === "string" && room.owner ? { owner: room.owner } : {}),
+      memberCount: typeof room.memberCount === "number" && Number.isFinite(room.memberCount) ? room.memberCount : 0,
+      createdAt: typeof room.createdAt === "number" && Number.isFinite(room.createdAt) ? room.createdAt : 0,
+      lastActiveAt: typeof room.lastActiveAt === "number" && Number.isFinite(room.lastActiveAt) ? room.lastActiveAt : 0,
+    });
+  }
+  return out;
 }
 
 function parsedRoomAccessStatus(value: unknown): (RoomAccessStatus & { message?: string }) | undefined {
@@ -1208,6 +1234,8 @@ function RoomSession({
   const [legacyRecoveryConfirmation, setLegacyRecoveryConfirmation] = useState("");
   const [legacyRecoveryBusy, setLegacyRecoveryBusy] = useState(false);
   const [roomDraft, setRoomDraft] = useState(room);
+  const [roomNameDraft, setRoomNameDraft] = useState("");
+  const roomNameFocused = useRef(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const guidedStartInFlight = useRef(false);
   const reverifiedToken = useRef(false);
@@ -1374,6 +1402,12 @@ function RoomSession({
 
   const roomLink = `${location.origin}/#${encodeURIComponent(room)}`;
   const connectionAccess = useRoomConnectionAccess(room, onAccessLost);
+
+  // Keep the room-name field in sync with the live synced value (e.g. when a
+  // teammate renames the room), but never clobber what someone is mid-typing.
+  useEffect(() => {
+    if (!roomNameFocused.current) setRoomNameDraft(state?.roomName ?? "");
+  }, [state?.roomName]);
 
   const agent = useAgent<GlideState>({
     agent: "GlideAgent",
@@ -2161,6 +2195,19 @@ function RoomSession({
     if (res) setNotice(res.message);
   }, [tokenInput, runRpc]);
 
+  // Commit a room-name edit. Normalizes locally (so the field shows exactly what
+  // the server stores), no-ops when unchanged, and reverts on a failed send.
+  const commitRoomName = useCallback(async () => {
+    roomNameFocused.current = false;
+    const next = normalizeRoomName(roomNameDraft) ?? "";
+    const current = state?.roomName ?? "";
+    setRoomNameDraft(next);
+    if (next === current) return;
+    const res = await runRpc<{ ok: boolean; roomName?: string }>("setRoomName", [next, name]);
+    if (res?.ok) setRoomNameDraft(res.roomName ?? "");
+    else setRoomNameDraft(current);
+  }, [roomNameDraft, state?.roomName, runRpc, name]);
+
   const invite = useCallback(async () => {
     const email = inviteEmail.trim();
     if (!email) return;
@@ -2176,9 +2223,10 @@ function RoomSession({
     if (res?.members) setMembers(res.members);
     setInviteEmail("");
     // Open the user's mail client with a prefilled invite (works for anyone).
-    const subject = encodeURIComponent(`Join me in the Glide room #${room}`);
+    const roomLabel = state?.roomName ? `"${state.roomName}" (#${room})` : `#${room}`;
+    const subject = encodeURIComponent(`Join me in the Glide room ${roomLabel}`);
     const lines = [
-      `${name} invited you to the Glide room "#${room}".`,
+      `${name} invited you to the Glide room ${roomLabel}.`,
       "",
       `Open it here: ${roomLink}`,
       "",
@@ -2188,7 +2236,7 @@ function RoomSession({
     window.location.href = `mailto:${encodeURIComponent(email)}?subject=${subject}&body=${encodeURIComponent(
       lines.join("\n"),
     )}`;
-  }, [inviteEmail, name, room, roomLink, runRpc]);
+  }, [inviteEmail, name, room, roomLink, runRpc, state?.roomName]);
 
   const removeMember = useCallback(async (email: string) => {
     if (!window.confirm(`Remove ${email} from this room? Their active connections will close immediately.`)) return;
@@ -2199,6 +2247,27 @@ function RoomSession({
     if (res?.members) setMembers(res.members);
     if (res) setNotice(res.message);
   }, [runRpc]);
+
+  // Owner-only: permanently delete this room, then navigate back to the lobby.
+  const deleteRoom = useCallback(async () => {
+    const label = state?.roomName ? `"${state.roomName}" (#${room})` : `#${room}`;
+    if (
+      !window.confirm(
+        `Permanently delete room ${label}?\n\nThis erases the chat history, pending approvals, memory, business profile, invites, and the stored Cloudflare token for EVERYONE in the room. This cannot be undone.`,
+      )
+    ) return;
+    const res = await runRpc<{ ok: boolean; message: string }>(
+      "destroyRoom",
+      [ROOM_DELETE_CONFIRMATION, name],
+      { timeout: APPLY_RPC_TIMEOUT_MS },
+    );
+    if (res?.ok) {
+      // The room is gone; drop the hash so the lobby (create screen) renders.
+      location.hash = "";
+    } else if (res) {
+      setNotice(res.message);
+    }
+  }, [room, name, runRpc, state?.roomName]);
 
   useEffect(() => {
     if (!connected || agent.readyState !== WebSocket.OPEN) return;
@@ -2432,6 +2501,27 @@ function RoomSession({
         <div style={S.headerLeft} className="glide-header-left">
           <img src="/cloudflare-mark.png" alt="Cloudflare" style={S.cfMark} />
           <span style={S.brandSm} className="glide-brand">Glide</span>
+          <input
+            value={roomNameDraft}
+            maxLength={MAX_ROOM_NAME_CHARS}
+            placeholder="Name this room"
+            onFocus={() => { roomNameFocused.current = true; }}
+            onChange={(e) => setRoomNameDraft(e.target.value)}
+            onBlur={() => { void commitRoomName(); }}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                event.currentTarget.blur();
+              } else if (event.key === "Escape") {
+                setRoomNameDraft(state?.roomName ?? "");
+                roomNameFocused.current = false;
+                event.currentTarget.blur();
+              }
+            }}
+            style={S.roomNameInput}
+            className="glide-room-name"
+            aria-label="Room name"
+            title="Give this room a name everyone in it will see"
+          />
           <span style={S.roomPill} className="glide-room-pill">
             #
             <input
@@ -2453,8 +2543,8 @@ function RoomSession({
                 }
               }}
               style={S.roomInput}
-              aria-label="Room name"
-              title={access.isEmployee ? "Open or create another room" : "External members open rooms from invitation links"}
+              aria-label="Room ID"
+              title={access.isEmployee ? "Open or create another room by ID" : "External members open rooms from invitation links"}
             />
           </span>
           <span
@@ -3247,6 +3337,23 @@ function RoomSession({
                    </div>
                 </div>
               ))}
+            </Section>
+          )}
+
+          {access.role === "owner" && (
+            <Section title="Danger zone">
+              <p style={S.hint}>
+                Permanently delete this room for everyone — chat history, pending approvals, memory,
+                business profile, invites, and the stored Cloudflare token. This cannot be undone.
+              </p>
+              <button
+                style={{ ...S.dangerBtn, marginTop: 8 }}
+                disabled={!connected}
+                onClick={() => void deleteRoom()}
+                title={connected ? "Permanently delete this room" : "Reconnect before deleting the room"}
+              >
+                Delete this room
+              </button>
             </Section>
           )}
         </aside>
@@ -4828,11 +4935,36 @@ function GuidanceTab({
 }
 
 /** Prompt for a room id when `/admin` is opened without one in the hash. */
-function AdminPickRoom({ onPick }: { onPick: (room: string) => void }) {
+function AdminPickRoom({ isEmployee, onPick }: { isEmployee: boolean; onPick: (room: string) => void }) {
   const [value, setValue] = useState("");
+  const [rooms, setRooms] = useState<RoomSummary[]>();
+  const [roomsError, setRoomsError] = useState<string>();
+  const [loadingRooms, setLoadingRooms] = useState(false);
+  const [attempt, setAttempt] = useState(0);
+
+  useEffect(() => {
+    if (!isEmployee) return;
+    const controller = new AbortController();
+    setLoadingRooms(true);
+    setRoomsError(undefined);
+    void fetchAccessJson("/api/rooms", controller.signal, "GET")
+      .then((v) => {
+        if (!controller.signal.aborted) setRooms(parsedRoomSummaries(v));
+      })
+      .catch((reason: unknown) => {
+        if (!controller.signal.aborted) {
+          setRoomsError(reason instanceof Error ? reason.message : "Glide could not load the room list.");
+        }
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setLoadingRooms(false);
+      });
+    return () => controller.abort();
+  }, [isEmployee, attempt]);
+
   return (
     <div style={S.joinWrap} className="glide-join">
-      <div style={{ ...S.joinCard, width: 460 }} className="glide-glass glide-join-card">
+      <div style={{ ...S.joinCard, width: 520, maxHeight: "88dvh", overflowY: "auto" }} className="glide-glass glide-join-card">
         <img src="/cloudflare-logo-white.png" alt="Cloudflare" style={S.cfLogoJoin} />
         <h1 style={{ ...S.brand, fontSize: 30 }} className="glide-brand">Glide · Admin</h1>
         <p style={S.tagline}>
@@ -4854,13 +4986,59 @@ function AdminPickRoom({ onPick }: { onPick: (room: string) => void }) {
         <button style={S.primaryBtn} disabled={!value.trim()} onClick={() => value.trim() && onPick(value.trim())}>
           Open admin
         </button>
+
+        {isEmployee && (
+          <div style={S.adminRoomsWrap}>
+            <div style={S.adminRoomsHead}>
+              <span style={S.label}>All rooms{rooms ? ` · ${rooms.length}` : ""}</span>
+              <button
+                style={S.miniBtn}
+                disabled={loadingRooms}
+                onClick={() => setAttempt((a) => a + 1)}
+                title="Refresh the room list"
+              >
+                {loadingRooms ? "Loading…" : "Refresh"}
+              </button>
+            </div>
+            {roomsError ? (
+              <p style={{ ...S.hint, color: "#fda4af" }}>{roomsError}</p>
+            ) : loadingRooms && !rooms ? (
+              <p style={S.hint}>Loading rooms…</p>
+            ) : rooms && rooms.length === 0 ? (
+              <p style={S.hint}>
+                No rooms are registered yet. Rooms appear here once they’re created or next active
+                after this update.
+              </p>
+            ) : (
+              <div style={S.adminRoomsList}>
+                {(rooms ?? []).map((r) => (
+                  <button
+                    key={r.id}
+                    style={S.adminRoomRow}
+                    className="glide-room-row"
+                    onClick={() => onPick(r.id)}
+                    title={`Open admin for ${r.name ? `${r.name} (#${r.id})` : `#${r.id}`}`}
+                  >
+                    <span style={S.adminRoomName}>{r.name || `#${r.id}`}</span>
+                    <span style={S.adminRoomMeta}>
+                      {r.name ? `#${r.id} · ` : ""}
+                      {r.memberCount} member{r.memberCount === 1 ? "" : "s"}
+                      {r.owner ? ` · ${r.owner}` : ""}
+                      {r.lastActiveAt ? ` · active ${relTime(r.lastActiveAt)}` : ""}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );
 }
 
 /** Admin entry: resolve the room (from the hash) and mount the dashboard. */
-function AdminGate() {
+function AdminGate({ session }: { session: AccessSession }) {
   const [room, setRoom] = useState(() => readRoomFromHash());
   useEffect(() => {
     const onHash = () => setRoom(readRoomFromHash());
@@ -4871,6 +5049,7 @@ function AdminGate() {
   if (!room) {
     return (
       <AdminPickRoom
+        isEmployee={session.isEmployee}
         onPick={(r) => {
           const normalized = r.trim();
           if (!isSupportedRoomId(normalized)) return;
@@ -4987,6 +5166,7 @@ function AdminRoom({
           <img src="/cloudflare-mark.png" alt="Cloudflare" style={S.cfMark} />
           <span style={S.brandSm} className="glide-brand">Glide</span>
           <span style={S.adminTag}>Admin</span>
+          {state?.roomName && <span style={S.roomNameTag} title="Room name">{state.roomName}</span>}
           <span style={S.roomPill} className="glide-room-pill">#{room}</span>
         </div>
         <div style={S.headerRight} className="glide-header-right">
@@ -5453,7 +5633,7 @@ function Root() {
   ) : !session ? (
     <AccessCard title="Verifying identity" message="Checking your Cloudflare Access session…" />
   ) : admin ? (
-    <AdminGate />
+    <AdminGate session={session} />
   ) : (
     <App session={session} />
   );
@@ -5508,6 +5688,7 @@ const S: Record<string, React.CSSProperties> = {
   safetyDivider: { color: "#475569", margin: "0 1px" },
   roomPill: { display: "inline-flex", alignItems: "center", gap: 2, background: "rgba(9,12,17,.55)", border: "1px solid rgba(148,163,184,.16)", borderRadius: 7, padding: "4px 10px", color: "#94a3b8", fontSize: 14 },
   roomInput: { background: "transparent", border: 0, color: "#f8fafc", fontSize: 14, width: 92, outline: "none", fontWeight: 600 },
+  roomNameInput: { background: "rgba(9,12,17,.55)", border: "1px solid rgba(148,163,184,.16)", borderRadius: 7, padding: "4px 10px", color: "#f8fafc", fontSize: 14, width: 150, outline: "none", fontWeight: 600 },
   badge: { fontSize: 10, fontWeight: 700, padding: "3px 7px", borderRadius: 5, textTransform: "uppercase", letterSpacing: 0.55 },
   you: { fontSize: 13, color: "#cbd5e1", fontWeight: 600 },
   warnBar: { padding: "9px 14px", margin: "8px 12px 0", background: "rgba(246,130,31,.09)", color: "#fed7aa", fontSize: 13, border: "1px solid rgba(246,130,31,.24)", borderRadius: 8, backdropFilter: "blur(14px)", WebkitBackdropFilter: "blur(14px)" },
@@ -5691,6 +5872,13 @@ const S: Record<string, React.CSSProperties> = {
 
   // Admin dashboard (/admin)
   adminTag: { fontSize: 10, fontWeight: 800, textTransform: "uppercase", letterSpacing: 0.7, color: "#fed7aa", background: "rgba(246,130,31,.1)", border: "1px solid rgba(246,130,31,.28)", borderRadius: 5, padding: "3px 8px", fontFamily: DISPLAY },
+  roomNameTag: { fontSize: 14, fontWeight: 600, color: "#f8fafc", maxWidth: 220, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
+  adminRoomsWrap: { marginTop: 22, borderTop: "1px solid rgba(148,163,184,.16)", paddingTop: 16 },
+  adminRoomsHead: { display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 },
+  adminRoomsList: { display: "flex", flexDirection: "column", gap: 6, maxHeight: 320, overflowY: "auto" },
+  adminRoomRow: { display: "flex", flexDirection: "column", gap: 2, alignItems: "flex-start", textAlign: "left", width: "100%", boxSizing: "border-box", padding: "9px 11px", borderRadius: 8, border: "1px solid rgba(148,163,184,.16)", background: "rgba(9,12,17,.5)", color: "#e5e7eb", cursor: "pointer" },
+  adminRoomName: { fontSize: 14, fontWeight: 700, color: "#f8fafc", wordBreak: "break-all" },
+  adminRoomMeta: { fontSize: 11.5, color: "#94a3b8", wordBreak: "break-all" },
   headerLink: { fontSize: 13, fontWeight: 700, color: "#fed7aa", textDecoration: "none", border: "1px solid rgba(246,130,31,.26)", background: "rgba(246,130,31,.075)", borderRadius: 6, padding: "5px 10px" },
 
   adminStats: { display: "flex", flexWrap: "wrap", gap: 9, padding: 10, margin: "10px 12px 0", border: "1px solid rgba(148,163,184,.14)", borderRadius: 12, background: "rgba(17,23,34,.68)", backdropFilter: "blur(18px)", WebkitBackdropFilter: "blur(18px)", boxShadow: "0 10px 30px rgba(0,0,0,.2), inset 0 1px 0 rgba(255,255,255,.03)" },

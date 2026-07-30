@@ -107,7 +107,8 @@ Room authorization is independent of the URL:
   same-origin `Origin`; Agent routing performs read-only admission and cannot
   activate a room. The admin and transient-close checks add `intent=inspect`, which
   performs only read-only membership authorization.
-- New room ids match `^[A-Za-z0-9_-]{1,128}$` and reserve `__system__`; the default
+- New room ids match `^[A-Za-z0-9_-]{1,128}$` and reserve `__system__` (docs-index
+  coordinator) and `__registry__` (room registry); the default
   is a 32-character hyphenless UUIDv4. Existing non-control ids up to 200
   characters are lookup-only and cannot create empty rooms. The browser and API
   share a PartySocket-compatible mapping from that display id to a serialized
@@ -116,6 +117,11 @@ Room authorization is independent of the URL:
 - The first Cloudflare employee to open an existing legacy room becomes its owner.
   Old invitation records remain audit-only and every guest must be re-invited.
 - Every other identity needs an existing `glide_room_members` row for that room.
+- Verified Cloudflare employees can list all rooms via `GET /api/rooms` (the admin
+  **All rooms** view). This is a convenience index only; entering any listed room
+  still requires a `glide_room_members` row. The room owner can permanently delete
+  a room (`destroyRoom`, confirmed with `DELETE THIS ROOM`); any member can set a
+  display-only room name.
 - Any current member can invite another canonical email, up to 100 members. The
   ACL grant and `glide_room_invites` audit write are atomic, but the recipient must
   authenticate as that exact address.

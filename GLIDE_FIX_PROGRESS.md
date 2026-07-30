@@ -519,3 +519,80 @@ in the Workers deployment history rather than this source document.
 - The implementation is not deployed. Production release remains blocked until a
   full-hostname Access application and policy exist and its `TEAM_DOMAIN` and
   `POLICY_AUD` values are available to the Worker.
+
+---
+
+## Follow-up 14: business-nature onboarding, room naming, and owner-gated room deletion + "all rooms" admin
+
+### Goal (three user-requested features)
+
+1. **Actually ask about the business during onboarding.** The advisor code existed,
+   but onboarding could run start-to-finish without ever asking a nature-of-the-
+   business question, so the Business profile stayed empty and recommendations never
+   fired.
+2. **Name a room.** Give each room an optional human-friendly label.
+3. **Delete a room + see all rooms.** Let a room **owner** permanently delete a room,
+   and let a verified Cloudflare employee browse every room from `/admin`.
+
+### Fix
+
+1. **Business-nature onboarding** (`src/system-prompt.ts`) — added a required
+   step 7 ("Nature of the business") to the onboarding question order, an explicit
+   instruction to **interleave** business-nature questions with the go-live steps
+   (never defer them to the end, never finish with an empty profile), and a dynamic
+   `BUSINESS PROFILE STILL EMPTY` nudge in `renderOnboarding()`. Refactored the
+   duplicated empty-profile check into one `hasBusinessProfileSignal()` type guard
+   shared by the nudge and `renderBusinessProfile()`.
+2. **Room naming** (`src/shared.ts`, `src/server.ts`, `src/client/*`) — added
+   `GlideState.roomName`, `MAX_ROOM_NAME_CHARS` (60), and `normalizeRoomName()`; a
+   `setRoomName(name, by)` `@callable` any member can use (syncs to the registry);
+   an editable header input, a read-only `/admin` header tag, and room-name-aware
+   invite emails. Display-only — it never changes routing/storage identity.
+3. **Room deletion + registry + all-rooms** (`src/shared.ts`, `src/server.ts`,
+   `src/client/main.tsx`) —
+   - `RoomSummary` type and `ROOM_DELETE_CONFIRMATION = "DELETE THIS ROOM"`.
+   - A fixed `__registry__` `GlideAgent` instance (reused namespace, **no new
+     binding/migration**) holding a lazily created `glide_room_registry` table.
+     Reserved-name handling generalized (`RESERVED_SYSTEM_ROOMS` = `__system__` +
+     `__registry__`; `isReservedSystemRoom()`); browser routes reject both.
+   - Rooms self-report a `RoomSummary` via `syncRoomToRegistry()` on activation,
+     rename, invite, member removal, and (throttled ~5 min) chat activity;
+     best-effort `waitUntil`, with a `roomDestroyed` guard so an in-flight sync
+     can't resurrect a deleted room. Registry RPCs (`upsert`/`remove`/`list`,
+     capped 1,000) are inert off the registry instance.
+   - `destroyRoom(confirmation, by)` `@callable`: verifies the **live connection
+     identity**, requires `owner` role and the exact confirmation phrase, then
+     awaits deregistration → `storage.deleteAll()` → deferred `ctx.abort()`.
+   - `GET /api/rooms`: GET-only, same-origin, **verified-employee-only**
+     (`403 forbidden` otherwise), reads the registry (`503` on failure).
+   - Client: owner-only sidebar **Danger zone → Delete this room** (typed
+     `window.confirm`); `AdminPickRoom` fetches `/api/rooms` for employees and
+     renders a clickable **All rooms** list.
+
+### Tests
+
+- New `tests/workers/room-registry.test.ts` (12 cases): registry DO RPC
+  upsert/list/remove + non-registry inertness; `GET /api/rooms` 405 / cross-origin
+  403 / non-employee 403 / employee 200; `destroyRoom` over WebSocket for
+  owner-wrong-phrase, non-owner-member, and owner-correct-phrase (then post-delete
+  `intent=inspect` → 403); `setRoomName` set/propagate-to-registry, clear-on-blank,
+  and length cap.
+
+### Docs & deck
+
+- Updated `README.md`, `docs/architecture.md`, `docs/tools.md`, `docs/security.md`,
+  `docs/onboarding-and-migration.md`, `docs/setup.md`, and `docs/README.md` for all
+  three features (new RPCs, the `__registry__` instance and `glide_room_registry`
+  table, `GET /api/rooms`, `GlideState.roomName`, reserved names, and threat-model
+  rows). Refreshed `Glide.pptx`.
+
+### Validation and release state
+
+- `npx tsc --noEmit` (app) and `-p tests/workers/tsconfig.json` (workers) both
+  clean; `npm run test:node` **154 pass**; `npm run test:workers` **99 pass**
+  (87 prior + 12 new); `npm run build` clean.
+- Deployed with `npm run deploy` — **Version ID `5dfc32b9-ec80-4a72-8811-b437629b78c8`**,
+  client bundle `index-BmqnCae4.js`, live at https://glide.arunpotta1024.workers.dev
+  (bindings intact: `GlideAgent` DO, `VECTORIZE`, `AI`, both rate limiters, `ASSETS`,
+  `GLIDE_MODEL=@cf/openai/gpt-oss-120b`). The app sits behind Cloudflare Access, so
+  anonymous verification returns the expected `302` to the Access login.

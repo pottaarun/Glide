@@ -1,0 +1,21 @@
+package-lock.json
+  s_f2b31467e4ffb3::t_a378373a694337 15
+worker-configuration.d.ts
+  s_f2b31467e4ffb3::t_9c368eab422b5b 2,6-7
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "b2f54ec1f715474b16824f853102c582d7a46d50",
+  "prompts": {},
+  "sessions": {
+    "s_f2b31467e4ffb3": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_05c1ec5c1ffen70g28J1z6g89T",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Arun Potta <arunpotta1024@gmail.com>"
+    }
+  }
+}

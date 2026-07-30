@@ -7,6 +7,20 @@
   "durable_objects": {
     "bindings": [{ "name": "GlideAgent", "class_name": "GlideAgent" }]
   },
+  // Account-global namespace ids. Keep these unique if another Worker in this
+  // account adds a rate-limiting binding.
+  "ratelimits": [
+    {
+      "name": "AGENT_RATE_LIMITER",
+      "namespace_id": "2026072901",
+      "simple": { "limit": 120, "period": 60 }
+    },
+    {
+      "name": "CHAT_RATE_LIMITER",
+      "namespace_id": "2026072902",
+      "simple": { "limit": 20, "period": 60 }
+    }
+  ],
   // Service binding to the Switchflare / migration tool Worker. Invokes it
   // directly inside the runtime (bypasses the public edge + Cloudflare Access),
   // so Glide can read existing provider config even though switchflare's public

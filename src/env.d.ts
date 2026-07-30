@@ -2,6 +2,12 @@
 declare global {
   namespace Cloudflare {
     interface Env {
+      /** Cloudflare Access team URL, for example https://team.cloudflareaccess.com. */
+      TEAM_DOMAIN?: string;
+      /** Audience tag of the Access application protecting this Worker. */
+      POLICY_AUD?: string;
+      /** Explicit identity bypass accepted only on loopback Wrangler requests. */
+      GLIDE_DEV_ACCESS_EMAIL?: string;
       /**
        * 32-byte (base64) key used to derive the AES-256-GCM key that encrypts
        * GUI-provided API tokens at rest in the Durable Object. Set with

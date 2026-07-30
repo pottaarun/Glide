@@ -1,8 +1,12 @@
 import { env } from "cloudflare:workers";
 import { evictDurableObject, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { getAgentByName } from "agents";
+import { getAgentByName, type Connection } from "agents";
 
+import {
+  requestWithAccessIdentity,
+  type AccessIdentity,
+} from "../../src/access-auth";
 import type { GlideAgent } from "../../src/server";
 import { LEGACY_CHAT_RECOVERY_CONFIRMATION } from "../../src/shared";
 
@@ -33,6 +37,39 @@ function chatRequestFrame(requestId: string, messageId: string, text: string): s
       }),
     },
   });
+}
+
+async function authorizeMigrationTest(agent: GlideAgent): Promise<AccessIdentity> {
+  const identity: AccessIdentity = {
+    email: "migration-test@cloudflare.com",
+    subject: "migration-test-subject",
+    expiresAt: Math.floor(Date.now() / 1_000) + 300,
+  };
+  const authorization = await agent.activateRoomAccess(identity, true);
+  if (!authorization.allowed) throw new Error("Could not authorize the migration test member");
+  return identity;
+}
+
+function authenticatedRequest(identity: AccessIdentity): Request {
+  return requestWithAccessIdentity(new Request("https://example.com/get-messages"), identity);
+}
+
+function authenticatedConnection(identity: AccessIdentity, frames: string[]): Connection {
+  return {
+    id: crypto.randomUUID(),
+    server: "test",
+    state: {
+      glideAccessEmail: identity.email,
+      glideAccessSubjectDigest: `access-subject:${"a".repeat(64)}`,
+      glideAccessExpiresAt: identity.expiresAt,
+      glideClientRateLimitKey: `client:${"a".repeat(64)}`,
+    },
+    setState() {},
+    send(frame: string | ArrayBuffer) {
+      if (typeof frame === "string") frames.push(frame);
+    },
+    close() {},
+  } as unknown as Connection;
 }
 
 async function seedLegacyHistory(room: string, messages: StoredMessage[]): Promise<GlideStub> {
@@ -224,7 +261,8 @@ describe("legacy chat history migration", () => {
 
     stub = await wake(room, stub);
     const failed = await runInDurableObject(stub, async (agent: GlideAgent, state) => {
-      const blocked = await agent.onRequest(new Request("https://example.com/get-messages"));
+      const identity = await authorizeMigrationTest(agent);
+      const blocked = await agent.onRequest(authenticatedRequest(identity));
       const result = {
         blockedStatus: blocked.status,
         activeCount: state.storage.sql.exec<{ count: number }>(
@@ -250,10 +288,12 @@ describe("legacy chat history migration", () => {
     expect(failed).toEqual({ blockedStatus: 503, activeCount: 0, archivedCount: 2, migrationCount: 0 });
 
     const recovered = await runInDurableObject(stub, async (agent: GlideAgent, state) => {
+      const identity = await authorizeMigrationTest(agent);
       await agent.continueLegacyChatMigration();
-      const history = await agent.onRequest(new Request("https://example.com/get-messages"));
+      const history = await agent.onRequest(authenticatedRequest(identity));
       return {
         historyStatus: history.status,
+        cacheControl: history.headers.get("cache-control"),
         migrationCount: state.storage.sql.exec<{ count: number }>(
           "SELECT COUNT(*) AS count FROM glide_chat_migrations",
         ).one().count,
@@ -262,7 +302,12 @@ describe("legacy chat history migration", () => {
         ).length,
       };
     });
-    expect(recovered).toEqual({ historyStatus: 200, migrationCount: 1, migrationSchedules: 0 });
+    expect(recovered).toEqual({
+      historyStatus: 200,
+      cacheControl: "private, no-store",
+      migrationCount: 1,
+      migrationSchedules: 0,
+    });
   });
 
   it("offers explicit archive-discard recovery when the old token cannot decrypt", async () => {
@@ -282,7 +327,8 @@ describe("legacy chat history migration", () => {
 
     stub = await wake(room, stub);
     const result = await runInDurableObject(stub, async (agent: GlideAgent, state) => {
-      const blocked = await agent.onRequest(new Request("https://example.com/get-messages"));
+      const identity = await authorizeMigrationTest(agent);
+      const blocked = await agent.onRequest(authenticatedRequest(identity));
       const blockedBody = await blocked.json<{
         code: string;
         error: string;
@@ -294,16 +340,16 @@ describe("legacy chat history migration", () => {
       const before = await agent.legacyChatMigrationStatus();
       const rejectedFrames: string[] = [];
       await agent.onMessage(
-        { send: (frame: string) => rejectedFrames.push(frame) } as never,
+        authenticatedConnection(identity, rejectedFrames),
         chatRequestFrame("blocked-request", "blocked-user", "This must not be persisted."),
       );
       const rejected = await agent.discardLegacyChatArchiveForRecovery("wrong confirmation");
       const recovered = await agent.discardLegacyChatArchiveForRecovery(LEGACY_CHAT_RECOVERY_CONFIRMATION);
-      const history = await agent.onRequest(new Request("https://example.com/get-messages"));
+      const history = await agent.onRequest(authenticatedRequest(identity));
       const after = await agent.legacyChatMigrationStatus();
       const replayFrames: string[] = [];
       await agent.onMessage(
-        { send: (frame: string) => replayFrames.push(frame) } as never,
+        authenticatedConnection(identity, replayFrames),
         chatRequestFrame("replay-request", "user-secret", "Replay the discarded legacy id."),
       );
       const cleared = await agent.clearCloudflareToken();

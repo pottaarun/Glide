@@ -425,3 +425,97 @@ The release workflow runs `npm test`, `npm run check`, `npm run build`, and
 `npx wrangler deploy --dry-run` before production deployment, then verifies the
 Worker HTML and referenced hashed assets over HTTPS. Exact deployment IDs belong
 in the Workers deployment history rather than this source document.
+
+---
+
+## Follow-up 13: verified room membership and route-boundary abuse controls
+
+### Risks addressed
+
+- Room URLs previously acted as bearer credentials, so anyone who obtained a link
+  could read the transcript, use the room token, invite others, and Apply changes.
+- Dynamic request limiting depended on a path-prefix check before the Agents SDK
+  parsed the route, leaving alternate path forms at risk of bypassing admission.
+- Protocol and chat limits used the client network for active users, so coworkers
+  behind one corporate egress could throttle each other.
+
+### Fix
+
+1. `src/access-auth.ts` validates the signed Cloudflare Access application JWT
+   (RS256, remote team JWKS, issuer, audience, type, email, subject, and expiry),
+   reuses the issuer's remote-JWKS resolver, distinguishes retryable key-service
+   failures from invalid tokens, overwrites trusted internal identity headers, and
+   fails closed when production Access configuration is absent. A separate
+   development identity works only on loopback request URLs.
+2. Each `GlideAgent` now owns a server-only `glide_room_members` SQLite ACL.
+   Cloudflare employees can atomically create an empty room or claim an unclaimed
+   legacy room. Legacy invite records enter only `glide_room_invites` audit storage
+   and must be re-issued. Existing rooms deny all nonmembers, including other
+   employees; any member can grant one canonical email access up to the 100-member
+   cap, while only the owner can revoke a non-owner.
+3. `routeAgentRequest` `onBeforeConnect` and `onBeforeRequest` hooks perform rate
+   limiting, JWT authentication, room-name/origin validation, and read-only
+   membership checks after the SDK identifies the route. Only same-origin
+   `POST /api/room-access` can create or claim. The Durable Object suppresses
+   initial protocol frames before admission and repeats membership/expiry checks
+   at HTTP/connection admission and before every protocol frame.
+4. Browser attribution now comes from the verified Access email. The client uses
+   `/api/session` and `/api/room-access`, permits room creation only for employees,
+   displays claim/member state, and treats invitation as a durable ACL grant rather
+   than a link credential.
+5. Pre-auth dynamic HTTP remains network-limited. After JWT verification,
+   WebSocket protocol and chat keys derive from the opaque Access subject, avoiding
+   shared-NAT collisions. Chat response retry and guidance mutation/reindex RPCs
+   consume the strict identity and room budget before work or state changes.
+6. Each accepted socket gets a durable JWT-expiry schedule, including across
+   hibernation; revocation/expiry closes with `1008`, schedule failure closes with
+   `1011`, and connection state persists only subject/client digests. HTML denies
+   framing with CSP and `X-Frame-Options`.
+7. `roomStorageName()` is shared by the room-access API and both Agent clients. It
+   preserves PartySocket's historical first-path-segment serialization for legacy
+   display ids while enforcing the Durable Object's 1,024-byte storage-name limit.
+8. Storage created only by a denied room probe is marked provisional and destroyed
+   through an idempotent scheduled cleanup. Schedule-write failures get bounded
+   retries and then a native fallback alarm. A final `blockConcurrencyWhile()`
+   member/data recheck precedes one atomic `deleteAll()` and deferred isolate abort,
+   avoiding a persistent condemned marker that could race later activation.
+   First-owner activation clears the marker atomically; a stable activation id
+   replays `created`/`claimed` when the Worker retries after a cleanup reset.
+9. Connection setup rechecks membership after asynchronous identity-key derivation,
+   authorization closes remount the browser access gate, and verified emails up to
+   the Access limit remain valid chat attribution. Membership grants are available
+   only through the explicit Invite-panel RPC, not through the model's tool set.
+10. Frame admission rejects binary/oversized input before limiter I/O, bounds total
+    in-flight protocol bytes, and rechecks membership after asynchronous protocol,
+    chat, and expensive-operation limiters. Private transcript responses are
+    `private, no-store`, and invitation email composition requires a confirmed ACL
+    grant.
+11. Apply and token-management calls retain a connection-bound authorization lease
+    across external awaits and recheck it before Cloudflare writes or credential
+    mutation. Revocation cancels undispatched work without a model follow-up. Since
+    Glide does not use Agent facets, every `/sub/` route fails closed with `404`.
+12. Admin and unexpected-close checks use read-only room inspection, so `/admin`
+    cannot create or claim a room and transient `1006` disconnects keep normal SDK
+    reconnection unless inspection proves access is denied. Access bootstrap reads
+    have a 15-second deadline, admin membership refreshes live, and structured logs
+    correlate rooms by opaque Durable Object id rather than the room name.
+13. Privileged authorization leases include a server-generated socket-session
+    nonce, preventing a reconnect that reuses an SDK connection id from inheriting
+    in-flight authority. Connection setup rechecks after durable expiry scheduling,
+    and destructive legacy-archive recovery rechecks the lease after token
+    decryption before arming deletion.
+14. Active chat turns and response retries register against that exact lease and
+    abort on close, revocation, expiry, or same-id reconnect. Chat tools recheck
+    after awaited reads, retry cancellation reaches transcript save, and migration
+    preview/check/Terraform/CSV paths discard late results before retained state.
+    Byte-oversized protocol frames now close with `1009` before limiter work.
+
+### Validation and release state
+
+- Access, membership, claim-race, persistence, invitation, nonmember/sub-agent
+  routing, assertion-expiry, revocation/reconnect-during-chat/retry/Apply/token/
+  archive/migration, oversized-protocol, and expensive-operation regressions run
+  in the Workers runtime; pure JWT and rate-limit policy tests run under Node.
+- The implementation is not deployed. Production release remains blocked until a
+  full-hostname Access application and policy exist and its `TEAM_DOMAIN` and
+  `POLICY_AUD` values are available to the Worker.

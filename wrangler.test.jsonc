@@ -7,6 +7,22 @@
   "durable_objects": {
     "bindings": [{ "name": "GlideAgent", "class_name": "GlideAgent" }]
   },
+  "ratelimits": [
+    {
+      "name": "AGENT_RATE_LIMITER",
+      "namespace_id": "2026072901",
+      "simple": { "limit": 120, "period": 60 }
+    },
+    {
+      "name": "CHAT_RATE_LIMITER",
+      "namespace_id": "2026072902",
+      "simple": { "limit": 20, "period": 60 }
+    }
+  ],
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["GlideAgent"] }],
-  "vars": { "GLIDE_TOKEN_KEY": "glide-test-only-encryption-key" }
+  "vars": {
+    "GLIDE_TOKEN_KEY": "glide-test-only-encryption-key",
+    "TEAM_DOMAIN": "https://glide-test.cloudflareaccess.com",
+    "POLICY_AUD": "glide-test-audience"
+  }
 }

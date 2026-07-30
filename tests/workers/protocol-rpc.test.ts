@@ -1,14 +1,23 @@
 import { exports } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 
+import { asAccessUser } from "./access-test-helpers";
+
 describe("Agent WebSocket protocol", () => {
   it("delegates valid callable RPC frames to the Agents SDK", async () => {
     const room = `rpc-${crypto.randomUUID()}`;
-    const response = await exports.default.fetch(
-      new Request(`https://example.com/agents/glide-agent/${room}`, {
-        headers: { Upgrade: "websocket" },
-      }),
-    );
+    const access = await asAccessUser("rpc-test@cloudflare.com", (headers) =>
+      exports.default.fetch(new Request(
+        `https://example.com/api/room-access?room=${encodeURIComponent(room)}`,
+        { headers, method: "POST" },
+      )));
+    expect(access.status).toBe(200);
+    const response = await asAccessUser("rpc-test@cloudflare.com", async (headers) => {
+      headers.set("Upgrade", "websocket");
+      return exports.default.fetch(
+        new Request(`https://example.com/agents/glide-agent/${room}`, { headers }),
+      );
+    });
     expect(response.status).toBe(101);
     const socket = response.webSocket;
     expect(socket).toBeDefined();

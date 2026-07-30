@@ -31,12 +31,16 @@ import type { UIMessage } from "ai";
 // + docs/*.md), injected by the `glide-docs-manifest` Vite plugin. Powers the
 // Admin page's "Dev docs updates" tracker.
 import type { GlideDocsManifest } from "virtual:glide-docs";
+import type { AccessSession } from "../access-auth";
 
 import "./index.css";
 
 import {
+  isSupportedRoomId,
   isCloudflareDocsUrl,
   LEGACY_CHAT_RECOVERY_CONFIRMATION,
+  MAX_LEGACY_ROOM_ID_CHARS,
+  roomStorageName,
   type ActionResult,
   type BusinessProfile,
   type DocLink,
@@ -48,6 +52,8 @@ import {
   type OnboardingPath,
   type OnboardingState,
   type PendingAction,
+  type RoomAccessStatus,
+  type RoomMember,
   type SetupType,
   type TerraformArtifact,
 } from "../shared";
@@ -61,9 +67,7 @@ import {
 import {
   MAX_CHAT_DELIVERY_STATUS_IDS,
   MAX_CHAT_HISTORY_BYTES,
-  MAX_CHAT_PARTICIPANT_NAME_CHARS,
   MAX_CHAT_TEXT_CHARS,
-  chatParticipantNameError,
   containsCloudflareApiToken,
   interruptedRetryTarget,
   isChatTextWithinLimit,
@@ -87,6 +91,8 @@ import {
 const CHAT_CONNECTION_ERROR = "Glide's live connection closed before the message was sent.";
 const AGENT_MESSAGES_TIMEOUT_MS = 10_000;
 const MAX_MIGRATION_STATUS_BYTES = 16_000;
+const MAX_ACCESS_RESPONSE_BYTES = 128_000;
+const ACCESS_REQUEST_TIMEOUT_MS = 15_000;
 const MAX_RECOVERABLE_DRAFTS = MAX_CHAT_DELIVERY_STATUS_IDS;
 
 type ReconciledDeliveryStatus = DeliveryStatus | "accepted_pruned";
@@ -190,7 +196,7 @@ async function readBoundedResponseText(response: Response, maxBytes: number): Pr
   const contentLength = Number(response.headers.get("content-length"));
   if (Number.isFinite(contentLength) && contentLength > maxBytes) {
     await response.body?.cancel().catch(() => undefined);
-    throw new Error(`Room history exceeds the ${maxBytes.toLocaleString()} byte safety limit.`);
+    throw new Error(`Response exceeds the ${maxBytes.toLocaleString()} byte safety limit.`);
   }
   if (!response.body) return "";
   const reader = response.body.getReader();
@@ -204,7 +210,7 @@ async function readBoundedResponseText(response: Response, maxBytes: number): Pr
       bytes += value.byteLength;
       if (bytes > maxBytes) {
         await reader.cancel().catch(() => undefined);
-        throw new Error(`Room history exceeds the ${maxBytes.toLocaleString()} byte safety limit.`);
+        throw new Error(`Response exceeds the ${maxBytes.toLocaleString()} byte safety limit.`);
       }
       chunks.push(decoder.decode(value, { stream: true }));
     }
@@ -250,6 +256,16 @@ async function fetchAgentMessages(
         if (allowPendingMigration) return [];
         throw new Error(migration.message);
       }
+      const rateLimitMessage = payload && typeof payload === "object" && !Array.isArray(payload) &&
+          ((payload as { code?: unknown }).code === "rate_limit_exceeded" ||
+            (payload as { code?: unknown }).code === "rate_limit_unavailable") &&
+          typeof (payload as { message?: unknown }).message === "string" &&
+          (payload as { message: string }).message.length <= 300
+        ? (payload as { message: string }).message
+        : undefined;
+      if ((response.status === 429 || response.status === 503) && rateLimitMessage) {
+        throw new Error(rateLimitMessage);
+      }
       throw new Error(`Loading room history returned HTTP ${response.status}.`);
     }
     const value: unknown = JSON.parse(await readBoundedResponseText(response, MAX_CHAT_HISTORY_BYTES));
@@ -287,25 +303,140 @@ function readRoomFromHash(): string {
   try {
     const raw = decodeURIComponent(location.hash.replace(/^#/, "")).trim();
     const room = raw.replace(/^room=/, "").trim();
-    return room.length <= 200 && !/[\u0000-\u001f\u007f]/.test(room) ? room : "";
+    return isSupportedRoomId(room) ? room : "";
   } catch {
     return "";
   }
 }
 
-/**
- * Mint a high-entropy, unguessable room id. The room URL is effectively the
- * access credential (there is no separate login), so the DEFAULT room must not
- * be guessable — otherwise strangers could land in a shared room that already
- * has a Cloudflare token and Apply changes. Sharing the link is the (intended)
- * way to collaborate.
- */
 function newRoomId(): string {
-  // 128 bits, URL-safe.
   return crypto.randomUUID().replace(/-/g, "");
 }
 
-const NAME_KEY = "glide:name";
+function requiredRoomStorageName(room: string): string {
+  const storageName = roomStorageName(room);
+  if (!storageName) throw new Error("Glide could not map this room id to durable storage.");
+  return storageName;
+}
+
+function parsedAccessSession(value: unknown): AccessSession | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const session = value as { email?: unknown; isEmployee?: unknown };
+  return typeof session.email === "string" &&
+    session.email.length > 0 &&
+    session.email.length <= 254 &&
+    typeof session.isEmployee === "boolean"
+    ? { email: session.email, isEmployee: session.isEmployee }
+    : undefined;
+}
+
+function parsedRoomAccessStatus(value: unknown): (RoomAccessStatus & { message?: string }) | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const access = value as Record<string, unknown>;
+  if (
+    typeof access.email !== "string" ||
+    typeof access.isEmployee !== "boolean" ||
+    !["owner", "member"].includes(String(access.role)) ||
+    !["member", "created", "claimed"].includes(String(access.entry)) ||
+    !Array.isArray(access.members) ||
+    access.members.length > 100
+  ) return undefined;
+  const members: RoomMember[] = [];
+  for (const raw of access.members) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+    const member = raw as Record<string, unknown>;
+    if (
+      typeof member.email !== "string" ||
+      member.email.length === 0 ||
+      member.email.length > 254 ||
+      !["owner", "member"].includes(String(member.role)) ||
+      (member.invitedBy !== undefined && typeof member.invitedBy !== "string") ||
+      typeof member.joinedAt !== "number" ||
+      !Number.isFinite(member.joinedAt)
+    ) return undefined;
+    members.push({
+      email: member.email,
+      role: member.role as RoomMember["role"],
+      ...(typeof member.invitedBy === "string" ? { invitedBy: member.invitedBy } : {}),
+      joinedAt: member.joinedAt,
+    });
+  }
+  return {
+    email: access.email,
+    isEmployee: access.isEmployee,
+    role: access.role as RoomMember["role"],
+    members,
+    entry: access.entry as RoomAccessStatus["entry"],
+    ...(typeof access.message === "string" && access.message.length <= 500 ? { message: access.message } : {}),
+  };
+}
+
+async function fetchAccessJson(
+  url: string,
+  signal?: AbortSignal,
+  method: "GET" | "POST" = "GET",
+): Promise<unknown> {
+  const controller = new AbortController();
+  let timedOut = false;
+  const abort = () => controller.abort(signal?.reason);
+  if (signal?.aborted) abort();
+  else signal?.addEventListener("abort", abort, { once: true });
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, ACCESS_REQUEST_TIMEOUT_MS);
+  try {
+    const response = await fetch(url, {
+      cache: "no-store",
+      credentials: "same-origin",
+      method,
+      signal: controller.signal,
+    });
+    const text = await readBoundedResponseText(response, MAX_ACCESS_RESPONSE_BYTES);
+    let value: unknown;
+    try {
+      value = JSON.parse(text);
+    } catch {
+      value = undefined;
+    }
+    if (!response.ok) {
+      const payload = value && typeof value === "object" && !Array.isArray(value)
+        ? value as { code?: unknown; message?: unknown }
+        : undefined;
+      const message = typeof payload?.message === "string"
+        ? payload.message
+        : `Glide access check returned HTTP ${response.status}.`;
+      const retryAfter = Number(response.headers.get("Retry-After"));
+      throw new AccessRequestError(
+        message,
+        response.status,
+        typeof payload?.code === "string" ? payload.code : undefined,
+        Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter : undefined,
+      );
+    }
+    return value;
+  } catch (reason) {
+    if (timedOut && !signal?.aborted) {
+      throw new AccessRequestError("Glide's access check timed out. Try again.", 0, "access_timeout");
+    }
+    throw reason;
+  } finally {
+    clearTimeout(timeout);
+    signal?.removeEventListener("abort", abort);
+  }
+}
+
+class AccessRequestError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly code?: string,
+    readonly retryAfterSeconds?: number,
+  ) {
+    super(message);
+    this.name = "AccessRequestError";
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Small presentational helpers
@@ -869,82 +1000,188 @@ function ToolChip({ tool: rendered }: { tool: RenderedTool }) {
 }
 
 // ---------------------------------------------------------------------------
-// Join screen
+// Main room
 // ---------------------------------------------------------------------------
 
-function Join({ onJoin }: { onJoin: (name: string) => void }) {
-  const [value, setValue] = useState("");
-  const normalizedName = value.trim();
-  const nameError = value ? chatParticipantNameError(normalizedName) : undefined;
+function AccessCard({
+  title,
+  message,
+  action,
+}: {
+  title: string;
+  message: string;
+  action?: ReactNode;
+}) {
   return (
     <div style={S.joinWrap} className="glide-join">
       <div style={S.joinCard} className="glide-glass glide-join-card">
         <img src="/cloudflare-logo-white.png" alt="Cloudflare" style={S.cfLogoJoin} />
-        <h1 style={S.brand} className="glide-brand">Glide</h1>
-        <p style={S.tagline}>Guided Cloudflare configuration with reviewable changes.</p>
-        <form
-          onSubmit={(e) => {
-            e.preventDefault();
-            if (!nameError && normalizedName) onJoin(normalizedName);
-          }}
-        >
-          <label style={S.label}>Your display name</label>
-          <input
-            autoFocus
-            value={value}
-            maxLength={MAX_CHAT_PARTICIPANT_NAME_CHARS}
-            onChange={(e) => setValue(e.target.value)}
-            placeholder="e.g. Avery"
-            style={S.input}
-            aria-invalid={Boolean(nameError)}
-          />
-          {nameError && <div style={{ ...S.hint, marginTop: 6 }}>{nameError}</div>}
-          <button type="submit" style={S.primaryBtn} disabled={!normalizedName || Boolean(nameError)}>
-            Enter room
-          </button>
-        </form>
+        <h1 style={{ ...S.brand, fontSize: 30 }} className="glide-brand">{title}</h1>
+        <p style={S.tagline}>{message}</p>
+        {action}
       </div>
     </div>
   );
 }
 
-// ---------------------------------------------------------------------------
-// Main room
-// ---------------------------------------------------------------------------
+function useRoomConnectionAccess(room: string, onAccessLost: () => void) {
+  const recheckController = useRef<AbortController | undefined>(undefined);
+  useEffect(() => () => recheckController.current?.abort(), []);
 
-function Room({ name }: { name: string }) {
-  const [room, setRoom] = useState<string>(() => readRoomFromHash() || newRoomId());
+  const onClose = useCallback((event: CloseEvent) => {
+    if (event.code === 1008) {
+      recheckController.current?.abort();
+      onAccessLost();
+      return;
+    }
+    if (event.code !== 1006 || recheckController.current) return;
+
+    const controller = new AbortController();
+    recheckController.current = controller;
+    void fetchAccessJson(
+      `/api/room-access?room=${encodeURIComponent(room)}&intent=inspect`,
+      controller.signal,
+      "POST",
+    )
+      .catch((reason: unknown) => {
+        if (
+          !controller.signal.aborted &&
+          reason instanceof AccessRequestError &&
+          [401, 403, 404].includes(reason.status)
+        ) {
+          onAccessLost();
+        }
+      })
+      .finally(() => {
+        if (recheckController.current === controller) recheckController.current = undefined;
+      });
+  }, [onAccessLost, room]);
+
+  const shouldReconnectOnClose = useCallback((event: CloseEvent) => event.code !== 1008, []);
+  return { onClose, shouldReconnectOnClose };
+}
+
+function RoomAccessGate({
+  room,
+  mode,
+  children,
+}: {
+  room: string;
+  mode: "activate" | "inspect";
+  children: (
+    access: RoomAccessStatus & { message?: string },
+    recheckAccess: () => void,
+  ) => ReactNode;
+}) {
+  const [attempt, setAttempt] = useState(0);
+  const [access, setAccess] = useState<RoomAccessStatus & { message?: string }>();
+  const [error, setError] = useState<string>();
+  const recheckAccess = useCallback(() => setAttempt((value) => value + 1), []);
 
   useEffect(() => {
-    if (!readRoomFromHash()) {
-      history.replaceState(null, "", `${location.pathname}${location.search}#${encodeURIComponent(room)}`);
-    }
+    const controller = new AbortController();
+    setAccess(undefined);
+    setError(undefined);
+    const intent = mode === "inspect" ? "&intent=inspect" : "";
+    void fetchAccessJson(`/api/room-access?room=${encodeURIComponent(room)}${intent}`, controller.signal, "POST")
+      .then((value) => {
+        const parsed = parsedRoomAccessStatus(value);
+        if (!parsed) throw new Error("Glide returned a malformed room-access response.");
+        setAccess(parsed);
+      })
+      .catch((reason: unknown) => {
+        if (!controller.signal.aborted) {
+          setError(reason instanceof Error ? reason.message : "Glide could not check room access.");
+        }
+      });
+    return () => controller.abort();
+  }, [attempt, mode, room]);
+
+  if (error) {
+    return (
+      <AccessCard
+        title="Room access required"
+        message={error}
+        action={<button style={S.primaryBtn} onClick={() => setAttempt((value) => value + 1)}>Try again</button>}
+      />
+    );
+  }
+  if (!access) return <AccessCard title="Checking room access" message="Verifying your membership…" />;
+  return children(access, recheckAccess);
+}
+
+function Room({ session }: { session: AccessSession }) {
+  const [room, setRoom] = useState<string>(() => readRoomFromHash());
+
+  useEffect(() => {
     const onHash = () => {
-      const next = readRoomFromHash();
-      setRoom(next || newRoomId());
+      setRoom(readRoomFromHash());
     };
     window.addEventListener("hashchange", onHash);
     return () => window.removeEventListener("hashchange", onHash);
-  }, [room]);
-
-  const changeRoom = useCallback((next: string) => {
-    const normalized = next.trim();
-    if (!normalized || normalized.length > 200 || /[\u0000-\u001f\u007f]/.test(normalized)) return;
-    location.hash = encodeURIComponent(normalized);
   }, []);
 
-  return <RoomSession key={room} name={name} room={room} onRoomChange={changeRoom} />;
+  const changeRoom = useCallback((next: string) => {
+    if (!session.isEmployee) return;
+    const normalized = next.trim();
+    if (!isSupportedRoomId(normalized)) return;
+    location.hash = encodeURIComponent(normalized);
+  }, [session.isEmployee]);
+
+  if (!room) {
+    return session.isEmployee ? (
+      <AccessCard
+        title="Create a private room"
+        message={`Signed in as ${session.email}. New Glide rooms can be created by Cloudflare employees.`}
+        action={
+          <button
+            style={S.primaryBtn}
+            onClick={() => {
+              location.hash = encodeURIComponent(newRoomId());
+            }}
+          >
+            Create room
+          </button>
+        }
+      />
+    ) : (
+      <AccessCard
+        title="Open an invitation"
+        message={`Signed in as ${session.email}. Open the room link from a member's invitation; external users cannot create rooms.`}
+      />
+    );
+  }
+
+  return (
+    <RoomAccessGate key={room} mode="activate" room={room}>
+      {(access, recheckAccess) => (
+        <RoomSession
+          access={access}
+          key={room}
+          name={access.email}
+          onAccessLost={recheckAccess}
+          room={room}
+          onRoomChange={changeRoom}
+        />
+      )}
+    </RoomAccessGate>
+  );
 }
 
 function RoomSession({
+  access,
   name,
+  onAccessLost,
   room,
   onRoomChange,
 }: {
+  access: RoomAccessStatus & { message?: string };
   name: string;
+  onAccessLost: () => void;
   room: string;
   onRoomChange: (room: string) => void;
 }) {
+  const agentRoom = requiredRoomStorageName(room);
   const draftStorageKey = roomSessionKey("draft", room);
   const pendingStorageKey = roomSessionKey("pending", room);
   const recoverableStorageKey = roomSessionKey("recoverable", room);
@@ -958,6 +1195,7 @@ function RoomSession({
   const [tokenInput, setTokenInput] = useState("");
   const [showTokenForm, setShowTokenForm] = useState(false);
   const [inviteEmail, setInviteEmail] = useState("");
+  const [members, setMembers] = useState<RoomMember[]>(access.members);
   // The guided FORM is opt-in now; onboarding is chat-led by default.
   const [formOpen, setFormOpen] = useState(false);
   const [migBusy, setMigBusy] = useState<string>();
@@ -1135,11 +1373,13 @@ function RoomSession({
   }, [recoverableStorageKey, updateDraft]);
 
   const roomLink = `${location.origin}/#${encodeURIComponent(room)}`;
+  const connectionAccess = useRoomConnectionAccess(room, onAccessLost);
 
   const agent = useAgent<GlideState>({
     agent: "GlideAgent",
-    name: room,
+    name: agentRoom,
     onStateUpdate: (s) => setState(s),
+    ...connectionAccess,
   });
 
   const acceptedChatMessageIds = useCallback(async (ids: readonly string[]): Promise<Set<string>> => {
@@ -1924,15 +2164,16 @@ function RoomSession({
   const invite = useCallback(async () => {
     const email = inviteEmail.trim();
     if (!email) return;
-    const res = await runRpc<{ ok: boolean; message: string }>("inviteTeammate", [
+    const res = await runRpc<{ ok: boolean; message: string; members?: RoomMember[] }>("inviteTeammate", [
       email,
       name,
       roomLink,
     ]);
-    if (res && !res.ok) {
-      setNotice(res.message);
+    if (res?.ok !== true) {
+      if (res) setNotice(res.message);
       return;
     }
+    if (res?.members) setMembers(res.members);
     setInviteEmail("");
     // Open the user's mail client with a prefilled invite (works for anyone).
     const subject = encodeURIComponent(`Join me in the Glide room #${room}`);
@@ -1941,12 +2182,33 @@ function RoomSession({
       "",
       `Open it here: ${roomLink}`,
       "",
+      `Sign in to Cloudflare Access as ${email}; membership is checked against that verified address.`,
       "Glide is a shared room that drives Cloudflare configuration via chat.",
     ];
     window.location.href = `mailto:${encodeURIComponent(email)}?subject=${subject}&body=${encodeURIComponent(
       lines.join("\n"),
     )}`;
   }, [inviteEmail, name, room, roomLink, runRpc]);
+
+  const removeMember = useCallback(async (email: string) => {
+    if (!window.confirm(`Remove ${email} from this room? Their active connections will close immediately.`)) return;
+    const res = await runRpc<{ ok: boolean; message: string; members?: RoomMember[] }>(
+      "removeRoomMember",
+      [email],
+    );
+    if (res?.members) setMembers(res.members);
+    if (res) setNotice(res.message);
+  }, [runRpc]);
+
+  useEffect(() => {
+    if (!connected || agent.readyState !== WebSocket.OPEN) return;
+    void agent.call("roomAccessStatus", [], { timeout: AGENT_MESSAGES_TIMEOUT_MS })
+      .then((value) => {
+        const parsed = parsedRoomAccessStatus(value);
+        if (parsed) setMembers(parsed.members);
+      })
+      .catch(() => undefined);
+  }, [agent, connected, state?.invites.length]);
 
   const apply = useCallback(
     async (id: string, confirmUncertain = false) => {
@@ -2174,11 +2436,12 @@ function RoomSession({
             #
             <input
               value={roomDraft}
-              maxLength={200}
+              maxLength={MAX_LEGACY_ROOM_ID_CHARS}
+              readOnly={!access.isEmployee}
               onChange={(e) => setRoomDraft(e.target.value)}
               onBlur={() => {
                 const next = roomDraft.trim();
-                if (next && next.length <= 200 && !/[\u0000-\u001f\u007f]/.test(next)) onRoomChange(next);
+                if (isSupportedRoomId(next)) onRoomChange(next);
                 else setRoomDraft(room);
               }}
               onKeyDown={(event) => {
@@ -2191,6 +2454,7 @@ function RoomSession({
               }}
               style={S.roomInput}
               aria-label="Room name"
+              title={access.isEmployee ? "Open or create another room" : "External members open rooms from invitation links"}
             />
           </span>
           <span
@@ -2241,7 +2505,11 @@ function RoomSession({
         </div>
       </header>
 
-      {connected && legacyChatMigration && legacyChatMigration.status !== "ready" ? (
+      {access.entry === "claimed" ? (
+        <div style={S.warnBar} className="glide-warn-bar">
+          <strong>Legacy room claimed.</strong> Verified membership now protects this room. Re-invite any legacy guests before they can return.
+        </div>
+      ) : connected && legacyChatMigration && legacyChatMigration.status !== "ready" ? (
         <div style={S.warnBar} className="glide-warn-bar">
           <strong>Room history is locked.</strong> {legacyChatMigration.message}
           {legacyChatMigration.status === "recovery_required" && (
@@ -2899,6 +3167,27 @@ function RoomSession({
             </Section>
           )}
 
+          <Section title={`Room members · ${members.length}`}>
+            {members.map((member) => (
+              <div key={member.email} style={S.inviteItem}>
+                <span style={{ fontSize: 13, wordBreak: "break-all" }}>{member.email}</span>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
+                  <span style={S.inviteBy}>
+                    {member.role}{member.email === name ? " · you" : ""}
+                  </span>
+                  {access.role === "owner" && member.role !== "owner" && (
+                    <button
+                      style={{ ...S.miniBtn, color: "#fca5a5" }}
+                      onClick={() => void removeMember(member.email)}
+                    >
+                      Remove
+                    </button>
+                  )}
+                </div>
+              </div>
+            ))}
+          </Section>
+
           <Section
             title={`Invite teammates${(state?.invites?.length ?? 0) ? ` · ${state!.invites.length}` : ""}`}
           >
@@ -2919,8 +3208,8 @@ function RoomSession({
               </button>
             </div>
             <p style={S.hint}>
-              ⚠ Anyone with this room link can read it and <strong>Apply changes</strong> using its token —
-              there’s no separate login. Share it only with teammates. Opens a prefilled email, or copy it:
+              The invitation grants this verified email room membership. The recipient must authenticate through
+              Cloudflare Access before the link opens. Send the prefilled email, or copy the link:
             </p>
             <div style={S.linkRow}>
               <code style={S.linkCode}>{roomLink}</code>
@@ -4554,7 +4843,7 @@ function AdminPickRoom({ onPick }: { onPick: (room: string) => void }) {
         <input
           autoFocus
           value={value}
-          maxLength={200}
+          maxLength={MAX_LEGACY_ROOM_ID_CHARS}
           onChange={(e) => setValue(e.target.value.trim())}
           onKeyDown={(e) => {
             if (e.key === "Enter" && value.trim()) onPick(value.trim());
@@ -4572,7 +4861,6 @@ function AdminPickRoom({ onPick }: { onPick: (room: string) => void }) {
 
 /** Admin entry: resolve the room (from the hash) and mount the dashboard. */
 function AdminGate() {
-  const name = useMemo(() => localStorage.getItem(NAME_KEY) || "admin", []);
   const [room, setRoom] = useState(() => readRoomFromHash());
   useEffect(() => {
     const onHash = () => setRoom(readRoomFromHash());
@@ -4585,7 +4873,7 @@ function AdminGate() {
       <AdminPickRoom
         onPick={(r) => {
           const normalized = r.trim();
-          if (!normalized || normalized.length > 200 || /[\u0000-\u001f\u007f]/.test(normalized)) return;
+          if (!isSupportedRoomId(normalized)) return;
           location.hash = encodeURIComponent(normalized);
           setRoom(normalized);
         }}
@@ -4593,30 +4881,54 @@ function AdminGate() {
     );
   }
   return (
-    <Suspense
-      fallback={
-        <div style={{ ...S.shell, alignItems: "center", justifyContent: "center" }} className="glide-shell">
-          <span style={{ color: "#9ca3af", fontSize: 15 }}>Loading admin…</span>
-        </div>
-      }
-    >
-      <AdminRoom key={room} room={room} name={name} />
-    </Suspense>
+    <RoomAccessGate key={room} mode="inspect" room={room}>
+      {(access, recheckAccess) => (
+        <Suspense
+          fallback={
+            <div style={{ ...S.shell, alignItems: "center", justifyContent: "center" }} className="glide-shell">
+              <span style={{ color: "#9ca3af", fontSize: 15 }}>Loading admin…</span>
+            </div>
+          }
+        >
+          <AdminRoom
+            access={access}
+            key={room}
+            room={room}
+            name={access.email}
+            onAccessLost={recheckAccess}
+          />
+        </Suspense>
+      )}
+    </RoomAccessGate>
   );
 }
 
 /** The room-scoped admin dashboard: comms, actions, dev docs, onboarding & migration. */
 
-function AdminRoom({ room, name }: { room: string; name: string }) {
+function AdminRoom({
+  access,
+  room,
+  name,
+  onAccessLost,
+}: {
+  access: RoomAccessStatus;
+  room: string;
+  name: string;
+  onAccessLost: () => void;
+}) {
+  const agentRoom = requiredRoomStorageName(room);
   const docsManifest = use(loadAdminDocs());
   const [state, setState] = useState<GlideState>();
   const [tab, setTab] = useState<AdminTab>("comms");
   const [openDoc, setOpenDoc] = useState<string | null>(null);
+  const [members, setMembers] = useState(access.members);
+  const connectionAccess = useRoomConnectionAccess(room, onAccessLost);
 
   const agent = useAgent<GlideState>({
     agent: "GlideAgent",
-    name: room,
+    name: agentRoom,
     onStateUpdate: (s) => setState(s),
+    ...connectionAccess,
   });
   const chat = useAgentChat({
     agent,
@@ -4641,6 +4953,24 @@ function AdminRoom({ room, name }: { room: string; name: string }) {
   const plan = state?.migrationPlan;
   const guidance = state?.guidance ?? [];
   const guidanceActive = guidance.filter((d) => d.enabled).length;
+
+  useEffect(() => {
+    let cancelled = false;
+    const refresh = () => {
+      void agent.call("roomAccessStatus", [], { timeout: AGENT_MESSAGES_TIMEOUT_MS })
+        .then((value) => {
+          const parsed = parsedRoomAccessStatus(value);
+          if (!cancelled && parsed) setMembers(parsed.members);
+        })
+        .catch(() => undefined);
+    };
+    agent.addEventListener("open", refresh);
+    if (agent.readyState === WebSocket.OPEN) refresh();
+    return () => {
+      cancelled = true;
+      agent.removeEventListener("open", refresh);
+    };
+  }, [agent, state?.invites.length]);
 
   const tabs: Array<{ id: AdminTab; label: string; count?: number }> = [
     { id: "comms", label: "Comms", count: messages.length },
@@ -4670,6 +5000,7 @@ function AdminRoom({ room, name }: { room: string; name: string }) {
             <span style={{ ...S.badge, background: "#374151", color: "#d1d5db" }}>connecting…</span>
           )}
           <a href={chatLink} style={S.headerLink}>← Chat</a>
+          <span style={S.you} className="glide-user">{name}</span>
         </div>
       </header>
 
@@ -4740,6 +5071,15 @@ function AdminRoom({ room, name }: { room: string; name: string }) {
                   <span style={S.listMeta}>
                     by {inv.invitedBy} · {relTime(inv.ts)}
                   </span>
+                </div>
+              ))}
+            </Panel>
+
+            <Panel title={`Members · ${members.length}`}>
+              {members.map((member) => (
+                <div key={member.email} style={S.listRow}>
+                  <span style={{ fontSize: 13, wordBreak: "break-all" }}>{member.email}</span>
+                  <span style={S.listMeta}>{member.role}{member.email === name ? " · you" : ""}</span>
                 </div>
               ))}
             </Panel>
@@ -5053,26 +5393,7 @@ class ErrorBoundary extends Component<{ children: ReactNode }, { error: Error | 
   }
 }
 
-function App() {
-  const [name, setName] = useState<string | null>(() => {
-    const stored = localStorage.getItem(NAME_KEY);
-    if (!stored || chatParticipantNameError(stored)) {
-      localStorage.removeItem(NAME_KEY);
-      return null;
-    }
-    return stored.trim();
-  });
-
-  if (!name) {
-    return (
-      <Join
-        onJoin={(n) => {
-          localStorage.setItem(NAME_KEY, n);
-          setName(n);
-        }}
-      />
-    );
-  }
+function App({ session }: { session: AccessSession }) {
   // The bounded history loader suspends this route while the complete persisted
   // transcript is fetched, preventing partial-history sends and destructive retries.
   return (
@@ -5083,7 +5404,7 @@ function App() {
         </div>
       }
     >
-      <Room name={name} />
+      <Room session={session} />
     </Suspense>
   );
 }
@@ -5096,15 +5417,50 @@ function App() {
  */
 function Root() {
   const [admin, setAdmin] = useState(() => isAdminPath());
+  const [session, setSession] = useState<AccessSession>();
+  const [sessionError, setSessionError] = useState<string>();
+  const [sessionAttempt, setSessionAttempt] = useState(0);
   useEffect(() => {
     const onNav = () => setAdmin(isAdminPath());
     window.addEventListener("popstate", onNav);
     return () => window.removeEventListener("popstate", onNav);
   }, []);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    setSession(undefined);
+    setSessionError(undefined);
+    void fetchAccessJson("/api/session", controller.signal)
+      .then((value) => {
+        const parsed = parsedAccessSession(value);
+        if (!parsed) throw new Error("Glide returned a malformed Access identity response.");
+        setSession(parsed);
+      })
+      .catch((reason: unknown) => {
+        if (!controller.signal.aborted) {
+          setSessionError(reason instanceof Error ? reason.message : "Glide could not verify your identity.");
+        }
+      });
+    return () => controller.abort();
+  }, [sessionAttempt]);
+
+  const content = sessionError ? (
+    <AccessCard
+      title="Authentication required"
+      message={sessionError}
+      action={<button style={S.primaryBtn} onClick={() => setSessionAttempt((value) => value + 1)}>Try again</button>}
+    />
+  ) : !session ? (
+    <AccessCard title="Verifying identity" message="Checking your Cloudflare Access session…" />
+  ) : admin ? (
+    <AdminGate />
+  ) : (
+    <App session={session} />
+  );
   return (
     <>
       <PointerGlow />
-      {admin ? <AdminGate /> : <App />}
+      {content}
     </>
   );
 }

@@ -8,7 +8,8 @@ export type DeliveryStatus = "delivered" | "not_delivered" | "response_interrupt
 
 /** Bound user/assistant prose before persistence, inference, and prompt assembly. */
 export const MAX_CHAT_TEXT_CHARS = 20_000;
-export const MAX_CHAT_PARTICIPANT_NAME_CHARS = 80;
+/** Verified Access emails are used as participant names and may be up to 254 characters. */
+export const MAX_CHAT_PARTICIPANT_NAME_CHARS = 254;
 /** Bound browser buffering for the persisted transcript endpoint. */
 export const MAX_CHAT_HISTORY_BYTES = 5_000_000;
 /** Bound the decoded request body before parsing client-submitted history. */
@@ -31,7 +32,7 @@ export function isChatTextWithinLimit(text: string): boolean {
   return text.length <= MAX_CHAT_TEXT_CHARS;
 }
 
-export function isWithinUtf8ByteLimit(value: string, maxBytes: number): boolean {
+export function utf8ByteLengthWithinLimit(value: string, maxBytes: number): number | undefined {
   let bytes = 0;
   for (let index = 0; index < value.length; index += 1) {
     const code = value.charCodeAt(index);
@@ -41,9 +42,13 @@ export function isWithinUtf8ByteLimit(value: string, maxBytes: number): boolean 
       bytes += 4;
       index += 1;
     } else bytes += 3;
-    if (bytes > maxBytes) return false;
+    if (bytes > maxBytes) return undefined;
   }
-  return true;
+  return bytes;
+}
+
+export function isWithinUtf8ByteLimit(value: string, maxBytes: number): boolean {
+  return utf8ByteLengthWithinLimit(value, maxBytes) !== undefined;
 }
 
 /** Reject deeply nested or token-dense JSON before JSON.parse allocates its object graph. */
@@ -296,7 +301,7 @@ export function clientChatSubmissionError(
       Object.keys(metadata).some((key) => key !== "name") ||
       (metadata.name !== undefined &&
         (typeof metadata.name !== "string" ||
-          metadata.name.length > 80 ||
+          metadata.name.length > MAX_CHAT_PARTICIPANT_NAME_CHARS ||
           /[\u0000-\u001f\u007f]/.test(metadata.name) ||
           containsCloudflareApiToken(metadata.name)))
     ) {

@@ -11,12 +11,12 @@ These pages document how Glide actually works, drawn directly from the source in
 
 | Doc | What's inside |
 | --- | --- |
-| [Architecture](./architecture.md) | The Worker + `GlideAgent` Durable Object, request/chat-turn and delivery lifecycles, the source-file map, synced state, SQLite tables, structured events, both RAG paths, the weekly cron, and the read-only `/admin` dashboard. |
-| [Setup & configuration](./setup.md) | Prerequisites, local development, every env var / secret, the `VECTORIZE` and (optional) `MIGRATION` bindings, the Cloudflare-docs RAG + weekly cron, API-token permissions, and deploying to production. |
-| [Tools & RPC reference](./tools.md) | Every LLM tool (reads run, writes queue), active client RPCs, and fail-closed migration compatibility stubs — approvals, token setup/re-verification, client delivery reports, onboarding, business discovery/recommendations, migration, and guidance. |
-| [Onboarding & migration](./onboarding-and-migration.md) | The guided wizard, the onboarding checklists, business discovery → tailored recommendations, and the read-only provider-migration pipeline (preview → preflight → diff → queue → export). |
-| [Security model](./security.md) | At-rest token encryption, chat and log redaction, the room-link-as-credential model, the writes-always-through-a-human guarantee, disabled migration recovery paths, and the threat model. |
-| [Troubleshooting & observability](./troubleshooting.md) | LIVE/RECONNECTING recovery, authoritative delivery checks, structured event fields, production log queries, and an incident workflow. |
+| [Architecture](./architecture.md) | The Worker + `GlideAgent` Durable Object, room-name mapping, Access authorization and provisional-room lifecycle, layered rate limiting, request/chat-turn and delivery lifecycles, the source-file map, synced state, SQLite tables, structured events, both RAG paths, the weekly cron, and `/admin`. |
+| [Setup & configuration](./setup.md) | Prerequisites, local development, Access application and membership setup, every env var / secret and binding, rate-limit namespace/tuning details, Cloudflare-docs RAG, API-token permissions, and production deployment. |
+| [Tools & RPC reference](./tools.md) | Every LLM tool (reads run, writes queue), rate-limited active client RPCs, and fail-closed compatibility stubs: approvals, token setup, delivery reports, onboarding, recommendations, migration, and guidance. |
+| [Onboarding & migration](./onboarding-and-migration.md) | The guided wizard, rate-limit-safe retries, onboarding checklists, business discovery, tailored recommendations, and the read-only provider-migration pipeline. |
+| [Security model](./security.md) | Signed Access identity, durable room ACLs and denied-probe cleanup, at-rest token encryption, redaction, authenticated-traffic abuse controls, writes-always-through-a-human, disabled recovery paths, and the threat model. |
+| [Troubleshooting & observability](./troubleshooting.md) | LIVE/RECONNECTING recovery, `429`/`503` handling, authoritative delivery checks, structured events, production log queries, and incident workflow. |
 
 ## The one thing to remember
 
@@ -36,6 +36,7 @@ validation/snapshot paths.
 
 - A send vanished or the assistant never answered: [message delivery](./troubleshooting.md#message-delivery).
 - A production turn needs tracing: [structured chat events](./troubleshooting.md#structured-chat-events).
+- A request is returning `429` or `rate_limit_unavailable`: [rate limiting](./troubleshooting.md#rate-limiting).
 - A token is unexpectedly unverified: [token verification](./troubleshooting.md#token-verification).
 - A zone already exists, Add domain did not queue, or Apply was skipped:
   [approval and zone-creation recovery](./troubleshooting.md#approvals-and-zone-creation).

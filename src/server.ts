@@ -17,7 +17,16 @@
  */
 
 import { AIChatAgent } from "@cloudflare/ai-chat";
-import { callable, getAgentByName, routeAgentRequest, type AgentContext, type Connection } from "agents";
+import { AsyncLocalStorage } from "node:async_hooks";
+import {
+  callable,
+  getAgentByName,
+  getCurrentAgent,
+  routeAgentRequest,
+  type AgentContext,
+  type Connection,
+  type ConnectionContext,
+} from "agents";
 import { MessageType, parseProtocolMessage } from "agents/chat";
 import {
   convertToModelMessages,
@@ -34,6 +43,16 @@ import {
 import { createWorkersAI } from "workers-ai-provider";
 import { z } from "zod";
 
+import {
+  accessAuthErrorResponse,
+  accessIdentityFromHeaders,
+  authenticateAccessRequest,
+  canonicalizeEmail,
+  isCloudflareEmployeeEmail,
+  requestWithAccessIdentity,
+  type AccessIdentity,
+  type AccessSession,
+} from "./access-auth";
 import { canonicalizeApiPath, canonicalizeDomainName, zoneIdFromApiPath } from "./api-path";
 import {
   cfGet,
@@ -52,8 +71,11 @@ import {
 import {
   EMPTY_BUSINESS_PROFILE,
   INITIAL_GLIDE_STATE,
+  isValidRoomStorageName,
+  isValidRoomId,
   LEGACY_CHAT_RECOVERY_CONFIRMATION,
   mergeDocLinks,
+  roomStorageName,
   type ActionResult,
   type BusinessProfile,
   type DocChunk,
@@ -70,6 +92,8 @@ import {
   type OnboardingState,
   type OnboardingStep,
   type PendingAction,
+  type RoomAccessStatus,
+  type RoomMember,
   type SetupType,
   type TerraformArtifact,
   type WriteMethod,
@@ -137,6 +161,7 @@ import {
   isWithinUtf8ByteLimit,
   isUntrustedChatRole,
   redactCloudflareApiTokens,
+  utf8ByteLengthWithinLimit,
 } from "./chat-delivery";
 import {
   APPLY_ATTEMPT_STALE_MS,
@@ -197,11 +222,28 @@ import {
   parseTopIndex,
   retrieveDocChunks,
 } from "./docs-scraper";
+import {
+  CLIENT_RATE_LIMIT_HEADER,
+  clientRateLimitKey,
+  consumeRateLimit,
+  isClientRateLimitKey,
+  opaqueRateLimitKey,
+  rateLimitResponse,
+  type RateLimitDecision,
+  type RateLimiter,
+} from "./rate-limits";
 
 /** Keep this many finished results in synced state. */
 const MAX_RECENT_RESULTS = 25;
 const MAX_PENDING_ACTIONS = 100;
 const MAX_MEMORY_ENTRIES = 100;
+const MAX_ROOM_MEMBERS = 100;
+/** Give a queued first activation time to claim a room before denied-probe cleanup. */
+const FRESH_ROOM_CLEANUP_DELAY_SECONDS = 1;
+/** Retry transient schedule-write failures within the Durable Object waitUntil budget. */
+const FRESH_ROOM_CLEANUP_RETRY_DELAYS_MS = [50, 250] as const;
+/** Give a native fallback alarm a fresh invocation for atomic storage cleanup. */
+const FRESH_ROOM_CLEANUP_FALLBACK_ALARM_DELAY_MS = 1_000;
 /** Cap raw read payloads echoed back to the model so a huge list can't blow the context. */
 const MAX_READ_CHARS = 6_000;
 /** SQLite row name for the encrypted Cloudflare API token. */
@@ -262,6 +304,17 @@ function persistedChatMessageRole(
   return undefined;
 }
 
+/**
+ * Constructors in the Agent/AIChatAgent stack create SQLite tables even when a
+ * request is only probing a room. Capture whether any schema existed before
+ * those writes so a denied probe can remove only the storage it just created.
+ */
+function storageHadSchemaBeforeInitialization(storage: DurableObjectStorage): boolean {
+  return storage.sql.exec<{ name: string }>(
+    "SELECT name FROM sqlite_master WHERE type = 'table' LIMIT 1",
+  ).toArray().length > 0;
+}
+
 /** Swap legacy history out before AIChatAgent can hydrate an unbounded table. */
 function prepareLegacyChatMigration(storage: DurableObjectStorage): void {
   storage.sql.exec(`CREATE TABLE IF NOT EXISTS cf_ai_chat_agent_messages (
@@ -308,6 +361,36 @@ function prepareLegacyChatMigration(storage: DurableObjectStorage): void {
     );
   });
 }
+
+function prepareRoomAccessStorage(
+  storage: DurableObjectStorage,
+  storageHadSchemaAtConstruction: boolean,
+): void {
+  storage.sql.exec(`CREATE TABLE IF NOT EXISTS glide_room_members (
+    email      TEXT PRIMARY KEY COLLATE NOCASE,
+    role       TEXT NOT NULL CHECK (role IN ('owner', 'member')),
+    invited_by TEXT,
+    joined_at  INTEGER NOT NULL
+  )`);
+  storage.sql.exec(`CREATE TABLE IF NOT EXISTS glide_room_invites (
+    email       TEXT PRIMARY KEY COLLATE NOCASE,
+    invited_by  TEXT NOT NULL,
+    link        TEXT,
+    invited_at  INTEGER NOT NULL
+  )`);
+  storage.sql.exec(`CREATE TABLE IF NOT EXISTS glide_room_lifecycle (
+    id TEXT PRIMARY KEY CHECK (id = 'provisional')
+  )`);
+  storage.sql.exec(`CREATE TABLE IF NOT EXISTS glide_room_activations (
+    id           TEXT PRIMARY KEY,
+    email        TEXT NOT NULL COLLATE NOCASE,
+    entry        TEXT NOT NULL CHECK (entry IN ('created', 'claimed')),
+    activated_at INTEGER NOT NULL
+  )`);
+  if (!storageHadSchemaAtConstruction) {
+    storage.sql.exec("INSERT OR IGNORE INTO glide_room_lifecycle (id) VALUES ('provisional')");
+  }
+}
 /**
  * Stable, well-known DO name that drives the weekly docs-refresh cron. Using one
  * fixed instance keeps the crawl bookkeeping and global lock in a single place
@@ -333,18 +416,53 @@ const RL_PERIODS = [10, 60, 120, 300, 600, 3600] as const;
 /** Providers whose checks/migrations are zone-scoped (need a zone id). */
 const CDN_MIGRATION_PROVIDERS = new Set(["akamai", "fastly", "imperva"]);
 
-const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
 const WRITE_METHODS = new Set<WriteMethod>(["POST", "PUT", "PATCH", "DELETE"]);
 
 interface ChatTurnContext {
   actor: string;
   queuedActions: PendingAction[];
   queueNotices: string[];
+  accessLease?: RoomAccessLease;
+  abortSignal?: AbortSignal;
+  requestId?: string;
 }
 
 interface CredentialLease {
   token: string;
   generation: number;
+}
+
+interface GlideConnectionState {
+  glideClientRateLimitKey?: string;
+  glideAccessLeaseId?: string;
+  glideAccessEmail?: string;
+  glideAccessSubjectDigest?: string;
+  glideAccessExpiresAt?: number;
+  glideAccessExpiryScheduleId?: string;
+  [key: string]: unknown;
+}
+
+interface RoomAccessLease {
+  connectionId: string;
+  leaseId: string;
+  email: string;
+  expiresAt: number;
+}
+
+const roomAccessProgrammaticTurn = new AsyncLocalStorage<RoomAccessLease>();
+
+const ACCESS_SUBJECT_DIGEST_RE = /^access-subject:[a-f0-9]{64}$/;
+
+interface RoomAuthorizationResult {
+  allowed: boolean;
+  code:
+    | "member"
+    | "room_claimed"
+    | "room_created"
+    | "room_membership_required"
+    | "legacy_room_not_found";
+  message: string;
+  access?: RoomAccessStatus;
 }
 
 /** Runtime guard for persisted queue data before it can reach the privileged API client. */
@@ -1104,16 +1222,26 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
   messageConcurrency = "drop" as const;
   private readonly storageSql: Pick<SqlStorage, "exec">;
   private readonly durableStorage: Pick<DurableObjectStorage, "transactionSync">;
+  private readonly storageHadSchemaAtConstruction: boolean;
+  private freshRoomDestroyQueued = false;
+  private protocolBytesInFlight = 0;
   private assistantProvenanceReady = false;
   private assistantMigrationAttempted = false;
   private assistantMigrationRunning = false;
   private assistantMigrationFinalizing = false;
+  private readonly roomAccessAborters = new Map<
+    string,
+    Map<string, Set<(reason: Error) => void>>
+  >();
 
   constructor(ctx: AgentContext, env: Cloudflare.Env) {
+    const storageHadSchemaAtConstruction = storageHadSchemaBeforeInitialization(ctx.storage);
     prepareLegacyChatMigration(ctx.storage);
+    prepareRoomAccessStorage(ctx.storage, storageHadSchemaAtConstruction);
     super(ctx, env);
     this.storageSql = ctx.storage.sql;
     this.durableStorage = ctx.storage;
+    this.storageHadSchemaAtConstruction = storageHadSchemaAtConstruction;
     // SDK stream recovery can persist reconstructed messages before onStart().
     // Create the provenance tables synchronously so sanitization always fails closed.
     this.sql`CREATE TABLE IF NOT EXISTS glide_system_events (
@@ -1144,21 +1272,48 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     initializeAcceptedChatMessageLedger(this.storageSql);
     const handleMessage = this.onMessage.bind(this);
     this.onMessage = async (connection, message) => {
-      let admittedUserMessageId: string | undefined;
-      if (typeof message === "string") {
-        if (
-          !isWithinUtf8ByteLimit(message, MAX_CHAT_PROTOCOL_BYTES) ||
-          !isJsonStructureWithinLimits(message)
-        ) {
+      if (typeof message !== "string") {
+        try {
+          connection.close(1003, "Binary protocol messages are not supported");
+        } catch {
+          /* The connection already closed. */
+        }
+        return;
+      }
+      const messageBytes = utf8ByteLengthWithinLimit(message, MAX_CHAT_PROTOCOL_BYTES);
+      if (messageBytes === undefined) {
+        this.rejectClientTranscript(connection, undefined, "Chat protocol message is too large.");
+        try {
+          connection.close(1009, "Chat protocol message is too large");
+        } catch {
+          /* The connection already closed. */
+        }
+        return;
+      }
+      if (this.protocolBytesInFlight + messageBytes > MAX_CHAT_PROTOCOL_BYTES) {
+        try {
+          connection.close(1009, "Too much protocol data is awaiting admission");
+        } catch {
+          /* The connection already closed. */
+        }
+        return;
+      }
+      this.protocolBytesInFlight += messageBytes;
+      try {
+        if (!await this.admitProtocolMessage(connection)) return;
+        let admittedUserMessageId: string | undefined;
+        if (!isJsonStructureWithinLimits(message)) {
           this.rejectClientTranscript(connection, undefined, "Chat protocol message is too large.");
           return;
         }
+        let envelope: Record<string, unknown>;
         let event: ReturnType<typeof parseProtocolMessage>;
         try {
-          const envelope: unknown = JSON.parse(message);
-          if (!envelope || typeof envelope !== "object" || Array.isArray(envelope)) {
+          const parsedEnvelope: unknown = JSON.parse(message);
+          if (!parsedEnvelope || typeof parsedEnvelope !== "object" || Array.isArray(parsedEnvelope)) {
             throw new Error("Malformed protocol envelope.");
           }
+          envelope = parsedEnvelope as Record<string, unknown>;
           event = parseProtocolMessage(message);
         } catch {
           this.rejectClientTranscript(connection, undefined, "Chat protocol message is malformed.");
@@ -1214,7 +1369,6 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
           } else {
             const tools = body.clientTools;
             const trigger = body.trigger;
-            const bodyName = body.name;
             const submitted = Array.isArray(body.messages) ? body.messages : [];
             const latest = submitted[submitted.length - 1] as
               | { id?: unknown; parts?: Array<{ type?: unknown; text?: unknown }> }
@@ -1222,9 +1376,10 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
             const submittedText = latest?.parts?.[0]?.type === "text" && typeof latest.parts[0].text === "string"
               ? latest.parts[0].text
               : "";
-            const participantNameError = typeof bodyName === "string"
-              ? chatParticipantNameError(bodyName, this.tokenForRedaction)
-              : "Chat participant name is malformed.";
+            const actor = this.connectionIdentity(connection)?.email;
+            const participantNameError = actor
+              ? chatParticipantNameError(actor, this.tokenForRedaction)
+              : "Authenticated chat identity is unavailable.";
             const error =
               (Object.keys(body).some((key) => !["messages", "trigger", "name", "clientTools"].includes(key))
                 ? "Chat request contains unsupported fields."
@@ -1246,8 +1401,31 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
               this.rejectClientTranscript(connection, event.id, error);
               return;
             }
+            const rateLimit = await this.chatRateLimit(connection);
+            if (!this.enforceCurrentConnectionAccess(connection)) return;
+            if (rateLimit.decision !== "allowed") {
+              this.rejectRateLimitedChat(connection, event.id, rateLimit);
+              return;
+            }
             admittedUserMessageId = latest?.id as string;
             this.admittingUserMessageIds.add(admittedUserMessageId);
+            const canonicalMessages = [
+              ...submitted.slice(0, -1),
+              {
+                ...(latest as Record<string, unknown>),
+                metadata: { name: actor } satisfies GlideMessageMetadata,
+              },
+            ];
+            const init = envelope.init && typeof envelope.init === "object" && !Array.isArray(envelope.init)
+              ? envelope.init as Record<string, unknown>
+              : {};
+            message = JSON.stringify({
+              ...envelope,
+              init: {
+                ...init,
+                body: JSON.stringify({ ...body, messages: canonicalMessages, name: actor }),
+              },
+            });
           }
         }
         if (
@@ -1257,21 +1435,29 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
           this.rejectClientTranscript(connection, undefined, "Chat protocol id is malformed.");
           return;
         }
-      }
-      try {
-        return await handleMessage(connection, message);
+        try {
+          return await handleMessage(connection, message);
+        } finally {
+          if (admittedUserMessageId) this.admittingUserMessageIds.delete(admittedUserMessageId);
+        }
       } finally {
-        if (admittedUserMessageId) this.admittingUserMessageIds.delete(admittedUserMessageId);
+        this.protocolBytesInFlight -= messageBytes;
       }
     };
     const handleRequest = this.onRequest.bind(this);
-    this.onRequest = (request) => {
+    this.onRequest = async (request) => {
+      if (!agentRequestHasAllowedOrigin(request)) return invalidOriginResponse();
+      const identity = accessIdentityFromHeaders(request.headers);
+      if (!identity || this.isAccessIdentityExpired(identity) || !this.isRoomMember(identity.email)) {
+        return this.roomAccessDeniedResponse();
+      }
+      const isHistoryRequest = new URL(request.url).pathname.split("/").pop() === "get-messages";
       if (
         !this.assistantProvenanceReady &&
-        new URL(request.url).pathname.split("/").pop() === "get-messages"
+        isHistoryRequest
       ) {
         const migration = this.currentLegacyChatMigrationStatus();
-        return Promise.resolve(Response.json(
+        return Response.json(
           {
             code: "legacy_chat_migration_incomplete",
             error: migration.message,
@@ -1281,10 +1467,786 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
             recoveryConfirmation: migration.recoveryConfirmation,
           },
           { status: 503, headers: { "Cache-Control": "no-store" } },
-        ));
+        );
       }
-      return handleRequest(request);
+      const response = await handleRequest(request);
+      if (!isHistoryRequest) return response;
+      const headers = new Headers(response.headers);
+      headers.set("Cache-Control", "private, no-store");
+      return new Response(response.body, {
+        status: response.status,
+        statusText: response.statusText,
+        headers,
+      });
     };
+  }
+
+  async onConnect(connection: Connection, context: ConnectionContext): Promise<void> {
+    const identity = accessIdentityFromHeaders(context.request.headers);
+    if (
+      !agentRequestHasAllowedOrigin(context.request) ||
+      !identity ||
+      this.isAccessIdentityExpired(identity) ||
+      !this.isRoomMember(identity.email)
+    ) {
+      try {
+        connection.close(1008, "Room membership required");
+      } catch {
+        /* The connection closed before authorization completed. */
+      }
+      return;
+    }
+    this.abortRoomAccessOperationsForConnection(
+      connection.id,
+      new Error("The socket session was replaced by a reconnect."),
+    );
+    const current = connection.state;
+    const state = current && typeof current === "object" && !Array.isArray(current)
+      ? current as Record<string, unknown>
+      : {};
+    const headerRateLimitKey = context.request.headers.get(CLIENT_RATE_LIMIT_HEADER);
+    const [subjectDigest, clientKey] = await Promise.all([
+      opaqueRateLimitKey("access-subject", identity.subject),
+      isClientRateLimitKey(headerRateLimitKey)
+        ? Promise.resolve(headerRateLimitKey)
+        : clientRateLimitKey(context.request),
+    ]);
+    // Revocation can interleave while Web Crypto derives the opaque keys.
+    if (this.isAccessIdentityExpired(identity) || !this.isRoomMember(identity.email)) {
+      try {
+        connection.close(1008, "Room membership required");
+      } catch {
+        /* The connection closed while authorization was being finalized. */
+      }
+      return;
+    }
+    connection.setState({
+      ...state,
+      glideAccessLeaseId: crypto.randomUUID(),
+      glideAccessEmail: identity.email,
+      glideAccessSubjectDigest: subjectDigest,
+      glideAccessExpiresAt: identity.expiresAt,
+      glideClientRateLimitKey: clientKey,
+    });
+    try {
+      const expiry = await this.schedule(
+        new Date(identity.expiresAt * 1_000),
+        "expireAccessConnection",
+        { connectionId: connection.id },
+      );
+      connection.setState({
+        ...(connection.state as Record<string, unknown>),
+        glideAccessExpiryScheduleId: expiry.id,
+      });
+      // Scheduling is durable I/O, so authorization may have changed while it ran.
+      if (this.isAccessIdentityExpired(identity) || !this.isRoomMember(identity.email)) {
+        const deniedState = { ...(connection.state as GlideConnectionState) };
+        delete deniedState.glideAccessLeaseId;
+        delete deniedState.glideAccessEmail;
+        delete deniedState.glideAccessSubjectDigest;
+        delete deniedState.glideAccessExpiresAt;
+        delete deniedState.glideClientRateLimitKey;
+        delete deniedState.glideAccessExpiryScheduleId;
+        connection.setState(deniedState);
+        try {
+          connection.close(1008, "Room membership required");
+        } catch {
+          /* The connection closed while its expiry was being scheduled. */
+        }
+        try {
+          await this.cancelSchedule(expiry.id);
+        } catch {
+          this.logChatEvent("room.access_expiry_schedule_cleanup_failed", {}, "warn");
+        }
+        return;
+      }
+    } catch {
+      this.logChatEvent("room.access_expiry_schedule_failed", {}, "error");
+      try {
+        connection.close(1011, "Unable to enforce Access session expiry");
+      } catch {
+        /* The connection closed while its expiry was being scheduled. */
+      }
+      return;
+    }
+    await super.onConnect(connection, context);
+  }
+
+  async onBeforeSubAgent(): Promise<Response> {
+    return new Response("Not found", {
+      status: 404,
+      headers: { "Cache-Control": "no-store" },
+    });
+  }
+
+  shouldSendProtocolMessages(_connection: Connection, context: ConnectionContext): boolean {
+    const identity = accessIdentityFromHeaders(context.request.headers);
+    return Boolean(
+      agentRequestHasAllowedOrigin(context.request) &&
+      identity &&
+      !this.isAccessIdentityExpired(identity) &&
+      this.isRoomMember(identity.email),
+    );
+  }
+
+  async onClose(
+    connection: Connection,
+    code: number,
+    reason: string,
+    wasClean: boolean,
+  ): Promise<void> {
+    const accessLease = this.roomAccessLeaseForConnection(connection);
+    if (accessLease) {
+      this.abortRoomAccessOperations(
+        accessLease,
+        new Error("The socket session ended before the chat operation completed."),
+      );
+    }
+    const scheduleId = (connection.state as GlideConnectionState | null)?.glideAccessExpiryScheduleId;
+    if (typeof scheduleId === "string" && scheduleId.length > 0 && scheduleId.length <= 128) {
+      try {
+        await this.cancelSchedule(scheduleId);
+      } catch {
+        this.logChatEvent("room.access_expiry_schedule_cleanup_failed", {}, "warn");
+      }
+    }
+    await super.onClose(connection, code, reason, wasClean);
+  }
+
+  async expireAccessConnection(payload: { connectionId?: unknown } | null): Promise<void> {
+    const connectionId = payload?.connectionId;
+    if (typeof connectionId !== "string" || connectionId.length === 0 || connectionId.length > 256) {
+      this.logChatEvent("room.access_expiry_schedule_invalid", {}, "error");
+      return;
+    }
+    for (const connection of this.getConnections(connectionId)) {
+      const identity = this.connectionIdentity(connection);
+      if (identity && !this.isAccessIdentityExpired(identity) && this.isRoomMember(identity.email)) continue;
+      this.logChatEvent("room.access_expired", {}, "warn");
+      const accessLease = this.roomAccessLeaseForConnection(connection);
+      if (accessLease) {
+        this.abortRoomAccessOperations(
+          accessLease,
+          new Error("Room membership or the Access session expired."),
+        );
+      }
+      try {
+        connection.close(1008, "Room membership or Access session expired");
+      } catch {
+        /* The connection already closed. */
+      }
+    }
+  }
+
+  private isAccessIdentityExpired(identity: AccessIdentity): boolean {
+    return identity.expiresAt <= Math.floor(Date.now() / 1_000);
+  }
+
+  private connectionIdentity(connection: Connection | undefined): AccessIdentity | undefined {
+    const state = connection?.state as GlideConnectionState | null | undefined;
+    const email = canonicalizeEmail(state?.glideAccessEmail);
+    const subjectDigest = typeof state?.glideAccessSubjectDigest === "string"
+      ? state.glideAccessSubjectDigest.trim()
+      : "";
+    const expiresAt = state?.glideAccessExpiresAt;
+    if (
+      !email ||
+      !ACCESS_SUBJECT_DIGEST_RE.test(subjectDigest) ||
+      !Number.isSafeInteger(expiresAt) ||
+      expiresAt! <= 0
+    ) {
+      return undefined;
+    }
+    return { email, subject: subjectDigest, expiresAt: expiresAt! };
+  }
+
+  private isRoomMember(email: string): boolean {
+    return this.sql<{ present: number }>`SELECT 1 AS present FROM glide_room_members
+      WHERE email = ${email} LIMIT 1`.length > 0;
+  }
+
+  private roomMembers(): RoomMember[] {
+    return this.sql<{
+      email: string;
+      role: RoomMember["role"];
+      invited_by: string | null;
+      joined_at: number;
+    }>`SELECT email, role, invited_by, joined_at FROM glide_room_members
+      ORDER BY CASE role WHEN 'owner' THEN 0 ELSE 1 END, joined_at, email
+      LIMIT ${MAX_ROOM_MEMBERS}`.map((row) => ({
+        email: row.email,
+        role: row.role,
+        ...(row.invited_by ? { invitedBy: row.invited_by } : {}),
+        joinedAt: row.joined_at,
+      }));
+  }
+
+  private roomInvitationAudit(): Invite[] {
+    return this.sql<{
+      email: string;
+      invited_by: string;
+      link: string | null;
+      invited_at: number;
+    }>`SELECT email, invited_by, link, invited_at FROM glide_room_invites
+      ORDER BY invited_at DESC, email
+      LIMIT ${MAX_ROOM_MEMBERS}`.map((row) => ({
+        email: row.email,
+        invitedBy: row.invited_by,
+        ...(row.link ? { link: row.link } : {}),
+        ts: row.invited_at,
+      }));
+  }
+
+  private persistLegacyInvitationAudit(): void {
+    for (const candidate of this.state.invites.slice(0, MAX_ROOM_MEMBERS)) {
+      const email = canonicalizeEmail(candidate.email);
+      if (!email || !Number.isSafeInteger(candidate.ts) || candidate.ts <= 0) continue;
+      const invitedBy = normalizeActor(candidate.invitedBy, "legacy invite");
+      const link = typeof candidate.link === "string" && candidate.link.length <= 2_048
+        ? candidate.link
+        : null;
+      this.sql`INSERT OR IGNORE INTO glide_room_invites (email, invited_by, link, invited_at)
+        VALUES (${email}, ${invitedBy}, ${link}, ${candidate.ts})`;
+    }
+  }
+
+  private publishInvitationAudit(invites = this.roomInvitationAudit()): void {
+    if (JSON.stringify(invites) === JSON.stringify(this.state.invites)) return;
+    const nextState = { ...this.state, invites };
+    if (syncedStateSizeError(nextState) && !isSafeSyncedStateTransition(this.state, nextState)) {
+      this.logChatEvent("room.invite_projection_oversized", {}, "error");
+      return;
+    }
+    try {
+      this.setState(nextState);
+    } catch {
+      this.logChatEvent("room.invite_projection_failed", {}, "error");
+    }
+  }
+
+  private roomHadExistingData(): boolean {
+    const durableContent = this.sql<{ present: number }>`SELECT CASE WHEN
+      EXISTS (SELECT 1 FROM cf_ai_chat_agent_messages) OR
+      EXISTS (SELECT 1 FROM glide_legacy_chat_quarantine) OR
+      EXISTS (SELECT 1 FROM glide_secrets) OR
+      EXISTS (SELECT 1 FROM glide_migration_src) OR
+      EXISTS (SELECT 1 FROM glide_room_invites) OR
+      EXISTS (SELECT 1 FROM glide_action_notifications) OR
+      EXISTS (SELECT 1 FROM glide_system_events) OR
+      EXISTS (SELECT 1 FROM glide_assistant_events) OR
+      EXISTS (SELECT 1 FROM glide_accepted_user_message_ids) OR
+      EXISTS (SELECT 1 FROM glide_chat_message_id_tombstones) OR
+      EXISTS (
+        SELECT 1 FROM glide_chat_migration_progress
+        WHERE last_rowid > 0 OR blocked_reason IS NOT NULL OR recovery_requested != 0
+      ) OR
+      EXISTS (SELECT 1 FROM glide_docs_products) OR
+      EXISTS (SELECT 1 FROM glide_docs_pages) OR
+      EXISTS (SELECT 1 FROM glide_docs_previous_pages) OR
+      EXISTS (SELECT 1 FROM glide_docs_product_attempts)
+      THEN 1 ELSE 0 END AS present`[0]?.present === 1;
+
+    return durableContent ||
+      this.messages.length > 0 ||
+      Object.keys(this.state.memory).length > 0 ||
+      this.state.pendingActions.length > 0 ||
+      this.state.recentResults.length > 0 ||
+      this.state.invites.length > 0 ||
+      this.state.tokenConfigured ||
+      this.state.tokenLast4 !== undefined ||
+      this.state.tokenValid !== undefined ||
+      Boolean(
+        this.state.onboarding ||
+        this.state.businessProfile ||
+        this.state.migrationPlan ||
+        this.state.terraform ||
+        this.state.csv ||
+        this.state.migrationCheck ||
+        this.state.defaultAccountId !== undefined ||
+        this.state.defaultZone !== undefined ||
+        this.state.docLinks?.length ||
+        this.state.snapshots?.length ||
+        this.state.guidance?.length ||
+        this.state.docsIndex,
+      );
+  }
+
+  private isProvisionalRoom(): boolean {
+    return this.sql<{ present: number }>`SELECT 1 AS present FROM glide_room_lifecycle
+      WHERE id = ${"provisional"} LIMIT 1`.length > 0;
+  }
+
+  private replayedRoomActivation(
+    attemptId: string | undefined,
+    authorization: RoomAuthorizationResult,
+  ): RoomAuthorizationResult | undefined {
+    if (!authorization.allowed || !authorization.access || !attemptId) return undefined;
+    const replay = this.sql<{ entry: "created" | "claimed" }>`SELECT entry FROM glide_room_activations
+      WHERE id = ${attemptId} AND email = ${authorization.access.email} LIMIT 1`[0];
+    if (!replay) return undefined;
+    const claimed = replay.entry === "claimed";
+    return {
+      ...authorization,
+      code: claimed ? "room_claimed" : "room_created",
+      message: claimed
+        ? "This legacy room is now protected by verified membership."
+        : "Private room created.",
+      access: { ...authorization.access, entry: replay.entry },
+    };
+  }
+
+  private async retryFreshDeniedRoomCleanup(): Promise<void> {
+    try {
+      for (const delay of FRESH_ROOM_CLEANUP_RETRY_DELAYS_MS) {
+        await scheduler.wait(delay);
+        if (!this.isProvisionalRoom() || this.roomHadExistingData()) {
+          this.freshRoomDestroyQueued = false;
+          return;
+        }
+        try {
+          await this.schedule(
+            FRESH_ROOM_CLEANUP_DELAY_SECONDS,
+            "destroyFreshDeniedRoomIfUnused",
+            { freshDeniedRoom: true },
+            { idempotent: true },
+          );
+          return;
+        } catch {
+          /* Retry below, then move destruction to a fresh alarm invocation. */
+        }
+      }
+      if (!this.isProvisionalRoom() || this.roomHadExistingData()) {
+        this.freshRoomDestroyQueued = false;
+        return;
+      }
+      const memberCount = this.sql<{ count: number }>`SELECT COUNT(*) AS count FROM glide_room_members`[0]?.count ?? 0;
+      if (memberCount !== 0) {
+        this.freshRoomDestroyQueued = false;
+        return;
+      }
+      await this.ctx.storage.setAlarm(Date.now() + FRESH_ROOM_CLEANUP_FALLBACK_ALARM_DELAY_MS);
+    } catch {
+      this.freshRoomDestroyQueued = false;
+      this.logChatEvent("room.fresh_cleanup_retry_failed", {}, "error");
+    }
+  }
+
+  /** Native fallback alarms also destroy only an unchanged provisional room. */
+  async alarm(): Promise<void> {
+    if (this.isProvisionalRoom() && !this.roomHadExistingData()) {
+      const memberCount = this.sql<{ count: number }>`SELECT COUNT(*) AS count FROM glide_room_members`[0]?.count ?? 0;
+      if (memberCount === 0) {
+        await this.destroyFreshDeniedRoomIfUnused({ freshDeniedRoom: true });
+        return;
+      }
+    }
+    await super.alarm();
+  }
+
+  private evaluateRoomAuthorization(identity: AccessIdentity): RoomAuthorizationResult {
+    const email = canonicalizeEmail(identity?.email);
+    const subject = typeof identity?.subject === "string" ? identity.subject.trim() : "";
+    const expiresAt = identity?.expiresAt;
+    if (
+      !email ||
+      !subject ||
+      subject.length > 512 ||
+      !Number.isSafeInteger(expiresAt) ||
+      expiresAt <= Math.floor(Date.now() / 1_000)
+    ) {
+      return {
+        allowed: false,
+        code: "room_membership_required",
+        message: "A current verified identity is required to open this room.",
+      };
+    }
+
+    const existing = this.sql<{ role: RoomMember["role"] }>`SELECT role FROM glide_room_members
+      WHERE email = ${email} LIMIT 1`[0];
+    if (existing) {
+      return {
+        allowed: true,
+        code: "member",
+        message: "Room access granted.",
+        access: {
+          email,
+          isEmployee: isCloudflareEmployeeEmail(email),
+          role: existing.role,
+          members: this.roomMembers(),
+          entry: "member",
+        },
+      };
+    }
+
+    return {
+      allowed: false,
+      code: "room_membership_required",
+      message: "This room is private. Ask a room member to invite your verified email address.",
+    };
+  }
+
+  /** Durably queue cleanup for constructor-only storage left by a denied probe. */
+  private async queueFreshDeniedRoomDestroy(): Promise<void> {
+    if (!this.isProvisionalRoom() || this.roomHadExistingData()) return;
+    const memberCount = this.sql<{ count: number }>`SELECT COUNT(*) AS count FROM glide_room_members`[0]?.count ?? 0;
+    if (memberCount !== 0 || this.freshRoomDestroyQueued) return;
+
+    this.freshRoomDestroyQueued = true;
+    try {
+      await this.schedule(
+        FRESH_ROOM_CLEANUP_DELAY_SECONDS,
+        "destroyFreshDeniedRoomIfUnused",
+        { freshDeniedRoom: true },
+        { idempotent: true },
+      );
+    } catch {
+      this.logChatEvent("room.fresh_cleanup_schedule_failed", {}, "error");
+      this.ctx.waitUntil(this.retryFreshDeniedRoomCleanup());
+    }
+  }
+
+  /** Scheduled cleanup rechecks durable room state before atomically clearing storage. */
+  async destroyFreshDeniedRoomIfUnused(
+    payload: { freshDeniedRoom?: unknown } | null,
+  ): Promise<void> {
+    if (payload?.freshDeniedRoom !== true) {
+      this.logChatEvent("room.fresh_cleanup_payload_invalid", {}, "error");
+      return;
+    }
+    await this.ctx.blockConcurrencyWhile(async () => {
+      if (!this.isProvisionalRoom() || this.roomHadExistingData()) {
+        this.freshRoomDestroyQueued = false;
+        return;
+      }
+      const memberCount = this.sql<{ count: number }>`SELECT COUNT(*) AS count FROM glide_room_members`[0]?.count ?? 0;
+      if (memberCount !== 0) {
+        this.freshRoomDestroyQueued = false;
+        return;
+      }
+      await this.ctx.storage.deleteAll();
+      setTimeout(() => this.ctx.abort("fresh denied room destroyed"), 0);
+    });
+  }
+
+  private async finalizeRoomAuthorization(
+    authorization: RoomAuthorizationResult,
+  ): Promise<RoomAuthorizationResult> {
+    if (!authorization.allowed) await this.queueFreshDeniedRoomDestroy();
+    return authorization;
+  }
+
+  async authorizeRoomAccess(identity: AccessIdentity): Promise<RoomAuthorizationResult> {
+    return this.finalizeRoomAuthorization(this.evaluateRoomAuthorization(identity));
+  }
+
+  async activateRoomAccess(
+    identity: AccessIdentity,
+    canonicalRoomId: boolean,
+    attemptId?: string,
+  ): Promise<RoomAuthorizationResult> {
+    // Activation must evaluate without cleanup: a valid first employee may turn
+    // this same freshly-created instance into a durable room below.
+    const authorized = this.evaluateRoomAuthorization(identity);
+    if (authorized.allowed) return this.replayedRoomActivation(attemptId, authorized) ?? authorized;
+
+    const email = canonicalizeEmail(identity?.email);
+    const subject = typeof identity?.subject === "string" ? identity.subject.trim() : "";
+    const expiresAt = identity?.expiresAt;
+    if (
+      !email ||
+      !subject ||
+      subject.length > 512 ||
+      !Number.isSafeInteger(expiresAt) ||
+      expiresAt <= Math.floor(Date.now() / 1_000)
+    ) return this.finalizeRoomAuthorization(authorized);
+
+    const hadExistingData = this.roomHadExistingData();
+    if (!canonicalRoomId && !hadExistingData) {
+      return this.finalizeRoomAuthorization({
+        allowed: false,
+        code: "legacy_room_not_found",
+        message: "That legacy room does not exist. Create a room with a URL-safe room id.",
+      });
+    }
+
+    const activation = this.durableStorage.transactionSync(() => {
+      const member = this.sql<{ role: RoomMember["role"] }>`SELECT role FROM glide_room_members
+        WHERE email = ${email} LIMIT 1`[0];
+      if (member) {
+        this.sql`DELETE FROM glide_room_lifecycle WHERE id = ${"provisional"}`;
+        return { role: member.role, inserted: false };
+      }
+      const count = this.sql<{ count: number }>`SELECT COUNT(*) AS count FROM glide_room_members`[0]?.count ?? 0;
+      if (count !== 0 || !isCloudflareEmployeeEmail(email)) return undefined;
+
+      const now = Date.now();
+      this.sql`INSERT INTO glide_room_members (email, role, invited_by, joined_at)
+        VALUES (${email}, ${"owner"}, ${null}, ${now})`;
+      this.sql`DELETE FROM glide_room_lifecycle WHERE id = ${"provisional"}`;
+      if (hadExistingData) this.persistLegacyInvitationAudit();
+      if (attemptId) {
+        this.sql`INSERT OR REPLACE INTO glide_room_activations (id, email, entry, activated_at)
+          VALUES (${attemptId}, ${email}, ${hadExistingData ? "claimed" : "created"}, ${now})`;
+      }
+      return { role: "owner" as const, inserted: true };
+    });
+
+    if (!activation) {
+      return this.finalizeRoomAuthorization({
+        allowed: false,
+        code: "room_membership_required",
+        message: "This room is private. Ask a room member to invite your verified email address.",
+      });
+    }
+    if (!activation.inserted) return this.evaluateRoomAuthorization(identity);
+
+    const entry = hadExistingData ? "claimed" : "created";
+    return {
+      allowed: true,
+      code: hadExistingData ? "room_claimed" : "room_created",
+      message: hadExistingData
+        ? "This legacy room is now protected by verified membership."
+        : "Private room created.",
+      access: {
+        email,
+        isEmployee: true,
+        role: activation.role,
+        members: this.roomMembers(),
+        entry,
+      },
+    };
+  }
+
+  @callable()
+  async roomAccessStatus(): Promise<RoomAccessStatus> {
+    const { connection } = getCurrentAgent<GlideAgent>();
+    const identity = this.connectionIdentity(connection);
+    if (!identity || this.isAccessIdentityExpired(identity) || !this.isRoomMember(identity.email)) {
+      throw new Error("Room membership is no longer active. Reconnect through Cloudflare Access.");
+    }
+    const role = this.sql<{ role: RoomMember["role"] }>`SELECT role FROM glide_room_members
+      WHERE email = ${identity.email} LIMIT 1`[0]!.role;
+    return {
+      email: identity.email,
+      isEmployee: isCloudflareEmployeeEmail(identity.email),
+      role,
+      members: this.roomMembers(),
+      entry: "member",
+    };
+  }
+
+  private roomAccessDeniedResponse(): Response {
+    return Response.json(
+      {
+        code: "room_membership_required",
+        message: "This room is private. Ask a room member to invite your verified email address.",
+      },
+      { status: 403, headers: { "Cache-Control": "no-store" } },
+    );
+  }
+
+  private verifiedActor(value: unknown, fallback = "a teammate"): string {
+    return this.currentRoomAccessLease()?.email ?? normalizeActor(value, fallback);
+  }
+
+  private roomAccessLeaseForConnection(connection: Connection | undefined): RoomAccessLease | undefined {
+    if (!connection) return undefined;
+    const identity = this.connectionIdentity(connection);
+    const leaseId = (connection.state as GlideConnectionState | null)?.glideAccessLeaseId;
+    if (
+      !identity ||
+      typeof leaseId !== "string" ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(leaseId)
+    ) {
+      return undefined;
+    }
+    return {
+      connectionId: connection.id,
+      leaseId,
+      email: identity.email,
+      expiresAt: identity.expiresAt,
+    };
+  }
+
+  private currentRoomAccessLease(): RoomAccessLease | undefined {
+    const { connection } = getCurrentAgent<GlideAgent>();
+    if (!connection) return undefined;
+    const lease = this.roomAccessLeaseForConnection(connection);
+    if (
+      !lease ||
+      lease.expiresAt <= Math.floor(Date.now() / 1_000) ||
+      !this.isRoomMember(lease.email)
+    ) {
+      throw new Error("Room membership is no longer active. Reconnect through Cloudflare Access.");
+    }
+    return lease;
+  }
+
+  private currentChatRoomAccessLease(): RoomAccessLease | undefined {
+    const { connection } = getCurrentAgent<GlideAgent>();
+    return connection ? this.currentRoomAccessLease() : roomAccessProgrammaticTurn.getStore();
+  }
+
+  private isRoomAccessLeaseCurrent(lease: RoomAccessLease | undefined): boolean {
+    if (!lease) return true;
+    for (const connection of this.getConnections(lease.connectionId)) {
+      const identity = this.connectionIdentity(connection);
+      const leaseId = (connection.state as GlideConnectionState | null)?.glideAccessLeaseId;
+      if (
+        leaseId === lease.leaseId &&
+        identity &&
+        identity.email === lease.email &&
+        identity.expiresAt === lease.expiresAt &&
+        !this.isAccessIdentityExpired(identity) &&
+        this.isRoomMember(identity.email)
+      ) return true;
+    }
+    return false;
+  }
+
+  private registerRoomAccessAborter(
+    lease: RoomAccessLease,
+    abort: (reason: Error) => void,
+  ): () => void {
+    let byLease = this.roomAccessAborters.get(lease.connectionId);
+    if (!byLease) {
+      byLease = new Map();
+      this.roomAccessAborters.set(lease.connectionId, byLease);
+    }
+    let aborters = byLease.get(lease.leaseId);
+    if (!aborters) {
+      aborters = new Set();
+      byLease.set(lease.leaseId, aborters);
+    }
+    aborters.add(abort);
+    if (!this.isRoomAccessLeaseCurrent(lease)) {
+      abort(new Error("Room access ended before the operation started."));
+    }
+    return () => {
+      aborters!.delete(abort);
+      if (aborters!.size === 0) byLease!.delete(lease.leaseId);
+      if (byLease!.size === 0) this.roomAccessAborters.delete(lease.connectionId);
+    };
+  }
+
+  private abortRoomAccessOperations(lease: RoomAccessLease, reason: Error): void {
+    const aborters = this.roomAccessAborters.get(lease.connectionId)?.get(lease.leaseId);
+    if (!aborters) return;
+    for (const abort of [...aborters]) abort(reason);
+  }
+
+  private abortRoomAccessOperationsForConnection(connectionId: string, reason: Error): void {
+    const byLease = this.roomAccessAborters.get(connectionId);
+    if (!byLease) return;
+    for (const aborters of byLease.values()) {
+      for (const abort of [...aborters]) abort(reason);
+    }
+  }
+
+  private isChatTurnAccessCurrent(turn: ChatTurnContext): boolean {
+    return !turn.abortSignal?.aborted && this.isRoomAccessLeaseCurrent(turn.accessLease);
+  }
+
+  private chatTurnAccessError(): string {
+    return "Error: room access ended before this chat operation completed.";
+  }
+
+  private checkRateLimit(limiter: RateLimiter, key: string): Promise<RateLimitDecision> {
+    return consumeRateLimit(limiter, key);
+  }
+
+  private async connectionRateLimitKey(connection: Connection): Promise<string> {
+    const state = connection.state as GlideConnectionState | null;
+    const key = state?.glideClientRateLimitKey;
+    return typeof key === "string" && key.length <= 128
+      ? key
+      : opaqueRateLimitKey("client", "unidentified");
+  }
+
+  private async admitProtocolMessage(connection: Connection): Promise<boolean> {
+    if (!this.enforceCurrentConnectionAccess(connection)) return false;
+    const decision = await this.checkRateLimit(
+      this.env.AGENT_RATE_LIMITER,
+      `protocol:${await this.connectionRateLimitKey(connection)}`,
+    );
+    if (decision === "allowed") return this.enforceCurrentConnectionAccess(connection);
+    this.logChatEvent(
+      decision === "limited" ? "rate_limit.exceeded" : "rate_limit.unavailable",
+      { scope: "agent_protocol" },
+      decision === "limited" ? "warn" : "error",
+    );
+    try {
+      connection.close(
+        1013,
+        decision === "limited" ? "Rate limit exceeded; retry later" : "Rate limiter unavailable; retry later",
+      );
+    } catch {
+      /* The connection already closed. */
+    }
+    return false;
+  }
+
+  private enforceCurrentConnectionAccess(connection: Connection): boolean {
+    const identity = this.connectionIdentity(connection);
+    if (identity && !this.isAccessIdentityExpired(identity) && this.isRoomMember(identity.email)) {
+      return true;
+    }
+    this.logChatEvent("room.access_revoked", {}, "warn");
+    try {
+      connection.close(1008, "Room membership or Access session expired");
+    } catch {
+      /* The connection already closed. */
+    }
+    return false;
+  }
+
+  private async chatRateLimit(
+    connection: Connection,
+  ): Promise<{ decision: RateLimitDecision; scope: "chat_client" | "chat_room" }> {
+    const clientDecision = await this.checkRateLimit(
+      this.env.CHAT_RATE_LIMITER,
+      `chat-client:${await this.connectionRateLimitKey(connection)}`,
+    );
+    if (clientDecision !== "allowed") return { decision: clientDecision, scope: "chat_client" };
+
+    const roomKey = await opaqueRateLimitKey("room", this.name);
+    const roomDecision = await this.checkRateLimit(this.env.CHAT_RATE_LIMITER, `chat-room:${roomKey}`);
+    return { decision: roomDecision, scope: "chat_room" };
+  }
+
+  private async expensiveOperationRateLimit(): Promise<string | undefined> {
+    const { connection } = getCurrentAgent<GlideAgent>();
+    if (!connection) return undefined;
+    const result = await this.chatRateLimit(connection);
+    if (!this.enforceCurrentConnectionAccess(connection)) {
+      return "Room membership is no longer active. Reconnect through Cloudflare Access.";
+    }
+    if (result.decision === "allowed") return undefined;
+    this.logChatEvent(
+      result.decision === "limited" ? "rate_limit.exceeded" : "rate_limit.unavailable",
+      { scope: result.scope },
+      result.decision === "limited" ? "warn" : "error",
+    );
+    return result.decision === "limited"
+      ? "Too many expensive room operations were requested. Wait about a minute and try again."
+      : "Glide's abuse protection is temporarily unavailable. Retry shortly.";
+  }
+
+  private rejectRateLimitedChat(
+    connection: Connection,
+    requestId: string,
+    rateLimit: { decision: RateLimitDecision; scope: "chat_client" | "chat_room" },
+  ): void {
+    if (rateLimit.decision === "allowed") return;
+    const reason = rateLimit.decision === "limited"
+      ? "Too many chat messages were sent. Wait about a minute and try again."
+      : "Glide's chat abuse protection is temporarily unavailable. Retry shortly.";
+    this.sendChatRequestError(connection, requestId, reason);
+    this.logChatEvent(
+      rateLimit.decision === "limited" ? "rate_limit.exceeded" : "rate_limit.unavailable",
+      { scope: rateLimit.scope, requestId },
+      rateLimit.decision === "limited" ? "warn" : "error",
+    );
   }
 
   private hideUnregisteredAssistantMessages(): void {
@@ -1671,6 +2633,16 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
   async discardLegacyChatArchiveForRecovery(
     confirmation: string,
   ): Promise<{ ok: boolean; message: string }> {
+    return this.discardLegacyChatArchiveForRecoveryInternal(
+      confirmation,
+      this.currentRoomAccessLease(),
+    );
+  }
+
+  private async discardLegacyChatArchiveForRecoveryInternal(
+    confirmation: string,
+    accessLease?: RoomAccessLease,
+  ): Promise<{ ok: boolean; message: string }> {
     if (
       typeof confirmation !== "string" ||
       confirmation.length !== LEGACY_CHAT_RECOVERY_CONFIRMATION.length ||
@@ -1683,9 +2655,14 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     }
     const encryptedTokenStored = this.sql<{ value: string }>`SELECT value FROM glide_secrets
       WHERE name = ${TOKEN_SECRET_NAME}`[0]?.value;
-    if (!encryptedTokenStored || await this.getToken()) {
+    if (!encryptedTokenStored) {
       return { ok: false, message: "The stored token is no longer in the unrecoverable state." };
     }
+    const token = await this.getToken();
+    if (!this.isRoomAccessLeaseCurrent(accessLease)) {
+      return { ok: false, message: "Room access ended before archive deletion could be authorized." };
+    }
+    if (token) return { ok: false, message: "The stored token is no longer in the unrecoverable state." };
     const armed = this.durableStorage.transactionSync(() => {
       const eligible = this.sql<{ eligible: number }>`SELECT 1 AS eligible
         FROM glide_chat_migration_progress AS progress
@@ -1747,24 +2724,27 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     }
   }
 
+  private sendChatRequestError(connection: Connection, requestId: string | undefined, reason: string): void {
+    if (!requestId) return;
+    try {
+      connection.send(JSON.stringify({
+        body: reason,
+        done: true,
+        error: true,
+        id: requestId,
+        type: MessageType.CF_AGENT_USE_CHAT_RESPONSE,
+      }));
+    } catch {
+      /* The client disconnected before it could receive the bounded rejection. */
+    }
+  }
+
   private rejectClientTranscript(
     connection: Connection,
     requestId?: string,
     reason = "Client transcript updates are not allowed.",
   ): void {
-    try {
-      if (requestId) {
-        connection.send(JSON.stringify({
-          body: reason,
-          done: true,
-          error: true,
-          id: requestId,
-          type: MessageType.CF_AGENT_USE_CHAT_RESPONSE,
-        }));
-      }
-    } catch {
-      /* The client disconnected before it could receive the bounded rejection. */
-    }
+    this.sendChatRequestError(connection, requestId, reason);
     this.logChatEvent("chat.client_transcript_rejected", { requestId: requestId ?? "none" }, "warn");
   }
 
@@ -2033,6 +3013,9 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
       text TEXT NOT NULL,
       ts   INTEGER
     )`;
+    if ((this.sql<{ count: number }>`SELECT COUNT(*) AS count FROM glide_room_members`[0]?.count ?? 0) > 0) {
+      this.publishInvitationAudit();
+    }
     initializeAcceptedChatMessageLedger(this.storageSql);
     this.sql`CREATE TABLE IF NOT EXISTS glide_assistant_events (
       id          TEXT PRIMARY KEY,
@@ -2363,7 +3346,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
 
   @callable()
   async startOnboarding(by = "someone"): Promise<{ ok: true }> {
-    this.applyOnboardingPatch({}, normalizeActor(by));
+    this.applyOnboardingPatch({}, this.verifiedActor(by));
     return { ok: true };
   }
 
@@ -2385,13 +3368,13 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
   ): Promise<{ ok: boolean; message?: string }> {
     const parsed = validateOnboardingPatch(patch);
     if (!parsed.ok) return { ok: false, message: parsed.message };
-    this.applyOnboardingPatch(parsed.value, normalizeActor(by));
+    this.applyOnboardingPatch(parsed.value, this.verifiedActor(by));
     return { ok: true };
   }
 
   @callable()
   async completeOnboarding(by = "someone"): Promise<{ ok: true }> {
-    this.applyOnboardingPatch({ completed: true }, normalizeActor(by));
+    this.applyOnboardingPatch({ completed: true }, this.verifiedActor(by));
     return { ok: true };
   }
 
@@ -2478,7 +3461,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
   ): Promise<{ ok: boolean; message?: string }> {
     const parsed = validateBusinessProfilePatch(patch);
     if (!parsed.ok) return { ok: false, message: parsed.message };
-    this.applyBusinessProfilePatch(parsed.value, normalizeActor(by));
+    this.applyBusinessProfilePatch(parsed.value, this.verifiedActor(by));
     return { ok: true };
   }
 
@@ -2515,7 +3498,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     zoneId: string,
     by = "someone",
   ): Promise<{ ok: boolean; message: string; id?: string }> {
-    const actor = normalizeActor(by);
+    const actor = this.verifiedActor(by);
     if (typeof zoneId !== "string" || !/^[0-9a-f]{32}$/i.test(zoneId.trim())) {
       return { ok: false, message: "A valid target zone id is required first — ask Glide to find your zone." };
     }
@@ -2554,7 +3537,8 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     },
     by = "someone",
   ): Promise<{ ok: boolean; message: string; totalRules?: number; phases?: Array<{ key: string; label: string; count: number }> }> {
-    const actor = normalizeActor(by);
+    const accessLease = this.currentRoomAccessLease();
+    const actor = accessLease?.email ?? normalizeActor(by, "a teammate");
     if (!args || typeof args !== "object" || Array.isArray(args)) {
       return { ok: false, message: "Migration preview input must be an object." };
     }
@@ -2564,8 +3548,19 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
       return { ok: false, message: this.notConfigured() };
     }
     const resolved = await this.resolveConfigData(args);
+    if (!this.isRoomAccessLeaseCurrent(accessLease)) {
+      return { ok: false, message: "Room access ended before the migration preview completed." };
+    }
     if (!resolved.ok) return { ok: false, message: resolved.message };
-    const res = await this.runPreview(provider, resolved.data, actor);
+    const res = await this.runPreview(
+      provider,
+      resolved.data,
+      actor,
+      () => this.isRoomAccessLeaseCurrent(accessLease),
+    );
+    if (!this.isRoomAccessLeaseCurrent(accessLease)) {
+      return { ok: false, message: "Room access ended before the migration preview completed." };
+    }
     if (!res.ok) return { ok: false, message: res.message };
     this.applyOnboardingPatch({ configProvided: true, migratingFrom: provider, checkOff: ["preview"] }, actor);
     const retained = res.plan.truncated
@@ -2589,7 +3584,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     const checklist = ob.checklist.map((s) => (s.id === id ? { ...s, done } : s));
     this.setState({
       ...this.state,
-      onboarding: { ...ob, checklist, updatedBy: normalizeActor(by), ts: Date.now() },
+      onboarding: { ...ob, checklist, updatedBy: this.verifiedActor(by), ts: Date.now() },
     });
     return { ok: true };
   }
@@ -2597,19 +3592,29 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
   /** UI: pre-flight permission check for the room's migration plan. */
   @callable()
   async runPreflight(zoneId: string | undefined, by = "someone"): Promise<{ ok: boolean; summary: string }> {
+    const accessLease = this.currentRoomAccessLease();
     if (zoneId !== undefined && (typeof zoneId !== "string" || !/^[a-f0-9]{32}$/i.test(zoneId))) {
       return { ok: false, summary: "The zone id is invalid." };
     }
-    return this.doPreflight(zoneId, normalizeActor(by));
+    return this.doPreflight(
+      zoneId,
+      accessLease?.email ?? normalizeActor(by, "a teammate"),
+      () => this.isRoomAccessLeaseCurrent(accessLease),
+    );
   }
 
   /** UI: pre-migration diff (what already exists in the target zone). */
   @callable()
   async runDiffReport(zoneId: string | undefined, by = "someone"): Promise<{ ok: boolean; summary: string }> {
+    const accessLease = this.currentRoomAccessLease();
     if (zoneId !== undefined && (typeof zoneId !== "string" || !/^[a-f0-9]{32}$/i.test(zoneId))) {
       return { ok: false, summary: "The zone id is invalid." };
     }
-    return this.doDiff(zoneId, normalizeActor(by));
+    return this.doDiff(
+      zoneId,
+      accessLease?.email ?? normalizeActor(by, "a teammate"),
+      () => this.isRoomAccessLeaseCurrent(accessLease),
+    );
   }
 
   /** Disabled compatibility RPC retained for older clients. */
@@ -2623,7 +3628,12 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
   /** UI: export the migration plan's config as CSV. */
   @callable()
   async exportMigrationCsv(by = "someone"): Promise<{ ok: boolean; message: string }> {
-    return this.doExportCsv({}, normalizeActor(by));
+    const accessLease = this.currentRoomAccessLease();
+    return this.doExportCsv(
+      {},
+      accessLease?.email ?? normalizeActor(by, "a teammate"),
+      () => this.isRoomAccessLeaseCurrent(accessLease),
+    );
   }
 
   /** Disabled compatibility RPC retained for older clients. */
@@ -2719,6 +3729,13 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
 
   @callable()
   async setCloudflareToken(rawToken: string): Promise<{ ok: boolean; message: string }> {
+    return this.setCloudflareTokenInternal(rawToken, this.currentRoomAccessLease());
+  }
+
+  private async setCloudflareTokenInternal(
+    rawToken: string,
+    accessLease?: RoomAccessLease,
+  ): Promise<{ ok: boolean; message: string }> {
     if (typeof rawToken !== "string" || rawToken.length > 512) {
       return { ok: false, message: "Token must be text no longer than 512 characters." };
     }
@@ -2740,6 +3757,9 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
         };
       }
     }
+    if (!this.isRoomAccessLeaseCurrent(accessLease)) {
+      return { ok: false, message: "Room access ended before the token could be saved." };
+    }
 
     const previousSecret = this.sql<{ value: string; ts: number }>`
       SELECT value, ts FROM glide_secrets WHERE name = ${TOKEN_SECRET_NAME}`[0];
@@ -2751,6 +3771,13 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
       // retry if all verification reads fail transiently for an otherwise-valid token.
       const verify = await verifyToken(token);
       const packed = await encryptSecret(this.env.GLIDE_TOKEN_KEY, token);
+      if (!this.isRoomAccessLeaseCurrent(accessLease)) {
+        if (generation === this.credentialGeneration) {
+          const readyGeneration = ++this.credentialGeneration;
+          this.credentialReadyGeneration = readyGeneration;
+        }
+        return { ok: false, message: "Room access ended before the token could be saved." };
+      }
       if (generation !== this.credentialGeneration) {
         return { ok: false, message: "A newer token change replaced this request; the older token was not saved." };
       }
@@ -2799,6 +3826,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
 
   @callable()
   async clearCloudflareToken(): Promise<{ ok: boolean; message?: string }> {
+    const accessLease = this.currentRoomAccessLease();
     if (!this.assistantProvenanceReady) {
       await this.attemptLegacyChatMigration(true);
       if (!this.assistantProvenanceReady) {
@@ -2807,6 +3835,9 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
           message: "Chat history is still being migrated. Wait for it to finish before clearing the room token.",
         };
       }
+    }
+    if (!this.isRoomAccessLeaseCurrent(accessLease)) {
+      return { ok: false, message: "Room access ended before the token could be cleared." };
     }
     const previousSecret = this.sql<{ value: string; ts: number }>`
       SELECT value, ts FROM glide_secrets WHERE name = ${TOKEN_SECRET_NAME}`[0];
@@ -2848,7 +3879,11 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
    */
   @callable()
   async reverifyToken(): Promise<{ ok: boolean; valid: boolean; message: string }> {
+    const accessLease = this.currentRoomAccessLease();
     const credential = await this.getCredentialLease();
+    if (!this.isRoomAccessLeaseCurrent(accessLease)) {
+      return { ok: false, valid: false, message: "Room access ended before token verification completed." };
+    }
     if (credential === undefined) {
       return { ok: false, valid: false, message: "A newer token change replaced this verification request." };
     }
@@ -2864,6 +3899,9 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
       return { ok: false, valid: false, message: "No Cloudflare API token is configured." };
     }
     const verify = await verifyToken(credential.token);
+    if (!this.isRoomAccessLeaseCurrent(accessLease)) {
+      return { ok: false, valid: false, message: "Room access ended before token verification completed." };
+    }
     if (!this.isCredentialLeaseCurrent(credential)) {
       return { ok: false, valid: false, message: "A newer token change replaced this verification request." };
     }
@@ -2915,6 +3953,20 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     messageId: string,
     interruptedAssistantId?: string,
   ): Promise<{ ok: boolean; message: string }> {
+    const accessLease = this.currentRoomAccessLease();
+    const rateLimitMessage = await this.expensiveOperationRateLimit();
+    if (rateLimitMessage) return { ok: false, message: rateLimitMessage };
+    if (!this.isRoomAccessLeaseCurrent(accessLease)) {
+      return { ok: false, message: "Room access ended before the retry started." };
+    }
+    return this.retryInterruptedResponseInternal(messageId, interruptedAssistantId, accessLease);
+  }
+
+  private async retryInterruptedResponseInternal(
+    messageId: string,
+    interruptedAssistantId: string | undefined,
+    accessLease?: RoomAccessLease,
+  ): Promise<{ ok: boolean; message: string }> {
     const parsedId = validateIdentifier(messageId, "Message id", 200);
     if (!parsedId.ok) return { ok: false, message: parsedId.message };
     const parsedAssistantId = interruptedAssistantId === undefined
@@ -2928,14 +3980,31 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
       return { ok: false, message: "That interrupted response is not registered to the requested user turn." };
     }
     const conversationChanged = new Error("conversation changed before retry");
+    const accessEnded = new Error("room access ended before retry");
+    const controller = new AbortController();
+    const releaseAccessAborter = accessLease
+      ? this.registerRoomAccessAborter(accessLease, (reason) => controller.abort(reason))
+      : () => {};
     try {
-      const result = await this.saveMessages((messages) => {
-        const assistantId = parsedAssistantId?.ok ? parsedAssistantId.value : undefined;
-        if (!isAuthoritativeRetryTarget(messages, parsedId.value, assistantId)) {
-          throw conversationChanged;
-        }
-        return assistantId ? messages.slice(0, -1) : [...messages];
-      });
+      const save = () => this.saveMessages(
+        (messages) => {
+          if (!this.isRoomAccessLeaseCurrent(accessLease) || controller.signal.aborted) {
+            throw accessEnded;
+          }
+          const assistantId = parsedAssistantId?.ok ? parsedAssistantId.value : undefined;
+          if (!isAuthoritativeRetryTarget(messages, parsedId.value, assistantId)) {
+            throw conversationChanged;
+          }
+          return assistantId ? messages.slice(0, -1) : [...messages];
+        },
+        { signal: controller.signal },
+      );
+      const result = accessLease
+        ? await roomAccessProgrammaticTurn.run(accessLease, save)
+        : await save();
+      if (!this.isRoomAccessLeaseCurrent(accessLease) || controller.signal.aborted) {
+        return { ok: false, message: "Room access ended before the retry completed." };
+      }
       if (result.status !== "completed") {
         const target = interruptedRetryTarget(this.messages);
         return {
@@ -2950,10 +4019,15 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
       }
       return { ok: true, message: "Glide retried the unanswered turn from server history." };
     } catch (error) {
+      if (error === accessEnded || controller.signal.aborted || !this.isRoomAccessLeaseCurrent(accessLease)) {
+        return { ok: false, message: "Room access ended before the retry completed." };
+      }
       if (error === conversationChanged) {
         return { ok: false, message: "That message is no longer the latest unanswered turn. Reload the latest history." };
       }
       return { ok: false, message: "Glide could not start the retried response. Try again after the room is stable." };
+    } finally {
+      releaseAccessAborter();
     }
   }
 
@@ -2964,11 +4038,11 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
   @callable()
   async inviteTeammate(
     email: string,
-    by = "someone",
+    _by = "someone",
     link?: string,
-  ): Promise<{ ok: boolean; message: string }> {
-    const e = typeof email === "string" ? email.trim().toLowerCase() : "";
-    if (e.length > 254 || !EMAIL_RE.test(e)) {
+  ): Promise<{ ok: boolean; message: string; members?: RoomMember[] }> {
+    const e = canonicalizeEmail(email);
+    if (!e) {
       return { ok: false, message: `"${email}" doesn't look like a valid email address.` };
     }
     let safeLink: string | undefined;
@@ -2984,13 +4058,112 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
         return { ok: false, message: "Invite link is invalid." };
       }
     }
-    const actor = normalizeActor(by);
-    const already = this.state.invites.some((i) => i.email === e);
-    if (!already) {
-      const invite: Invite = { email: e, invitedBy: actor, link: safeLink, ts: Date.now() };
-      this.setState({ ...this.state, invites: [invite, ...this.state.invites].slice(0, 100) });
+    const { connection } = getCurrentAgent<GlideAgent>();
+    const identity = this.connectionIdentity(connection);
+    if (!identity || this.isAccessIdentityExpired(identity) || !this.isRoomMember(identity.email)) {
+      return { ok: false, message: "Only current room members can invite someone." };
     }
-    return { ok: true, message: already ? `${e} was already invited.` : `Invited ${e}.` };
+    const actor = identity.email;
+    const memberCount = this.sql<{ count: number }>`SELECT COUNT(*) AS count FROM glide_room_members`[0]?.count ?? 0;
+    const existingMember = this.isRoomMember(e);
+    if (!existingMember && memberCount >= MAX_ROOM_MEMBERS) {
+      return { ok: false, message: `This room already has the maximum of ${MAX_ROOM_MEMBERS} members.` };
+    }
+    if (existingMember) {
+      return { ok: true, message: `${e} is already a room member.`, members: this.roomMembers() };
+    }
+
+    const now = Date.now();
+    const invite: Invite = { email: e, invitedBy: actor, link: safeLink, ts: now };
+    const nextInvites = [
+      invite,
+      ...this.roomInvitationAudit().filter((candidate) => canonicalizeEmail(candidate.email) !== e),
+    ].slice(0, MAX_ROOM_MEMBERS);
+    const nextState = {
+      ...this.state,
+      invites: nextInvites,
+    };
+    const stateError = syncedStateSizeError(nextState);
+    if (stateError && !isSafeSyncedStateTransition(this.state, nextState)) {
+      return { ok: false, message: stateError };
+    }
+    try {
+      this.durableStorage.transactionSync(() => {
+        this.sql`INSERT INTO glide_room_members (email, role, invited_by, joined_at)
+          VALUES (${e}, ${"member"}, ${actor}, ${now})`;
+        this.sql`INSERT OR REPLACE INTO glide_room_invites (email, invited_by, link, invited_at)
+          VALUES (${e}, ${actor}, ${safeLink ?? null}, ${now})`;
+      });
+    } catch {
+      this.logChatEvent("room.invite_failed", {}, "error");
+      return { ok: false, message: "Glide could not grant that room membership. Try again." };
+    }
+    this.publishInvitationAudit(nextInvites);
+    return {
+      ok: true,
+      message: `Invited ${e}.`,
+      members: this.roomMembers(),
+    };
+  }
+
+  @callable()
+  async removeRoomMember(
+    email: string,
+  ): Promise<{ ok: boolean; message: string; members?: RoomMember[] }> {
+    const targetEmail = canonicalizeEmail(email);
+    if (!targetEmail) return { ok: false, message: "Provide a valid member email address." };
+
+    const { connection } = getCurrentAgent<GlideAgent>();
+    const identity = this.connectionIdentity(connection);
+    if (!identity || this.isAccessIdentityExpired(identity) || !this.isRoomMember(identity.email)) {
+      return { ok: false, message: "A current room owner session is required to remove a member." };
+    }
+    const actor = this.sql<{ role: RoomMember["role"] }>`SELECT role FROM glide_room_members
+      WHERE email = ${identity.email} LIMIT 1`[0];
+    if (actor?.role !== "owner") {
+      return { ok: false, message: "Only the room owner can remove a member." };
+    }
+    const target = this.sql<{ role: RoomMember["role"] }>`SELECT role FROM glide_room_members
+      WHERE email = ${targetEmail} LIMIT 1`[0];
+    if (!target) return { ok: false, message: `${targetEmail} is not a room member.` };
+    if (target.role === "owner") {
+      return { ok: false, message: "The room owner cannot be removed." };
+    }
+
+    const nextInvites = this.roomInvitationAudit().filter(
+      (candidate) => canonicalizeEmail(candidate.email) !== targetEmail,
+    );
+    try {
+      this.durableStorage.transactionSync(() => {
+        this.sql`DELETE FROM glide_room_members WHERE email = ${targetEmail}`;
+        this.sql`DELETE FROM glide_room_invites WHERE email = ${targetEmail}`;
+      });
+    } catch {
+      this.logChatEvent("room.member_removal_failed", {}, "error");
+      return { ok: false, message: "Glide could not remove that room member. Try again." };
+    }
+    this.publishInvitationAudit(nextInvites);
+
+    for (const activeConnection of this.getConnections()) {
+      if (this.connectionIdentity(activeConnection)?.email !== targetEmail) continue;
+      const accessLease = this.roomAccessLeaseForConnection(activeConnection);
+      if (accessLease) {
+        this.abortRoomAccessOperations(
+          accessLease,
+          new Error("Room membership was revoked."),
+        );
+      }
+      try {
+        activeConnection.close(1008, "Room membership revoked");
+      } catch {
+        /* The removed member's connection already closed. */
+      }
+    }
+    return {
+      ok: true,
+      message: `Removed ${targetEmail} from this room.`,
+      members: this.roomMembers(),
+    };
   }
 
   // ---------------------------------------------------------------------------
@@ -3008,6 +4181,8 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     input: { id?: string; title?: string; body?: string; enabled?: boolean },
     by = "an admin",
   ): Promise<{ ok: boolean; message: string; id?: string }> {
+    const rateLimitMessage = await this.expensiveOperationRateLimit();
+    if (rateLimitMessage) return { ok: false, message: rateLimitMessage };
     if (!input || typeof input !== "object" || Array.isArray(input)) {
       return { ok: false, message: "Guidance input must be an object." };
     }
@@ -3045,7 +4220,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
       title: title || "(untitled)",
       body,
       enabled: input?.enabled ?? true,
-      updatedBy: normalizeActor(by, "an admin"),
+      updatedBy: this.verifiedActor(by, "an admin"),
       ts: Date.now(),
     };
     const guidance = exists ? list.map((d) => (d.id === id ? doc : d)) : [...list, doc];
@@ -3059,6 +4234,8 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
   /** Delete an admin guidance doc by id. */
   @callable()
   async deleteGuidanceDoc(id: string): Promise<{ ok: boolean; message?: string }> {
+    const rateLimitMessage = await this.expensiveOperationRateLimit();
+    if (rateLimitMessage) return { ok: false, message: rateLimitMessage };
     if (typeof id !== "string" || !/^[a-zA-Z0-9._-]{1,200}$/.test(id)) {
       return { ok: false, message: "Guidance id is invalid." };
     }
@@ -3075,6 +4252,8 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
    */
   @callable()
   async reindexGuidance(): Promise<{ ok: boolean; indexed: number; message: string }> {
+    const rateLimitMessage = await this.expensiveOperationRateLimit();
+    if (rateLimitMessage) return { ok: false, indexed: 0, message: rateLimitMessage };
     const docs = this.state.guidance ?? [];
     if (!hasVectorize(this.env)) {
       return { ok: false, indexed: 0, message: "Semantic search isn't configured for this deployment." };
@@ -3287,7 +4466,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     }
 
     const runId = `d-${crypto.randomUUID()}`;
-    const startedBy = normalizeActor(by, "the docs refresh");
+    const startedBy = this.verifiedActor(by, "the docs refresh");
     const startedAt = Date.now();
     try {
       this.setState({
@@ -3590,12 +4769,16 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
   // Chat brain
   // ---------------------------------------------------------------------------
 
+  private roomLogCorrelation(): string {
+    return this.ctx.id.toString();
+  }
+
   private logChatEvent(
     event: string,
     details: Record<string, string | number | boolean | undefined> = {},
     level: "info" | "warn" | "error" = "info",
   ): void {
-    const payload = { glideEvent: event, room: this.name, ...details };
+    const payload = { glideEvent: event, room: this.roomLogCorrelation(), ...details };
     if (level === "error") console.error(payload);
     else if (level === "warn") console.warn(payload);
     else console.log(payload);
@@ -3603,12 +4786,24 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
 
   async onChatMessage(
     onFinish: OnChatFinish,
-    options?: { abortSignal?: AbortSignal; body?: Record<string, unknown> },
+    options?: {
+      requestId?: string;
+      abortSignal?: AbortSignal;
+      body?: Record<string, unknown>;
+      continuation?: boolean;
+    },
   ): Promise<Response | undefined> {
+    const accessLease = this.currentChatRoomAccessLease();
+    if (accessLease && !this.isRoomAccessLeaseCurrent(accessLease)) {
+      throw new Error("Room access ended before the chat turn started.");
+    }
     const turn: ChatTurnContext = {
-      actor: this.resolveActor(options?.body),
+      actor: accessLease?.email ?? this.resolveServerActor(options?.body),
       queuedActions: [],
       queueNotices: [],
+      accessLease,
+      abortSignal: options?.abortSignal,
+      requestId: options?.requestId,
     };
 
     const turnId = crypto.randomUUID();
@@ -3636,6 +4831,9 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
       MAX_MODEL_CHAT_HISTORY_BYTES,
     );
     const messages = await convertToModelMessages(modelHistory.map((message) => this.messageForModel(message)));
+    if (!this.isChatTurnAccessCurrent(turn)) {
+      throw new Error("Room access ended while the chat turn was being prepared.");
+    }
 
     // Deterministically capture onboarding answers straight from the user's
     // latest message and fold them into the room's onboarding state BEFORE the
@@ -3698,6 +4896,9 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
       this.selectGuidanceForPrompt(messages),
       this.selectDocsForPrompt(messages),
     ]);
+    if (!this.isChatTurnAccessCurrent(turn)) {
+      throw new Error("Room access ended while the chat turn was being prepared.");
+    }
     this.logChatEvent("chat.prepared", {
       turnId,
       guidanceCount: guidanceForPrompt?.length ?? 0,
@@ -3714,6 +4915,12 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
       return input ? { ...toolCall, input } : null;
     };
     const abortSignal = options?.abortSignal;
+    const releaseAccessAborter = accessLease && options?.requestId
+      ? this.registerRoomAccessAborter(
+          accessLease,
+          (reason) => this.abortRequest(options.requestId!, reason),
+        )
+      : () => {};
 
     // Multi-pass response, emitted as ONE assistant message. Pass 1 runs the
     // tools; models sometimes mis-end the turn in two ways regardless of prompt
@@ -3773,7 +4980,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
             type: "finish",
             messageMetadata: {
               responseTo: responseToMessageId,
-              delivery: abortSignal?.aborted ? "interrupted" : "completed",
+              delivery: this.isChatTurnAccessCurrent(turn) ? "completed" : "interrupted",
             } satisfies GlideMessageMetadata,
           });
         };
@@ -3790,6 +4997,11 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
           appendText(this.authoritativeQueueNarration(prose, turn.queuedActions, turn.queueNotices));
           return true;
         };
+        if (!this.isChatTurnAccessCurrent(turn)) {
+          outcome = "aborted";
+          finishMessage();
+          return;
+        }
         stage = "model.initial";
         const first = streamText({
           model,
@@ -3829,6 +5041,11 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
           narrate: string,
           fallbackQuestion?: string,
         ): Promise<void> => {
+          if (!this.isChatTurnAccessCurrent(turn)) {
+            outcome = "aborted";
+            finishMessage();
+            return;
+          }
           stage = "model.narration";
           // Tools may have updated onboarding/defaults since `system` was built
           // (notably list_dns_records marks DNS review complete). Rebuild here so
@@ -3869,7 +5086,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
           finishMessage();
         };
 
-        if (abortSignal?.aborted) {
+        if (!this.isChatTurnAccessCurrent(turn)) {
           outcome = "aborted";
           if (!emitQueueNarration(firstChunks, "aborted initial chat response")) {
             writeChunks(firstChunks, false);
@@ -3965,7 +5182,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
             finishMessage();
             return;
           }
-          if (contProse.length === 0 && !abortSignal?.aborted) {
+          if (contProse.length === 0 && this.isChatTurnAccessCurrent(turn)) {
             writeChunks(contChunks);
             if (contNeedsDnsFollowUp) this.logChatEvent("chat.onboarding_nudge", { turnId, stage });
             await runNarration(
@@ -4065,6 +5282,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
             },
             outcome === "error" ? "error" : outcome === "aborted" ? "warn" : "info",
           );
+          releaseAccessAborter();
         }
       },
     });
@@ -4073,8 +5291,8 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     return createUIMessageStreamResponse({ stream });
   }
 
-  /** Prefer the name sent on the request body, then the latest user message's metadata. */
-  private resolveActor(body?: Record<string, unknown>): string {
+  /** Server-driven turns retain a bounded attribution fallback. */
+  private resolveServerActor(body?: Record<string, unknown>): string {
     const fromBody = normalizeActor(body?.name, "");
     if (fromBody) return fromBody;
 
@@ -4100,8 +5318,10 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
         inputSchema: z.object({}),
         execute: async () => {
           const credential = await this.getCredentialLease();
+          if (!this.isChatTurnAccessCurrent(turn)) return this.chatTurnAccessError();
           if (!credential) return `Error: ${this.credentialUnavailableMessage()}`;
           const res = await listAccounts(credential.token);
+          if (!this.isChatTurnAccessCurrent(turn)) return this.chatTurnAccessError();
           if (!this.isCredentialLeaseCurrent(credential)) return `Error: ${this.credentialSupersededMessage()}`;
           if (!res.ok) return this.readError(res, credential);
           this.noteTokenOutcome(res, credential);
@@ -4117,8 +5337,10 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
         }),
         execute: async ({ accountId }) => {
           const credential = await this.getCredentialLease();
+          if (!this.isChatTurnAccessCurrent(turn)) return this.chatTurnAccessError();
           if (!credential) return `Error: ${this.credentialUnavailableMessage()}`;
           const res = await listZones(credential.token, accountId);
+          if (!this.isChatTurnAccessCurrent(turn)) return this.chatTurnAccessError();
           if (!this.isCredentialLeaseCurrent(credential)) return `Error: ${this.credentialSupersededMessage()}`;
           if (!res.ok) return this.readError(res, credential);
           this.noteTokenOutcome(res, credential);
@@ -4137,8 +5359,10 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
           if (!domain) return `"${name}" doesn't look like a bare domain, e.g. "example.com".`;
           const defaultsRevision = this.migrationDefaultsRevision();
           const credential = await this.getCredentialLease();
+          if (!this.isChatTurnAccessCurrent(turn)) return this.chatTurnAccessError();
           if (!credential) return `Error: ${this.credentialUnavailableMessage()}`;
           const res = await findZoneByName(credential.token, domain);
+          if (!this.isChatTurnAccessCurrent(turn)) return this.chatTurnAccessError();
           if (!this.isCredentialLeaseCurrent(credential)) return `Error: ${this.credentialSupersededMessage()}`;
           if (!res.ok) return this.readError(res, credential);
           if (defaultsRevision !== this.migrationDefaultsRevision()) {
@@ -4166,11 +5390,13 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
         execute: async ({ zoneId, type }) => {
           const q = type ? `?type=${encodeURIComponent(type)}` : "";
           const credential = await this.getCredentialLease();
+          if (!this.isChatTurnAccessCurrent(turn)) return this.chatTurnAccessError();
           if (!credential) return `Error: ${this.credentialUnavailableMessage()}`;
           const res = await cfGetAll<Record<string, unknown>>(
             `/zones/${zoneId}/dns_records${q}`,
             credential.token,
           );
+          if (!this.isChatTurnAccessCurrent(turn)) return this.chatTurnAccessError();
           if (!this.isCredentialLeaseCurrent(credential)) return `Error: ${this.credentialSupersededMessage()}`;
           if (!res.ok) return this.readError(res, credential);
           this.noteTokenOutcome(res, credential);
@@ -4203,8 +5429,10 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
           const canonicalPath = canonicalizeApiPath(path.startsWith("/") ? path : `/${path}`);
           if (!canonicalPath) return "Error: Invalid Cloudflare API path.";
           const credential = await this.getCredentialLease();
+          if (!this.isChatTurnAccessCurrent(turn)) return this.chatTurnAccessError();
           if (!credential) return `Error: ${this.credentialUnavailableMessage()}`;
           const res = await cfGet(canonicalPath, credential.token);
+          if (!this.isChatTurnAccessCurrent(turn)) return this.chatTurnAccessError();
           if (!this.isCredentialLeaseCurrent(credential)) return `Error: ${this.credentialSupersededMessage()}`;
           if (!res.ok) return this.readError(res, credential);
           this.noteTokenOutcome(res, credential);
@@ -4243,8 +5471,10 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
           }
           if (zoneId && zoneName && accountId) {
             const credential = await this.getCredentialLease();
+            if (!this.isChatTurnAccessCurrent(turn)) return this.chatTurnAccessError();
             if (!credential) return `Defaults not changed: ${this.credentialUnavailableMessage()}`;
             const resolved = await cfGet<ZoneSummary>(`/zones/${zoneId}`, credential.token);
+            if (!this.isChatTurnAccessCurrent(turn)) return this.chatTurnAccessError();
             if (!this.isCredentialLeaseCurrent(credential)) {
               return `Defaults not changed: ${this.credentialSupersededMessage()}`;
             }
@@ -4281,16 +5511,6 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
         },
       }),
 
-      invite_teammate: tool({
-        description:
-          "Record an invite for someone by email so they show up in the room's invite list. Tell the user to share the room link (top-right) or use the Invite panel to email it.",
-        inputSchema: z.object({ email: z.string().max(254).describe("Email address to invite.") }),
-        execute: async ({ email }) => {
-          const res = await this.inviteTeammate(email, turn.actor);
-          return res.message;
-        },
-      }),
-
       // ---- WRITES — these only QUEUE a pending action ----------------------
       add_domain: tool({
         description:
@@ -4318,6 +5538,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
           const selectedZoneMatches =
             canonicalizeDomainName(selectedZone?.name ?? "") === domain;
           const credential = await this.getCredentialLease();
+          if (!this.isChatTurnAccessCurrent(turn)) return this.chatTurnAccessError();
           if (credential === undefined) {
             return `No action queued: ${this.credentialSupersededMessage()}`;
           }
@@ -4338,6 +5559,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
               `/zones/${encodeURIComponent(selectedZone.id)}`,
               token,
             );
+            if (!this.isChatTurnAccessCurrent(turn)) return this.chatTurnAccessError();
             if (!credential || !this.isCredentialLeaseCurrent(credential)) {
               return `No action queued: ${this.credentialSupersededMessage()}`;
             }
@@ -4389,6 +5611,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
               );
             }
             const res = await listAccounts(token);
+            if (!this.isChatTurnAccessCurrent(turn)) return this.chatTurnAccessError();
             if (!credential || !this.isCredentialLeaseCurrent(credential)) {
               return `No action queued: ${this.credentialSupersededMessage()}`;
             }
@@ -4418,6 +5641,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
           // token, confirm against the selected account immediately before queueing.
           if (token) {
             const existing = await findZoneByName(token, domain, acct);
+            if (!this.isChatTurnAccessCurrent(turn)) return this.chatTurnAccessError();
             if (!credential || !this.isCredentialLeaseCurrent(credential)) {
               return `No action queued: ${this.credentialSupersededMessage()}`;
             }
@@ -4463,6 +5687,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
           if (defaultsRevision !== this.migrationDefaultsRevision()) {
             return "No action queued: a newer account/zone selection replaced this request.";
           }
+          if (!this.isChatTurnAccessCurrent(turn)) return this.chatTurnAccessError();
           const type = setupType === "partial" ? "partial" : "full";
           return this.queuePending({
             product: "Zones",
@@ -4784,10 +6009,17 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
         execute: async ({ provider, config, format }) => {
           if (!migrationConfigured(this.migrationTransport())) return this.notConfigured();
           const resolved = await this.resolveConfigData({ config, format });
+          if (!this.isChatTurnAccessCurrent(turn)) return this.chatTurnAccessError();
           if (!resolved.ok) return `Error: ${resolved.message}`;
 
           const normalizedProvider = provider.trim().toLowerCase();
-          const res = await this.runPreview(normalizedProvider, resolved.data, turn.actor);
+          const res = await this.runPreview(
+            normalizedProvider,
+            resolved.data,
+            turn.actor,
+            () => this.isChatTurnAccessCurrent(turn),
+          );
+          if (!this.isChatTurnAccessCurrent(turn)) return this.chatTurnAccessError();
           if (!res.ok) return `Error from migration tool: ${res.message}`;
           this.applyOnboardingPatch(
             { configProvided: true, migratingFrom: normalizedProvider, checkOff: ["preview"] },
@@ -4828,7 +6060,11 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
           accountId: z.string().regex(/^[a-f0-9]{32}$/i).optional().describe("Account id to embed; defaults to the room's default account."),
           zoneName: z.string().max(253).optional(),
         }),
-        execute: async (args) => this.generateTerraform(args, turn.actor),
+        execute: async (args) => this.generateTerraform(
+          args,
+          turn.actor,
+          () => this.isChatTurnAccessCurrent(turn),
+        ),
       }),
 
       migration_preflight: tool({
@@ -4837,7 +6073,11 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
         inputSchema: z.object({
           zoneId: z.string().regex(/^[a-f0-9]{32}$/i).optional().describe("Target zone id; defaults to the room's default zone."),
         }),
-        execute: async ({ zoneId }) => (await this.doPreflight(zoneId, turn.actor)).summary,
+        execute: async ({ zoneId }) => (await this.doPreflight(
+          zoneId,
+          turn.actor,
+          () => this.isChatTurnAccessCurrent(turn),
+        )).summary,
       }),
 
       migration_diff_report: tool({
@@ -4846,7 +6086,11 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
         inputSchema: z.object({
           zoneId: z.string().regex(/^[a-f0-9]{32}$/i).optional().describe("Target zone id; defaults to the room's default zone."),
         }),
-        execute: async ({ zoneId }) => (await this.doDiff(zoneId, turn.actor)).summary,
+        execute: async ({ zoneId }) => (await this.doDiff(
+          zoneId,
+          turn.actor,
+          () => this.isChatTurnAccessCurrent(turn),
+        )).summary,
       }),
 
       export_migration_csv: tool({
@@ -4857,11 +6101,26 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
           config: z.string().max(MAX_CONFIG_BYTES).optional().describe("Override config text (otherwise reuses the last preview)."),
           format: z.enum(["json", "xml", "terraform", "panos", "auto"]).optional(),
         }),
-        execute: async (args) => (await this.doExportCsv(args, turn.actor)).message,
+        execute: async (args) => (await this.doExportCsv(
+          args,
+          turn.actor,
+          () => this.isChatTurnAccessCurrent(turn),
+        )).message,
       }),
 
     } satisfies ToolSet;
 
+    type ExecutableTool = { execute?: (...args: unknown[]) => unknown };
+    for (const definition of Object.values(tools)) {
+      const executable = definition as ExecutableTool;
+      const execute = executable.execute;
+      if (!execute) continue;
+      executable.execute = async (...args) => {
+        if (!this.isChatTurnAccessCurrent(turn)) return this.chatTurnAccessError();
+        const result = await execute(...args);
+        return this.isChatTurnAccessCurrent(turn) ? result : this.chatTurnAccessError();
+      };
+    }
     return tools;
   }
 
@@ -5127,12 +6386,15 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     provider: string,
     configData: unknown,
     actor = "a teammate",
+    isAuthorized: () => boolean = () => true,
   ): Promise<{ ok: true; plan: MigrationPlan; phaseSummary: string } | { ok: false; message: string }> {
+    if (!isAuthorized()) return { ok: false, message: "Room access ended before the migration preview started." };
     if (!validMigrationProviderKey(provider)) return { ok: false, message: "Invalid migration provider key." };
     const serializedSource = serializeMigrationSource(configData);
     if (!serializedSource.ok) return serializedSource;
     const generation = ++this.migrationPreviewGeneration;
     const res = await previewProviderMigration(this.migrationTransport(), provider, configData);
+    if (!isAuthorized()) return { ok: false, message: "Room access ended before the migration preview completed." };
     if (generation !== this.migrationPreviewGeneration) {
       return { ok: false, message: "A newer migration preview replaced this request." };
     }
@@ -5193,6 +6455,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
       stateError = syncedStateSizeError(nextState);
     }
     if (stateError) return { ok: false, message: stateError };
+    if (!isAuthorized()) return { ok: false, message: "Room access ended before the migration preview could be saved." };
     this.saveMigrationSource(sourceRevision, provider, serializedSource.data);
     this.setState(nextState);
     this.sql`DELETE FROM glide_migration_src WHERE id <> ${sourceRevision}`;
@@ -5234,6 +6497,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     const inScope = (phase: string) => !want || want.has(phase);
 
     const credential = await this.getCredentialLease();
+    if (!this.isChatTurnAccessCurrent(turn)) return this.chatTurnAccessError();
     if (credential === undefined) {
       return `Nothing queued: ${this.credentialSupersededMessage()}`;
     }
@@ -5277,6 +6541,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
         wafRules,
         token,
       );
+      if (!this.isChatTurnAccessCurrent(turn)) return this.chatTurnAccessError();
       if (credential && !this.isCredentialLeaseCurrent(credential)) {
         return `Nothing queued: ${this.credentialSupersededMessage()}`;
       }
@@ -5325,6 +6590,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     });
     if (rlRules.length) {
       const merged = await this.mergeEntrypointRules(zoneId, "http_ratelimit", rlRules, token);
+      if (!this.isChatTurnAccessCurrent(turn)) return this.chatTurnAccessError();
       if (credential && !this.isCredentialLeaseCurrent(credential)) {
         return `Nothing queued: ${this.credentialSupersededMessage()}`;
       }
@@ -5374,6 +6640,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
       });
       if (builtRules.length) {
         const merged = await this.mergeEntrypointRules(zoneId, bucket.phase, builtRules, token);
+        if (!this.isChatTurnAccessCurrent(turn)) return this.chatTurnAccessError();
         if (credential && !this.isCredentialLeaseCurrent(credential)) {
           return `Nothing queued: ${this.credentialSupersededMessage()}`;
         }
@@ -5483,6 +6750,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     };
     const stateError = syncedStateSizeError(nextState);
     if (stateError) return `Nothing queued: ${stateError} Queue fewer migration phases.`;
+    if (!this.isChatTurnAccessCurrent(turn)) return this.chatTurnAccessError();
     this.setState(nextState);
     turn.queuedActions.push(...newActions);
     if (plan.truncated) {
@@ -5547,7 +6815,8 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     zoneId?: string;
     accountId?: string;
     zoneName?: string;
-  }, actor = "a teammate"): Promise<string> {
+  }, actor = "a teammate", isAuthorized: () => boolean = () => true): Promise<string> {
+    if (!isAuthorized()) return this.chatTurnAccessError();
     const generation = ++this.migrationTerraformGeneration;
     if (!migrationConfigured(this.migrationTransport())) return this.notConfigured();
     const expectedPlan = this.state.migrationPlan;
@@ -5556,6 +6825,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     let configData: unknown;
     if (args.config) {
       const resolved = await this.resolveConfigData(args);
+      if (!isAuthorized()) return this.chatTurnAccessError();
       if (!resolved.ok) return `Error: ${resolved.message}`;
       configData = resolved.data;
     } else {
@@ -5574,6 +6844,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     const sourceRevision = args.config
       ? `sha256:${await sha256Hex(JSON.stringify(configData))}`
       : expectedPlan?.sourceRevision ?? `sha256:${await sha256Hex(JSON.stringify(configData))}`;
+    if (!isAuthorized()) return this.chatTurnAccessError();
     const targetScope = CDN_MIGRATION_PROVIDERS.has(provider) ? "zone" : "account";
     const targetResolution = resolveMigrationExportTarget(
       this.state.defaultAccountId,
@@ -5588,6 +6859,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     }
 
     const providerLabel = await this.migrationProviderLabel(provider, expectedPlan);
+    if (!isAuthorized()) return this.chatTurnAccessError();
     if (generation !== this.migrationTerraformGeneration || this.state.migrationPlan !== expectedPlan) {
       return "A newer Terraform request or migration plan replaced this export. Review the latest plan and retry.";
     }
@@ -5597,6 +6869,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
       configData,
       ...target,
     });
+    if (!isAuthorized()) return this.chatTurnAccessError();
     const latestTarget = resolveMigrationExportTarget(
       this.state.defaultAccountId,
       this.state.defaultZone,
@@ -5630,6 +6903,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     const nextState = { ...this.state, terraform: artifact };
     const stateError = syncedStateSizeError(nextState);
     if (stateError) return `Error: ${stateError}`;
+    if (!isAuthorized()) return this.chatTurnAccessError();
     this.setState(nextState);
 
     const names = artifact.files.map((f) => f.filename).join(", ");
@@ -5662,6 +6936,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
   private async resolveMigrationCheckTarget(
     credential: CredentialLease,
     requestedZoneId?: string,
+    isAuthorized: () => boolean = () => true,
   ): Promise<
     | { ok: true; accountId: string; zoneId?: string }
     | { ok: false; message: string }
@@ -5676,6 +6951,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
         return { ok: true, accountId: defaultZone.accountId, zoneId: selectedZoneId };
       }
       const resolved = await cfGet<ZoneSummary>(`/zones/${selectedZoneId}`, credential.token);
+      if (!isAuthorized()) return { ok: false, message: "Room access ended before the migration check completed." };
       if (!this.isCredentialLeaseCurrent(credential)) {
         return { ok: false, message: this.credentialSupersededMessage() };
       }
@@ -5690,6 +6966,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
 
     if (this.state.defaultAccountId) return { ok: true, accountId: this.state.defaultAccountId };
     const accounts = await listAccounts(credential.token);
+    if (!isAuthorized()) return { ok: false, message: "Room access ended before the migration check completed." };
     if (!this.isCredentialLeaseCurrent(credential)) {
       return { ok: false, message: this.credentialSupersededMessage() };
     }
@@ -5715,10 +6992,12 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     target: { provider: string; accountId: string; zoneId?: string },
     defaultsRevision: string,
     credential: CredentialLease,
+    isAuthorized: () => boolean = () => true,
   ): { ok: boolean; summary: string } {
     const safeSummary = redactCloudflareApiTokens(summary, credential.token);
     if (
       generation !== this.migrationCheckGeneration ||
+      !isAuthorized() ||
       !this.isCredentialLeaseCurrent(credential) ||
       this.state.migrationPlan !== expectedPlan ||
       defaultsRevision !== this.migrationDefaultsRevision()
@@ -5744,7 +7023,12 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
   }
 
   /** Pre-flight permission validation for the current migration plan's provider. */
-  private async doPreflight(zoneId: string | undefined, by: string): Promise<{ ok: boolean; summary: string }> {
+  private async doPreflight(
+    zoneId: string | undefined,
+    by: string,
+    isAuthorized: () => boolean = () => true,
+  ): Promise<{ ok: boolean; summary: string }> {
+    if (!isAuthorized()) return { ok: false, summary: "Room access ended before the pre-flight started." };
     const generation = ++this.migrationCheckGeneration;
     if (!migrationConfigured(this.migrationTransport())) return { ok: false, summary: this.notConfigured() };
     const expectedPlan = this.state.migrationPlan;
@@ -5752,6 +7036,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     if (!provider) return { ok: false, summary: "No migration plan yet — preview a provider config first." };
     const defaultsRevision = this.migrationDefaultsRevision();
     const credential = await this.getCredentialLease();
+    if (!isAuthorized()) return { ok: false, summary: "Room access ended before the pre-flight completed." };
     if (!credential) return { ok: false, summary: this.credentialUnavailableMessage() };
     if (
       generation !== this.migrationCheckGeneration ||
@@ -5760,8 +7045,9 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     ) {
       return { ok: false, summary: "A newer account/zone, token, or migration check replaced this pre-flight request. Retry it." };
     }
-    const resolvedTarget = await this.resolveMigrationCheckTarget(credential, zoneId);
+    const resolvedTarget = await this.resolveMigrationCheckTarget(credential, zoneId, isAuthorized);
     if (
+      !isAuthorized() ||
       generation !== this.migrationCheckGeneration ||
       this.state.migrationPlan !== expectedPlan ||
       defaultsRevision !== this.migrationDefaultsRevision() ||
@@ -5781,9 +7067,10 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
       zoneId: zone,
       apiToken: credential.token,
     });
+    if (!isAuthorized()) return { ok: false, summary: "Room access ended before the pre-flight completed." };
     const target = { provider, accountId, zoneId: zone || undefined };
     if (!res.ok) {
-      return this.recordCheck("preflight", false, `Pre-flight failed: ${res.message}`, by, expectedPlan, generation, target, defaultsRevision, credential);
+      return this.recordCheck("preflight", false, `Pre-flight failed: ${res.message}`, by, expectedPlan, generation, target, defaultsRevision, credential, isAuthorized);
     }
 
     const r = res.result;
@@ -5798,6 +7085,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
         target,
         defaultsRevision,
         credential,
+        isAuthorized,
       );
     }
     const preflightOk = r.tokenValid && r.allPassed;
@@ -5806,11 +7094,16 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
       : `Pre-flight: ${r.passed.length} ok, ${r.missing.length} MISSING. Add: ${r.missing.slice(0, 6).join("; ")}${
           r.missing.length > 6 ? ` …(+${r.missing.length - 6})` : ""
         }`;
-    return this.recordCheck("preflight", preflightOk, summary, by, expectedPlan, generation, target, defaultsRevision, credential);
+    return this.recordCheck("preflight", preflightOk, summary, by, expectedPlan, generation, target, defaultsRevision, credential, isAuthorized);
   }
 
   /** Pre-migration diff: what already exists in the target zone. */
-  private async doDiff(zoneId: string | undefined, by: string): Promise<{ ok: boolean; summary: string }> {
+  private async doDiff(
+    zoneId: string | undefined,
+    by: string,
+    isAuthorized: () => boolean = () => true,
+  ): Promise<{ ok: boolean; summary: string }> {
+    if (!isAuthorized()) return { ok: false, summary: "Room access ended before the diff started." };
     const generation = ++this.migrationCheckGeneration;
     if (!migrationConfigured(this.migrationTransport())) return { ok: false, summary: this.notConfigured() };
     const expectedPlan = this.state.migrationPlan;
@@ -5818,6 +7111,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     const provider = expectedPlan.provider;
     const defaultsRevision = this.migrationDefaultsRevision();
     const credential = await this.getCredentialLease();
+    if (!isAuthorized()) return { ok: false, summary: "Room access ended before the diff completed." };
     if (!credential) return { ok: false, summary: this.credentialUnavailableMessage() };
     if (
       generation !== this.migrationCheckGeneration ||
@@ -5828,8 +7122,9 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     }
     const requestedZone = zoneId ?? this.state.defaultZone?.id;
     if (!requestedZone) return { ok: false, summary: "A diff needs a target zone — set a default zone (find_zone) or pass a zone id." };
-    const resolvedTarget = await this.resolveMigrationCheckTarget(credential, requestedZone);
+    const resolvedTarget = await this.resolveMigrationCheckTarget(credential, requestedZone, isAuthorized);
     if (
+      !isAuthorized() ||
       generation !== this.migrationCheckGeneration ||
       this.state.migrationPlan !== expectedPlan ||
       defaultsRevision !== this.migrationDefaultsRevision() ||
@@ -5848,9 +7143,10 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
       zoneId: zone,
       apiToken: credential.token,
     });
+    if (!isAuthorized()) return { ok: false, summary: "Room access ended before the diff completed." };
     const target = { provider, accountId, zoneId: zone };
     if (!res.ok) {
-      return this.recordCheck("diff", false, `Diff failed: ${res.message}`, by, expectedPlan, generation, target, defaultsRevision, credential);
+      return this.recordCheck("diff", false, `Diff failed: ${res.message}`, by, expectedPlan, generation, target, defaultsRevision, credential, isAuthorized);
     }
 
     const d = res.result;
@@ -5862,7 +7158,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
       (phaseBits.length ? phaseBits.join("; ") : "no existing rules in migration phases") +
       `. IP lists: ${d.ipLists.total}; LB pools: ${d.loadBalancers.pools}, LBs: ${d.loadBalancers.lbs}. ` +
       "Manual rules are preserved; queued rules merge into the phase entrypoint.";
-    return this.recordCheck("diff", true, summary, by, expectedPlan, generation, target, defaultsRevision, credential);
+    return this.recordCheck("diff", true, summary, by, expectedPlan, generation, target, defaultsRevision, credential, isAuthorized);
   }
 
   /** Export the migration plan's config as CSV (reuses the stored source, or args). */
@@ -5871,7 +7167,8 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     config?: string;
     configFiles?: Array<{ filename: string; content: string }>;
     format?: MigrationConfigFormat;
-  }, actor = "a teammate"): Promise<{ ok: boolean; message: string }> {
+  }, actor = "a teammate", isAuthorized: () => boolean = () => true): Promise<{ ok: boolean; message: string }> {
+    if (!isAuthorized()) return { ok: false, message: "Room access ended before the CSV export started." };
     const generation = ++this.migrationCsvGeneration;
     if (!migrationConfigured(this.migrationTransport())) return { ok: false, message: this.notConfigured() };
     const expectedPlan = this.state.migrationPlan;
@@ -5880,6 +7177,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     let configData: unknown;
     if (args.config || args.configFiles?.length) {
       const resolved = await this.resolveConfigData(args);
+      if (!isAuthorized()) return { ok: false, message: "Room access ended before the CSV export completed." };
       if (!resolved.ok) return { ok: false, message: resolved.message };
       configData = resolved.data;
     } else {
@@ -5901,15 +7199,18 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     const sourceRevision = explicitSource
       ? `sha256:${await sha256Hex(JSON.stringify(configData))}`
       : expectedPlan?.sourceRevision ?? `sha256:${await sha256Hex(JSON.stringify(configData))}`;
+    if (!isAuthorized()) return { ok: false, message: "Room access ended before the CSV export completed." };
     if (generation !== this.migrationCsvGeneration || this.state.migrationPlan !== expectedPlan) {
       return { ok: false, message: "A newer CSV request or migration plan replaced this export. Review the latest plan and retry." };
     }
 
     const providerLabel = await this.migrationProviderLabel(provider, expectedPlan);
+    if (!isAuthorized()) return { ok: false, message: "Room access ended before the CSV export completed." };
     if (generation !== this.migrationCsvGeneration || this.state.migrationPlan !== expectedPlan) {
       return { ok: false, message: "A newer CSV request or migration plan replaced this export. Review the latest plan and retry." };
     }
     const res = await exportMigrationCsv(this.migrationTransport(), { provider, providerLabel, configData });
+    if (!isAuthorized()) return { ok: false, message: "Room access ended before the CSV export completed." };
     if (generation !== this.migrationCsvGeneration || this.state.migrationPlan !== expectedPlan) {
       return { ok: false, message: "A newer CSV request or migration plan replaced this export. Review the latest plan and retry." };
     }
@@ -5927,6 +7228,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     const nextState = { ...this.state, csv: artifact };
     const stateError = syncedStateSizeError(nextState);
     if (stateError) return { ok: false, message: stateError };
+    if (!isAuthorized()) return { ok: false, message: "Room access ended before the CSV export could be saved." };
     this.setState(nextState);
     const names = artifact.files.map((f) => f.filename).join(", ");
     return {
@@ -5939,8 +7241,30 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
   // Approval RPC — the ONLY place real Cloudflare writes happen.
   // ---------------------------------------------------------------------------
 
+  private applyCanceledForAccessLoss(
+    action: PendingAction,
+    by: string,
+  ): Promise<ActionResult> {
+    return this.recordActionResult(
+      action.id,
+      {
+        id: action.id,
+        product: action.product,
+        summary: action.summary,
+        status: "failed",
+        detail: "Apply canceled because room access ended before the write. Nothing was sent to Cloudflare.",
+        by,
+        ts: Date.now(),
+      },
+      true,
+      false,
+    );
+  }
+
   @callable()
   async applyAction(id: string, by = "someone", confirmUncertain = false): Promise<ActionResult> {
+    const accessLease = this.currentRoomAccessLease();
+    const actor = accessLease?.email ?? normalizeActor(by, "a teammate");
     const parsedId = validateIdentifier(id, "Action id", 200);
     if (!parsedId.ok) {
       return {
@@ -5949,15 +7273,17 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
         summary: "(invalid action)",
         status: "failed",
         detail: parsedId.message,
-        by: normalizeActor(by),
+        by: actor,
         ts: Date.now(),
       };
     }
     return this.applyActionInternal(
       parsedId.value,
-      normalizeActor(by),
+      actor,
       true,
       confirmUncertain === true,
+      undefined,
+      accessLease,
     );
   }
 
@@ -5967,6 +7293,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     notify: boolean,
     confirmUncertain = false,
     capturedCredential?: CredentialLease | null,
+    accessLease?: RoomAccessLease,
   ): Promise<ActionResult> {
     let action = this.state.pendingActions.find((a) => a.id === id);
     if (!action) {
@@ -5976,6 +7303,17 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
         summary: "(unknown action)",
         status: "failed",
         detail: "That action is no longer pending.",
+        by,
+        ts: Date.now(),
+      };
+    }
+    if (!this.isRoomAccessLeaseCurrent(accessLease)) {
+      return {
+        id,
+        product: action.product,
+        summary: action.summary,
+        status: "failed",
+        detail: "Apply canceled because room access ended before it started. Nothing was sent to Cloudflare.",
         by,
         ts: Date.now(),
       };
@@ -6098,11 +7436,17 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
         }),
       );
     }
+    if (!this.isRoomAccessLeaseCurrent(accessLease)) {
+      return this.applyCanceledForAccessLoss(action, by);
+    }
 
     try {
       const credential = capturedCredential === undefined
         ? await this.getCredentialLease()
         : capturedCredential;
+      if (!this.isRoomAccessLeaseCurrent(accessLease)) {
+        return this.applyCanceledForAccessLoss(action, by);
+      }
       if (!credential) {
         return this.recordActionResult(
           id,
@@ -6147,6 +7491,9 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
           `/zones/${action.zoneId}/rulesets/phases/${phase}/entrypoint`,
           credential.token,
         );
+        if (!this.isRoomAccessLeaseCurrent(accessLease)) {
+          return this.applyCanceledForAccessLoss(action, by);
+        }
         if (!this.isCredentialLeaseCurrent(credential)) {
           return this.recordActionResult(
             id,
@@ -6202,6 +7549,9 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
           true,
           notify,
         );
+      }
+      if (!this.isRoomAccessLeaseCurrent(accessLease)) {
+        return this.applyCanceledForAccessLoss(action, by);
       }
       const res = await cfRequest(action.method, action.path, credential.token, body);
 
@@ -6264,7 +7614,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
   @callable()
   async rejectAction(id: string, by = "someone"): Promise<ActionResult> {
     const parsedId = validateIdentifier(id, "Action id", 200);
-    const actor = normalizeActor(by);
+    const actor = this.verifiedActor(by);
     if (!parsedId.ok) {
       return {
         id: "invalid",
@@ -6320,11 +7670,17 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     ).slice(0, 100);
     const safeIds = selectBulkApplyIds(this.state.pendingActions, reviewedIds);
     const results: ActionResult[] = [];
-    const actor = normalizeActor(by);
+    const accessLease = this.currentRoomAccessLease();
+    const actor = accessLease?.email ?? normalizeActor(by, "a teammate");
     const credential = await this.getCredentialLease() ?? null;
     for (const id of safeIds) {
-      results.push(await this.applyActionInternal(id, actor, true, false, credential));
-      if (!credential || !this.isCredentialLeaseCurrent(credential)) break;
+      if (!this.isRoomAccessLeaseCurrent(accessLease)) break;
+      results.push(await this.applyActionInternal(id, actor, true, false, credential, accessLease));
+      if (
+        !credential ||
+        !this.isCredentialLeaseCurrent(credential) ||
+        !this.isRoomAccessLeaseCurrent(accessLease)
+      ) break;
     }
     return results;
   }
@@ -6439,6 +7795,82 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
   }
 }
 
+function validRoomStorageName(value: unknown): value is string {
+  return isValidRoomStorageName(value) && value !== DOCS_SYSTEM_ROOM;
+}
+
+function isSameOriginRequest(request: Request): boolean {
+  return request.headers.get("Origin") === new URL(request.url).origin;
+}
+
+function agentRequestHasAllowedOrigin(request: Request): boolean {
+  const origin = request.headers.get("Origin");
+  if (origin !== null) return origin === new URL(request.url).origin;
+  return request.headers.get("Upgrade")?.toLowerCase() !== "websocket";
+}
+
+function invalidOriginResponse(): Response {
+  return Response.json(
+    { code: "invalid_origin", message: "Glide Agent connections require the same application origin." },
+    { status: 403, headers: { "Cache-Control": "no-store" } },
+  );
+}
+
+async function rateLimitedDynamicRequest(
+  request: Request,
+  env: Cloudflare.Env,
+): Promise<Request | Response> {
+  const clientKey = await clientRateLimitKey(request);
+  const decision = await consumeRateLimit(env.AGENT_RATE_LIMITER, clientKey);
+  if (decision !== "allowed") {
+    const event = decision === "limited" ? "rate_limit.exceeded" : "rate_limit.unavailable";
+    const details = { glideEvent: event, scope: "agent_request" };
+    if (decision === "limited") console.warn(details);
+    else console.error(details);
+    return rateLimitResponse(decision);
+  }
+  return request;
+}
+
+async function authenticatedDynamicRequest(
+  request: Request,
+  env: Cloudflare.Env,
+): Promise<{ request: Request; identity: AccessIdentity } | Response> {
+  const limited = await rateLimitedDynamicRequest(request, env);
+  if (limited instanceof Response) return limited;
+  const authentication = await authenticateAccessRequest(limited, env);
+  if (!authentication.ok) return accessAuthErrorResponse(authentication);
+  const authenticatedRequest = requestWithAccessIdentity(limited, authentication.identity);
+  const headers = new Headers(authenticatedRequest.headers);
+  headers.set(
+    CLIENT_RATE_LIMIT_HEADER,
+    await opaqueRateLimitKey("client", authentication.identity.subject),
+  );
+  return {
+    request: new Request(authenticatedRequest, { headers }),
+    identity: authentication.identity,
+  };
+}
+
+/** Ownership activation is idempotent, so retry once if cleanup reset the DO. */
+async function activateRoomWithRetry(
+  env: Cloudflare.Env,
+  storageRoom: string,
+  identity: AccessIdentity,
+  canonicalRoomId: boolean,
+): Promise<RoomAuthorizationResult> {
+  const attemptId = crypto.randomUUID();
+  try {
+    const agent = await getAgentByName(env.GlideAgent, storageRoom);
+    return await agent.activateRoomAccess(identity, canonicalRoomId, attemptId);
+  } catch {
+    console.warn({ glideEvent: "room.activation_retry" });
+    await scheduler.wait(10);
+    const agent = await getAgentByName(env.GlideAgent, storageRoom);
+    return agent.activateRoomAccess(identity, canonicalRoomId, attemptId);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Worker entry: route /agents/* to the DO, otherwise serve the React SPA.
 // ---------------------------------------------------------------------------
@@ -6477,7 +7909,76 @@ export default {
   },
   async fetch(request: Request, env: Cloudflare.Env, ctx: ExecutionContext): Promise<Response> {
     const requestUrl = new URL(request.url);
+
+    if (requestUrl.pathname === "/api/session") {
+      if (request.method !== "GET") return new Response("Method not allowed", { status: 405 });
+      const authenticated = await authenticatedDynamicRequest(request, env);
+      if (authenticated instanceof Response) return authenticated;
+      const session: AccessSession = {
+        email: authenticated.identity.email,
+        isEmployee: isCloudflareEmployeeEmail(authenticated.identity.email),
+      };
+      return Response.json(session, { headers: { "Cache-Control": "no-store" } });
+    }
+
+    if (requestUrl.pathname === "/api/room-access") {
+      if (request.method !== "POST") {
+        return new Response("Method not allowed", { status: 405, headers: { Allow: "POST" } });
+      }
+      if (!isSameOriginRequest(request)) {
+        return Response.json(
+          { code: "invalid_origin", message: "Room access requests require a same-origin request." },
+          { status: 403, headers: { "Cache-Control": "no-store" } },
+        );
+      }
+      const intent = requestUrl.searchParams.get("intent");
+      if (intent !== null && intent !== "inspect") {
+        return Response.json(
+          { code: "invalid_intent", message: "Provide a valid room-access intent." },
+          { status: 400, headers: { "Cache-Control": "no-store" } },
+        );
+      }
+      const room = requestUrl.searchParams.get("room")?.trim();
+      const storageRoom = roomStorageName(room);
+      if (!storageRoom || storageRoom === DOCS_SYSTEM_ROOM) {
+        return Response.json(
+          { code: "invalid_room", message: "Provide a valid room id." },
+          {
+            status: storageRoom === DOCS_SYSTEM_ROOM ? 404 : 400,
+            headers: { "Cache-Control": "no-store" },
+          },
+        );
+      }
+      const authenticated = await authenticatedDynamicRequest(request, env);
+      if (authenticated instanceof Response) return authenticated;
+      const authorization = intent === "inspect"
+        ? await (await getAgentByName(env.GlideAgent, storageRoom)).authorizeRoomAccess(authenticated.identity)
+        : await activateRoomWithRetry(
+            env,
+            storageRoom,
+            authenticated.identity,
+            isValidRoomId(room),
+          );
+      if (!authorization.allowed || !authorization.access) {
+        return Response.json(
+          { code: authorization.code, message: authorization.message },
+          {
+            status: authorization.code === "legacy_room_not_found" ? 404 : 403,
+            headers: { "Cache-Control": "no-store" },
+          },
+        );
+      }
+      return Response.json(
+        { ...authorization.access, message: authorization.message },
+        { headers: { "Cache-Control": "no-store" } },
+      );
+    }
+
+    let rootAuthentication: { request: Request; identity: AccessIdentity } | undefined;
     if (request.method === "GET" && requestUrl.pathname === "/") {
+      const authenticated = await authenticatedDynamicRequest(request, env);
+      if (authenticated instanceof Response) return authenticated;
+      rootAuthentication = authenticated;
       ctx.waitUntil(
         (async () => {
           try {
@@ -6489,9 +7990,32 @@ export default {
         })(),
       );
     }
-    const routed = await routeAgentRequest(request, env, {
-      onBeforeConnect: rejectDocsSystemRoute,
-      onBeforeRequest: rejectDocsSystemRoute,
+
+    const admitAgentRequest = async (
+      candidate: Request,
+      lobby: { className: string; name: string },
+    ): Promise<Request | Response | undefined> => {
+      const reserved = rejectDocsSystemRoute(candidate, lobby);
+      if (reserved) return reserved;
+      if (lobby.className !== "GlideAgent" || !validRoomStorageName(lobby.name)) {
+        return new Response("Not found", { status: 404, headers: { "Cache-Control": "no-store" } });
+      }
+      if (!agentRequestHasAllowedOrigin(candidate)) return invalidOriginResponse();
+      const authenticated = await authenticatedDynamicRequest(candidate, env);
+      if (authenticated instanceof Response) return authenticated;
+      const agent = await getAgentByName(env.GlideAgent, lobby.name);
+      const authorization = await agent.authorizeRoomAccess(authenticated.identity);
+      if (!authorization.allowed) {
+        return Response.json(
+          { code: authorization.code, message: authorization.message },
+          { status: 403, headers: { "Cache-Control": "no-store" } },
+        );
+      }
+      return authenticated.request;
+    };
+    const routed = await routeAgentRequest(rootAuthentication?.request ?? request, env, {
+      onBeforeConnect: admitAgentRequest,
+      onBeforeRequest: admitAgentRequest,
     });
     if (routed) return routed;
     const res = await env.ASSETS.fetch(request);
@@ -6501,6 +8025,8 @@ export default {
     if ((res.headers.get("content-type") ?? "").includes("text/html")) {
       const headers = new Headers(res.headers);
       headers.set("Cache-Control", "no-cache");
+      headers.set("Content-Security-Policy", "frame-ancestors 'none'");
+      headers.set("X-Frame-Options", "DENY");
       return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
     }
     return res;

@@ -10,7 +10,6 @@
   "scripts": {
     "build": "vite build",
     "dev": "wrangler dev",
-    "dev:ui": "vite",
     "deploy": "npm run build && wrangler deploy",
     "test": "npm run test:node && npm run test:workers",
     "test:node": "node --experimental-strip-types --test tests/*.test.ts",
@@ -24,6 +23,7 @@
     "@cloudflare/ai-chat": "^0.10.1",
     "agents": "^0.20.1",
     "ai": "^6.0.214",
+    "jose": "^6.2.4",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",
     "workers-ai-provider": "^3.2.1",

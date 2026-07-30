@@ -19,6 +19,7 @@ import {
   isUntrustedChatRole,
   persistedDeliveryStatus,
   redactCloudflareApiTokens,
+  utf8ByteLengthWithinLimit,
 } from "../src/chat-delivery.ts";
 
 test("allows a maximally escaped bounded request inside its protocol frame", () => {
@@ -38,6 +39,8 @@ test("rejects structurally dense or deeply nested JSON before parsing", () => {
 });
 
 test("counts UTF-8 bytes without allocating an encoded copy", () => {
+  assert.equal(utf8ByteLengthWithinLimit("é😀", 6), 6);
+  assert.equal(utf8ByteLengthWithinLimit("é😀", 5), undefined);
   assert.equal(isWithinUtf8ByteLimit("é", 1), false);
   assert.equal(isWithinUtf8ByteLimit("é", 2), true);
   assert.equal(isWithinUtf8ByteLimit("😀", 4), true);
@@ -51,7 +54,8 @@ test("bounds chat prose before server-side inference and prompt assembly", () =>
 
 test("participant names use the same bounded validation as chat admission", () => {
   assert.equal(chatParticipantNameError(" Avery "), undefined);
-  assert.match(chatParticipantNameError("x".repeat(81)) ?? "", /1-80/);
+  assert.equal(chatParticipantNameError(`${"a".repeat(242)}@example.com`), undefined);
+  assert.match(chatParticipantNameError("x".repeat(255)) ?? "", /1-254/);
   assert.match(chatParticipantNameError("bad\u0000name") ?? "", /control/i);
   assert.match(chatParticipantNameError("cfat_abcdefghijklmnopqrstuvwxyz") ?? "", /token/i);
 });
@@ -167,6 +171,13 @@ test("chat submissions append exactly one plain user message to authoritative hi
     metadata: { name: "Avery" },
   };
   assert.equal(clientChatSubmissionError(history, [...history, user]), undefined);
+  assert.equal(
+    clientChatSubmissionError(history, [
+      ...history,
+      { ...user, metadata: { name: `${"a".repeat(242)}@example.com` } },
+    ]),
+    undefined,
+  );
   assert.match(
     clientChatSubmissionError(history, [...history, user], (id) => id === "user-1") ?? "",
     /already been accepted/i,

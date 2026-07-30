@@ -22,6 +22,14 @@ nothing changes until a human Applies a queued action.
   `resetBusinessProfile`, `queueRecommendation` (`src/server.ts`).
 - Migration client: `src/migration.ts`; queueing logic: `src/server.ts`.
 
+All wizard and migration RPCs use the rate-limited Agent WebSocket transport. The
+protocol bucket allows 120 inbound frames per 60 seconds per verified Access identity;
+chat kickoff messages additionally use 20-per-60-second identity and room buckets.
+If the UI reports a limit, keep form state and uploads in place, stop retrying for
+about one minute, wait for **live**, and submit once. A rejected chat turn is
+blocked before persistence, so it is safe to retry after the window without
+creating a duplicate accepted message.
+
 ---
 
 ## Guided onboarding (chat-led by default)
@@ -318,6 +326,11 @@ JSON escaping keeps its server-side source below the Durable Object SQLite row l
 5. **`generate_migration_terraform`** / **`export_migration_csv`** — export the
    plan as Infrastructure-as-Code or CSV for phases best managed outside the
    queue. Downloaded from the sidebar.
+
+Each browser or chat invocation keeps the initiating socket-session lease across
+config parsing, migration-service requests, and Cloudflare target reads. If the
+socket closes, expires, is revoked, or is replaced, Glide discards the result before
+saving migration source/plan/check/export state or queueing migration rules.
 
 After Apply, verify the reviewed Cloudflare rules and setting values directly.
 Automated post-migration validation is disabled fail-closed because the migration

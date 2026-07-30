@@ -1,6 +1,6 @@
 /**
- * Shared types used by BOTH the Worker (GlideAgent) and the React client.
- * Pure types only — no Workers or DOM globals, no `declare global`.
+ * Client-safe types and validation shared by the Worker and React client.
+ * No Workers or DOM globals and no `declare global`.
  */
 
 import type { PendingActionStatus } from "./action-lifecycle";
@@ -8,6 +8,56 @@ import type { PendingActionStatus } from "./action-lifecycle";
 export type WriteMethod = "POST" | "PUT" | "PATCH" | "DELETE";
 
 export const LEGACY_CHAT_RECOVERY_CONFIRMATION = "DISCARD LEGACY CHAT ARCHIVE";
+export const MAX_ROOM_ID_CHARS = 128;
+export const MAX_LEGACY_ROOM_ID_CHARS = 200;
+/** Durable Object names are limited to 1,024 bytes; URL path serialization is ASCII. */
+export const MAX_ROOM_STORAGE_NAME_BYTES = 1_024;
+
+function routeStorageName(value: string): string | undefined {
+  try {
+    const parts = new URL(`https://glide.invalid/agents/glide-agent/${value}`)
+      .pathname.split("/").filter(Boolean);
+    if (parts[0] !== "agents" || parts[1] !== "glide-agent") return undefined;
+    const storageName = parts[2];
+    return storageName && storageName.length <= MAX_ROOM_STORAGE_NAME_BYTES
+      ? storageName
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export function isValidRoomId(value: unknown): value is string {
+  return typeof value === "string" &&
+    value.length <= MAX_ROOM_ID_CHARS &&
+    /^[A-Za-z0-9_-]+$/.test(value);
+}
+
+/**
+ * Resolve a displayed room id to the name PartySocket historically placed in
+ * the Agent URL's first room segment. Keeping this mapping shared prevents the
+ * access endpoint and browser Agent client from selecting different objects.
+ */
+export function roomStorageName(value: unknown): string | undefined {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.length > MAX_LEGACY_ROOM_ID_CHARS ||
+    /[\u0000-\u001f\u007f]/.test(value)
+  ) return undefined;
+  return routeStorageName(value);
+}
+
+export function isSupportedRoomId(value: unknown): value is string {
+  return roomStorageName(value) !== undefined;
+}
+
+/** Validate a room name after URL serialization, where the 200-char display cap no longer applies. */
+export function isValidRoomStorageName(value: unknown): value is string {
+  return typeof value === "string" &&
+    value.length <= MAX_ROOM_STORAGE_NAME_BYTES &&
+    routeStorageName(value) === value;
+}
 
 export interface LegacyChatMigrationStatus {
   status: "ready" | "migrating" | "recovery_required" | "discarding";
@@ -59,14 +109,29 @@ export interface PendingAction {
   ts: number;
 }
 
-/** Someone invited to this room by email. Stored so the room can show who's been asked to join. */
+/** Invitation audit record; authorization uses the server-only room-members table. */
 export interface Invite {
   email: string;
-  /** Display name of the room participant who sent the invite. */
+  /** Canonical verified email of the room member who granted access. */
   invitedBy: string;
   /** Shareable room link captured at invite time (origin + room hash). */
   link?: string;
   ts: number;
+}
+
+export interface RoomMember {
+  email: string;
+  role: "owner" | "member";
+  invitedBy?: string;
+  joinedAt: number;
+}
+
+export interface RoomAccessStatus {
+  email: string;
+  isEmployee: boolean;
+  role: RoomMember["role"];
+  members: RoomMember[];
+  entry: "member" | "created" | "claimed";
 }
 
 /** The outcome of applying or rejecting a pending action. */

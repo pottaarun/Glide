@@ -49,12 +49,12 @@ This README is the overview. In-depth docs live in [`docs/`](docs/):
 
 | Doc | What's inside |
 | --- | --- |
-| [Architecture](docs/architecture.md) | Worker + `GlideAgent` Durable Object, the chat-turn lifecycle, source map, synced state, SQLite tables, and the API clients. |
-| [Setup & configuration](docs/setup.md) | Prerequisites, local dev, every var/secret, the `MIGRATION` binding, token permissions, and deploying. |
+| [Architecture](docs/architecture.md) | Worker + `GlideAgent` Durable Object, abuse-control layers, the chat-turn lifecycle, source map, synced state, SQLite tables, and the API clients. |
+| [Setup & configuration](docs/setup.md) | Prerequisites, local dev, every var/secret and binding, production rate-limit tuning, token permissions, and deploying. |
 | [Tools & RPC reference](docs/tools.md) | Every LLM tool and every `@callable` Durable Object RPC. |
 | [Onboarding & migration](docs/onboarding-and-migration.md) | The guided wizard and the read-only provider-migration pipeline. |
-| [Security model](docs/security.md) | At-rest token encryption, the room-link credential model, and the writes-through-a-human guarantee. |
-| [Troubleshooting & observability](docs/troubleshooting.md) | Connection recovery, delivery diagnostics, structured log queries, and incident handling. |
+| [Security model](docs/security.md) | Verified Access identity, durable room membership, at-rest token encryption, production abuse controls, and the writes-through-a-human guarantee. |
+| [Troubleshooting & observability](docs/troubleshooting.md) | Connection recovery, rate-limit responses, delivery diagnostics, structured log queries, and incident handling. |
 
 ---
 
@@ -65,6 +65,15 @@ This README is the overview. In-depth docs live in [`docs/`](docs/):
 - **Verified message delivery.** A **live** / **reconnecting** badge prevents sends
   into a closed socket. Interrupted sends are checked by message id; missing text
   returns to the composer and incomplete assistant turns can be retried safely.
+- **Verified identity and private rooms.** The Worker validates Cloudflare Access
+  application JWTs before dynamic routing. Verified `@cloudflare.com` employees
+  can create or claim rooms; current members can grant another verified email
+  access. Membership is durable, server-only, and checked on every WebSocket frame.
+- **Layered production abuse controls.** Cloudflare Rate Limiting bounds dynamic
+  HTTP requests to 120/minute per hashed client network and WebSocket frames to
+  120/minute per verified identity. AI chat is stricter at 20 submissions/minute
+  both per verified identity and per room. Hashed JS/CSS and non-root asset
+  requests are not counted; the authenticated root document is.
 - **Broad Cloudflare API coverage.** Dedicated tools add a domain/zone and manage
   DNS, zone settings, and WAF custom rules. Generic `cf_write`/`cf_get` tools cover
   Cloudflare v4 JSON REST endpoints for products such as Gateway, Access, Tunnels,
@@ -155,28 +164,33 @@ Worker (src/server.ts)
                           Switchflare / migration tool Worker
 ```
 
-A **room** is a single `GlideAgent` instance, named by the URL hash. Open the same
-link and you share the same agent — same chat, same queue, same memory. Append
-`/admin#<room>` for a read-only dashboard of that same room.
+A **room** is a single `GlideAgent` instance. The display id in the URL hash is
+mapped to the same Agent path segment PartySocket historically used, preserving
+existing custom-room storage. Current ACL members who open the same link share the
+same chat, queue, and memory; the link alone grants nothing. Append
+`/admin#<room>` for a dashboard of that same room. Admin admission is inspect-only:
+it cannot create a new room or claim an unowned legacy room.
 
 ### Source layout
 
 | File | Responsibility |
 | --- | --- |
 | `src/server.ts` | Worker entry + the `GlideAgent` Durable Object: chat brain, LLM tool definitions, the Apply/Reject approval RPCs, at-rest token encryption, the guidance RPCs, and all migration helpers. |
+| `src/access-auth.ts` | Cloudflare Access JWT verification, cached remote JWKS resolution, identity canonicalization, trusted internal headers, and fail-closed responses. |
 | `src/client/main.tsx` | The React client: join screen, room UI, the chat-led onboarding opener + opt-in form wizard, the sidebar, and the read-only `/admin` dashboard. Holds all component styling in one inline `S` styles object. |
 | `src/client/index.css` | Global visual layer the inline styles can't do: font wiring, restrained ambient light and pointer glow, hover/focus/entrance motion, responsive layouts, custom scrollbars, and the `prefers-reduced-motion` reset. |
-| `src/shared.ts` | Types shared by the Worker and the client (`GlideState`, `PendingAction`, `OnboardingState`, `MigrationPlan`, `GuidanceDoc`, …). Pure types only. |
+| `src/shared.ts` | Client-safe shared types plus room display-id validation and the shared PartySocket-compatible display-to-storage-name mapping. |
 | `src/system-prompt.ts` | Builds the LLM system prompt, injecting room memory, onboarding status, the migration plan, and the retrieved team-guidance docs. Encodes the safety contract. |
 | `src/guidance-rag.ts` | Team-guidance RAG helper: embeds docs with `GLIDE_EMBED_MODEL`, upserts/queries **Vectorize** per-room (namespace-isolated), and degrades gracefully when the index is absent. |
 | `src/docs-scraper.ts` | Cloudflare-docs RAG: scrapes the developer docs (`llms.txt` index), cleans + chunks pages, embeds them into a shared `__cfdocs_v2__` Vectorize namespace with deterministic ids, and retrieves the top matches per chat turn. |
 | `src/cf-api.ts` | Cloudflare API client: retry/backoff, typed error classification, permission hints, and ruleset safety reads. |
 | `src/chat-delivery.ts` | Server-authoritative delivery classification and admission validation plus Cloudflare token detection and persistence redaction. |
 | `src/chat-message-ledger.ts` | Durable accepted-user-message ID ledger schema and trigger, preventing replay after transcript pruning. |
+| `src/rate-limits.ts` | Pure abuse-control policy helpers: opaque client/room keys, binding outcomes, route selection, and retryable HTTP responses. |
 | `src/migration.ts` | Client for the Switchflare / migration tool Worker (preview, Terraform/CSV, pre-flight, and diff), with fail-closed guards for disabled validation and snapshot mutation endpoints. |
 | `src/env.d.ts` | Augments the generated `Cloudflare.Env` with secrets not declared in `wrangler.jsonc`. |
 | `vite.config.ts` | Builds the client to `dist/client` and exposes the build-time docs manifest (`virtual:glide-docs`) that powers the admin **Dev docs** tab. |
-| `wrangler.jsonc` | Worker config: Durable Object, AI binding, Vectorize binding, optional MIGRATION service binding, static assets, and the `GLIDE_MODEL` / `GLIDE_EMBED_MODEL` vars. |
+| `wrangler.jsonc` | Worker config: Durable Object, AI, Vectorize, rate-limit, optional MIGRATION, and static-asset bindings plus the model vars. |
 
 > Deep dive: [docs/architecture.md](docs/architecture.md) — request/chat-turn
 > lifecycle, the full `GlideState`, the SQLite tables, and the API clients.
@@ -188,6 +202,8 @@ link and you share the same agent — same chat, same queue, same memory. Append
 - **Node.js** `^22.18.0` or `>=24.11.0` and npm (also pinned in `.nvmrc`)
 - A **Cloudflare account** with **Workers AI** enabled
 - **[Wrangler](https://developers.cloudflare.com/workers/wrangler/)** (installed as a dev dependency)
+- A **Cloudflare Zero Trust organization and Access application** protecting the
+  complete production hostname
 - A **Cloudflare API token** (create one at
   [dash.cloudflare.com/profile/api-tokens](https://dash.cloudflare.com/profile/api-tokens))
 - _Optional:_ a running [Switchflare](https://developers.cloudflare.com/) migration
@@ -201,9 +217,9 @@ link and you share the same agent — same chat, same queue, same memory. Append
 # 1. Install dependencies
 npm install
 
-# 2. Configure local secrets
+# 2. Configure local secrets and the loopback-only development identity
 cp .dev.vars.example .dev.vars
-#   then edit .dev.vars and set GLIDE_TOKEN_KEY
+#   then edit .dev.vars and set GLIDE_TOKEN_KEY + GLIDE_DEV_ACCESS_EMAIL
 
 # 3. Build the client bundle the Worker serves from ./dist/client
 npm run build
@@ -212,14 +228,11 @@ npm run build
 npm run dev
 ```
 
-Open the URL Wrangler prints, pick a display name, and you'll land in a fresh
-room. Share the room URL with a teammate to collaborate.
-
-For fast UI-only iteration you can also run the Vite dev server:
-
-```bash
-npm run dev:ui
-```
+Open the loopback URL Wrangler prints. Glide uses `GLIDE_DEV_ACCESS_EMAIL` only
+for loopback requests; use an `@cloudflare.com` development address to create a
+fresh room. Keep Wrangler bound to loopback and do not expose it through a LAN
+listener or reverse proxy. Deployed hostnames always require a signed Access
+assertion.
 
 > **Tip:** Do not put a Cloudflare API token in `.dev.vars`. Set only
 > `GLIDE_TOKEN_KEY`, then enter each room's Cloudflare API token directly into the GUI
@@ -230,7 +243,6 @@ npm run dev:ui
 | Script | What it does |
 | --- | --- |
 | `npm run dev` | `wrangler dev` — runs the full Worker (DO + AI + assets) locally. |
-| `npm run dev:ui` | `vite` — runs only the React UI dev server for quick iteration. |
 | `npm run build` | `vite build` — builds the client to `dist/client`. |
 | `npm run deploy` | `npm run build && wrangler deploy` — build, then deploy the Worker. |
 | `npm test` | Runs the Node regression suite and Workers-runtime Durable Object integration tests. |
@@ -250,14 +262,54 @@ npm run dev:ui
 | `GLIDE_MODEL` | `@cf/openai/gpt-oss-120b` | The Workers AI model that powers the chat brain. A full-precision, 128k-context model with reliable function calling. |
 | `GLIDE_EMBED_MODEL` | `@cf/baai/bge-base-en-v1.5` | The Workers AI text-embedding model for team-guidance **and** Cloudflare-docs RAG. Its output dimensionality (768) **must** match the Vectorize index. |
 
+### Rate-limit bindings (public deployment)
+
+`wrangler.jsonc` declares two Cloudflare Rate Limiting bindings:
+
+| Binding | Limit | Enforcement |
+| --- | --- | --- |
+| `AGENT_RATE_LIMITER` | 120 per 60 seconds | Authenticated dynamic HTTP requests use a SHA-256 digest of `CF-Connecting-IP`; inbound WebSocket frames use a separate bucket keyed by the verified Access subject. |
+| `CHAT_RATE_LIMITER` | 20 per 60 seconds | Each validated chat submission, first per verified Access identity and then per hashed room. The same budget covers response retries and guidance writes/reindexing. |
+
+Exceeded HTTP requests return `429` with `Retry-After: 60`; a temporarily
+unavailable binding fails closed on dynamic authenticated traffic with `503` and
+`Retry-After: 10`. Apart from the authenticated root document, static asset
+requests remain outside these buckets. These controls
+reduce abuse; Access JWT verification and durable room membership provide
+authentication and authorization.
+See [Setup & configuration](docs/setup.md#workers-rate-limiting-bindings) for
+namespace IDs, tuning, locality, and local-test behavior.
+
 ### Secrets / environment
 
 Set these via `.dev.vars` locally or `wrangler secret put <NAME>` in production.
 
 | Name | Required | Purpose |
 | --- | --- | --- |
+| `TEAM_DOMAIN` | Required in production | Canonical Access team URL, for example `https://your-team.cloudflareaccess.com`; used as the JWT issuer and JWKS origin. |
+| `POLICY_AUD` | Required in production | Audience tag of the Access application protecting Glide. |
+| `GLIDE_DEV_ACCESS_EMAIL` | Local development only | Explicit identity accepted only when the request URL is loopback. Keep Wrangler bound to loopback; it is ignored on deployed hostnames and must not replace production Access. |
 | `GLIDE_TOKEN_KEY` | Required for Cloudflare API access | Key used to derive the AES-256-GCM key that encrypts each room's GUI-provided token at rest. **Without it, token storage is disabled.** Generate one with e.g. `openssl rand -base64 32`. There is no deployment-wide token fallback. |
 | `MIGRATION_API_URL` | Optional | Base URL of the Switchflare / migration tool Worker. Used as a fallback when the `MIGRATION` service binding isn't present. |
+
+### Cloudflare Access (required in production)
+
+Create a self-hosted Access application for the Worker's complete production
+hostname, not only `/agents/*`. Allow identity-provider sign-in and/or One-time
+PIN for prospective invitees. The broad Access policy authenticates an email;
+Glide's server-side room table decides which authenticated emails may enter each
+room. Copy the application audience to `POLICY_AUD` and the standard
+`https://<team>.cloudflareaccess.com` URL to `TEAM_DOMAIN`.
+
+The Worker accepts only signed RS256 application tokens with the configured
+issuer/audience, a verified email, non-empty subject, and current expiry. Service
+tokens and global-session tokens cannot become room users. Missing configuration
+returns `503`; missing or invalid assertions return `401`/`403` before Agent
+routing. The issuer-scoped `jose` resolver reuses its remote JWKS cache. A signing-key
+endpoint outage returns no-store `503 access_keys_unavailable` with
+`Retry-After: 10`; an unknown key remains an invalid-token `403`. See
+[Setup & configuration](docs/setup.md#cloudflare-access-and-room-membership)
+for the complete policy and rollout sequence.
 
 ### The `VECTORIZE` binding (team-guidance RAG)
 
@@ -276,8 +328,8 @@ wrangler vectorize create glide-guidance --dimensions=768 --metric=cosine
 
 Each room's guidance queries are scoped to a deterministic per-room Vectorize
 `namespace`; this is storage/query partitioning, not an authentication boundary.
-The unguessable room link remains the room's credential. If the binding or index
-is absent, Glide safely falls back to injecting **all** enabled guidance
+Access identity plus the room's server-only membership table is the authorization
+boundary. If the binding or index is absent, Glide safely falls back to injecting **all** enabled guidance
 docs into the prompt, so guidance still works — you just lose the semantic
 top-K narrowing.
 
@@ -343,6 +395,8 @@ outside the connection form should still be revoked and rotated.
 wrangler vectorize create glide-guidance --dimensions=768 --metric=cosine
 
 # Set production secrets (once)
+wrangler secret put TEAM_DOMAIN          # Access issuer / team URL
+wrangler secret put POLICY_AUD           # Access application audience
 wrangler secret put GLIDE_TOKEN_KEY      # enables encrypted per-room token storage
 wrangler secret put MIGRATION_API_URL    # optional, if not using the service binding
 
@@ -350,10 +404,12 @@ wrangler secret put MIGRATION_API_URL    # optional, if not using the service bi
 npm run deploy
 ```
 
-The Worker serves the built SPA from `./dist/client` via the `ASSETS` binding and
-routes `/agents/*` to the `GlideAgent` Durable Object. `npm run deploy` runs
+Configure the Access application and its policy before exposing this version. The
+Worker serves the built SPA from `./dist/client` via the `ASSETS` binding and
+routes authorized `/agents/*` traffic to the `GlideAgent` Durable Object. `npm run deploy` runs
 `vite build` first, which also refreshes the admin **Dev docs** snapshot from the
-current Markdown.
+current Markdown. Wrangler deploys both rate-limit binding configurations with the
+Worker; no separate WAF rule is required.
 
 A deployment can interrupt an in-flight Durable Object response. Deploy outside
 active conversations when possible; after a deploy, wait for the **live** badge or
@@ -367,16 +423,23 @@ follow the room-by-room migration and secret-removal steps in
 
 ## How a room works
 
-1. **Join.** You enter a display name (saved in `localStorage`). The name is
-   attached to your messages and to any action you queue or apply.
-2. **Room URL = access.** A room is identified by the URL hash, which is a
-   128-bit random id by default. **There is no separate login — anyone with the
-   room link can read the room and Apply changes using its token.** Share links
-   only with teammates.
-3. **Chat.** Wait for the **live** badge, then ask Glide to inspect or change your
+1. **Authenticate.** Cloudflare Access verifies the browser identity; Glide uses
+   the signed token's canonical email for chat and action attribution.
+2. **Open or create.** A room is identified by the URL hash. New room ids must
+   match `^[A-Za-z0-9_-]{1,128}$`; the default is a 32-character hyphenless UUIDv4.
+   Older non-control ids up to 200 characters remain lookup-only. A same-origin
+    `POST /api/room-access` may let a Cloudflare employee create a canonical empty
+    room or claim an existing legacy room. Agent routing itself never creates or
+    claims a room. The admin gate uses the endpoint's inspect-only intent and also
+    cannot create or claim. Everyone else must already be in the server-side membership table.
+3. **Invite.** Any current member can grant another canonical email membership,
+   up to 100 members. The recipient must authenticate to Access as that exact email;
+   possessing the URL alone grants nothing. Only the owner can remove a non-owner;
+   removal immediately closes all of that member's room sockets.
+4. **Chat.** Wait for the **live** badge, then ask Glide to inspect or change your
    Cloudflare setup. Reads stream back immediately; changes appear in the
    **Pending approvals** panel.
-4. **Approve.** Review the method, path, body, and warning, then click **Apply** or
+5. **Approve.** Review the method, path, body, and warning, then click **Apply** or
    **Reject**. For several actions, **Apply reviewed changes** confirms and sends
    only the IDs visible in that reviewed queue snapshot. Failed actions stay
    queued for correction; uncertain network/interruption outcomes are excluded
@@ -401,6 +464,13 @@ the latest pre-flight/diff `migrationCheck`, the team `guidance` docs, and
 whether migration import is configured (`migrationToolConfigured`). The decrypted
 token, the raw provider config, and the guidance **vectors** are **not** synced —
 they live only in the Durable Object's SQLite (or Vectorize).
+
+Room authorization is also not synced state. The canonical email, owner/member
+role, inviter, and join time live in the server-only `glide_room_members` SQLite
+table. `glide_room_invites` is the durable invitation audit, while
+`GlideState.invites` is its bounded UI projection; neither grants access without
+an ACL row. Legacy invite records are retained only as audit data and must be
+re-issued before those guests can return.
 
 Clients mutate room data only through callable RPCs; direct client state writes
 are rejected by the agent.
@@ -524,10 +594,12 @@ not expose start, cancel, or clear controls for this deployment-wide index.
 
 ### Read-only admin dashboard (`/admin`)
 
-Open `/admin#<room>` (there's an **Admin →** link in the room header) for a
+Open `/admin#<room>` (there's an **Admin →** link in the room header) as a current
+room member for a
 read-only control room over the same `GlideAgent`. It reads the live synced state,
 the chat transcript, and a build-time docs manifest — there are **no** Apply/Reject
-controls here (do that from the chat room). Tabs:
+controls here (do that from the chat room), and opening admin cannot create or
+claim a room. Tabs:
 
 | Tab | Shows |
 | --- | --- |
@@ -561,7 +633,6 @@ only add a pending action for human approval.
 | --- | --- |
 | `remember` | Store a durable fact for the room. |
 | `set_defaults` | Set the room's default account id / default zone. |
-| `invite_teammate` | Record an invite by email. |
 
 ### Writes (queue only)
 
@@ -600,9 +671,33 @@ answers that drive `recommend_configuration`), `list_migration_providers`,
   the server also redacts the room's exact stored token from persisted text parts.
   Structured chat events contain identifiers and outcomes, not message
   text or token values.
-- **The room link is the credential.** There is no per-user auth. Anyone with the
-  link can read the room and Apply changes with its token. Default rooms get a
-  128-bit random id so they aren't guessable; treat the link like a password.
+- **Access identity and room membership are mandatory.** Signed Access JWTs are
+  validated for issuer, audience, signature, application type, email, subject, and
+  expiry. Dynamic routing then checks `glide_room_members`; the URL identifies a
+  room but does not authorize its holder. Agent WebSockets require an exact
+  same-origin `Origin`; initial SDK protocol frames are suppressed until admission.
+  The Worker rechecks membership and expiry after asynchronous connection/frame
+  admission and uses a durable per-connection schedule to close idle expired
+  sockets after hibernation. Active chat turns, response retries, and privileged
+  Apply/token/archive/migration operations retain the exact socket-session lease;
+  revocation, expiry, close, or same-id reconnect aborts or discards unfinished
+  work before further room state is persisted. Authorization closes remount the browser access gate.
+  HTML responses deny framing with CSP `frame-ancestors 'none'` and
+  `X-Frame-Options`.
+- **Unknown-room probes do not reserve storage.** The API and Agent client use one
+  shared, bounded display-to-storage-name mapping. Storage created only by a
+  denied probe remains provisional and is destroyed after a final serialized
+  member/data recheck. First-owner activation removes that marker atomically and
+  uses an idempotency record when the Worker retries across a cleanup reset.
+- **Authenticated traffic is bounded.** Dynamic HTTP requests have a 120/minute
+  client-network bucket; WebSocket frames use a separate 120/minute verified-user
+  bucket. Chat and selected expensive RPCs also have 20/minute identity and room
+  buckets. Binary protocol frames close with `1003` and byte-oversized frames close
+  with `1009` before limiter I/O, and
+  one room cannot retain more than one protocol-frame limit of concurrent data.
+  Keys are hashed and never logged. The counters are permissive,
+  eventually consistent, and Cloudflare-location-local, so they are abuse
+  reduction rather than exact accounting.
 - **LLM-proposed writes always pass through a human.** The model can only queue;
   the server approval path is the only place a pending action executes. Bulk
   approval uses exact reviewed IDs, and uncertain outcomes require an individual
@@ -611,7 +706,9 @@ answers that drive `recommend_configuration`), `list_migration_providers`,
   that safety read fails.
 - **Migration previews never write.** Glide only calls the migration tool's
   enabled read-only/export endpoints; it never triggers a direct deploy. Automated
-  validation and snapshot/restore/rollback paths are disabled fail-closed.
+  validation and snapshot/restore/rollback paths are disabled fail-closed. Preview
+  sources/plans, checks, and Terraform/CSV artifacts are saved only while the
+  initiating socket-session lease remains current.
 
 > Full threat model, the encryption scheme (HKDF → AES-256-GCM), and operator
 > recommendations: [docs/security.md](docs/security.md).
@@ -623,6 +720,8 @@ answers that drive `recommend_configuration`), `list_migration_providers`,
 | Symptom | Expected recovery |
 | --- | --- |
 | Badge says **reconnecting** | Keep the draft in the composer and wait for **live** before sending. Hard-refresh after a deployment if it does not recover. |
+| Request returns `429` / chat says too many messages | Stop retrying for about one minute. The response is not cached; automatic reconnects settle after the current window. |
+| Request returns `503` with `rate_limit_unavailable` | Dynamic Agent traffic is failing closed because the binding could not be checked. Retry after 10 seconds and inspect `rate_limit.unavailable` logs if it persists. |
 | Message was not delivered | Glide restores the original text to the composer; send it again only after **live** returns. |
 | Assistant response was interrupted | Click **Retry response** after the room reconnects. Glide continues from the persisted user turn instead of duplicating it. |
 | Response spinner stops progressing | Click **Stop**. After 20 seconds without progress, the composer also becomes usable again. |
@@ -641,7 +740,8 @@ Filter structured records by `glideEvent` and `room`. Chat lifecycle records can
 also include `turnId`, `messageId`, `stage`, `outcome`, `kind`, and
 `connectionEpoch`. Common events are `chat.received`, `chat.prepared`,
 `chat.model_pass`, `chat.stream_created`, `chat.stream_finished`, `chat.error`,
-`chat.client_issue`, and `chat.secrets_redacted`.
+`chat.client_issue`, `chat.secrets_redacted`, `rate_limit.exceeded`, and
+`rate_limit.unavailable`.
 
 See [Troubleshooting and observability](docs/troubleshooting.md) for event meanings
 and an incident workflow.

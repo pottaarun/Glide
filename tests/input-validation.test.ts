@@ -11,6 +11,36 @@ import {
   validateBusinessProfilePatch,
   validateOnboardingPatch,
 } from "../src/input-validation.ts";
+import {
+  isSupportedRoomId,
+  isValidRoomStorageName,
+  isValidRoomId,
+  MAX_LEGACY_ROOM_ID_CHARS,
+  MAX_ROOM_ID_CHARS,
+  roomStorageName,
+} from "../src/shared.ts";
+
+test("room ids use bounded canonical ids and stable legacy storage names", () => {
+  assert.equal(isValidRoomId("room_01-test"), true);
+  assert.equal(isValidRoomId("a".repeat(MAX_ROOM_ID_CHARS)), true);
+  assert.equal(isValidRoomId(""), false);
+  assert.equal(isValidRoomId("room with spaces"), false);
+  assert.equal(isValidRoomId("a".repeat(MAX_ROOM_ID_CHARS + 1)), false);
+  assert.equal(isValidRoomId("room/slash"), false);
+  assert.equal(isSupportedRoomId("legacy.room name"), true);
+  assert.equal(isSupportedRoomId("a".repeat(MAX_LEGACY_ROOM_ID_CHARS)), true);
+  assert.equal(isSupportedRoomId("a".repeat(MAX_LEGACY_ROOM_ID_CHARS + 1)), false);
+  assert.equal(isSupportedRoomId("room\nname"), false);
+  assert.equal(roomStorageName("legacy room"), "legacy%20room");
+  assert.equal(roomStorageName("café"), "caf%C3%A9");
+  assert.equal(roomStorageName("legacy%20room"), "legacy%20room");
+  assert.equal(roomStorageName("room/slash"), "room");
+  assert.equal(roomStorageName("../escape"), undefined);
+  const encodedLegacyRoom = roomStorageName("é".repeat(34));
+  assert.equal(encodedLegacyRoom?.length, 204);
+  assert.equal(isValidRoomStorageName(encodedLegacyRoom), true);
+  assert.equal(isSupportedRoomId("界".repeat(MAX_LEGACY_ROOM_ID_CHARS)), false);
+});
 
 test("synced state budgets serialized bytes including JSON escaping", () => {
   assert.equal(syncedStateSizeError({ value: "small" }, 100), undefined);

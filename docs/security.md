@@ -89,29 +89,150 @@ different secret format or an obfuscated value can bypass it. If any secret is
 pasted into chat, browser logs, an issue, or another unintended location, revoke
 and rotate it even if Glide later displays a redacted transcript.
 
-## The room link is the credential
+## Verified identity and room membership
 
-There is **no per-user authentication**. A room is identified by its URL hash, and
-**anyone with the link can read the room and Apply changes using its token.**
+Production Glide requires a Cloudflare Access application over the complete
+hostname. The Worker does not trust edge placement alone: `src/access-auth.ts`
+validates the `Cf-Access-Jwt-Assertion` signature against the team's remote JWKS
+and requires the configured issuer, application audience, RS256 algorithm,
+`type: "app"`, canonical email, non-empty subject, and current expiry. A service
+token has no user email and an empty subject, so it cannot become a room member.
 
-- Default rooms get a **128-bit random id** (`newRoomId()`,
-  `src/client/main.tsx`) so they aren't guessable. Treat the link like a
-  password.
-- The Invite panel makes this explicit and warns before sharing
-  (`src/client/main.tsx`).
-- Choosing a short/custom room name (the header lets you type one) makes the room
-  guessable — only do that for non-sensitive use.
-- The **`/admin#<room>` dashboard** is under the same credential model: it addresses
-  the room by the same URL hash, so anyone with the link can also open it. It is
-  read-only for Cloudflare configuration: it adds no Apply/Reject controls or API
-  write path, though team guidance is editable. It surfaces the transcript,
-  capped recent outcomes, queue, onboarding, and migration state in one view. It
-  has no deployment-wide docs-index controls. Treat the
-  `/admin` link with the same care as the room link.
+The Worker removes the browser's ability to assert its own identity by overwriting
+`X-Glide-Access-Email`, `X-Glide-Access-Subject`, and
+`X-Glide-Access-Expiry` only after JWT verification. Missing production
+configuration fails closed with `503`; missing or invalid assertions return
+`401`/`403` before Agent routing. `/api/session` returns only the verified canonical
+email and employee classification.
 
-**Implication:** share room links only with people you trust to apply changes to
-your Cloudflare account. If you need stronger isolation, put the Worker behind
-[Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/policies/access/).
+The config-derived `jose` resolver is reused for the configured issuer so its
+remote JWKS and rotation cooldown are cached across requests in an isolate. A key
+endpoint timeout, network/HTTP failure, or malformed key set fails closed as
+no-store `503 access_keys_unavailable` with `Retry-After: 10` and logs only
+`access.jwks_unavailable`. An unknown key id or otherwise invalid token remains a
+`403`, preventing an attacker-selected `kid` from masquerading as an outage.
+
+Authorization is a server-only SQLite ACL in each room's Durable Object:
+
+- `glide_room_members` stores canonical email, `owner | member` role, inviter, and
+  join time. It is not synced through `GlideState` and is capped at 100 entries.
+- Only a same-origin `POST /api/room-access` may activate membership. An exact
+  `@cloudflare.com` email may create a canonical empty room or become owner of an
+  existing unclaimed legacy room. Agent GET/WebSocket routing is read-only and
+  cannot create or claim. The admin and unexpected-close checks send
+  `intent=inspect`, which calls read-only authorization and cannot insert an owner.
+- The URL hash is a display id. The activation endpoint and both Agent clients map
+  it through the same PartySocket-compatible resolver before lookup; serialized
+  storage names are limited to 1,024 bytes. This keeps legacy links on their
+  original object and prevents authorization/client name drift.
+- Legacy invitations are copied to the server-only `glide_room_invites` audit, not
+  to `glide_room_members`; each guest must be re-invited. New ACL grants and audit
+  records commit atomically, and the synced invite list is a repairable projection.
+- Any current member can grant another canonical email membership. The browser's
+  prefilled email is only delivery convenience; the durable ACL grant is what
+  authorizes the recipient after Access verifies that exact email. Grants require
+  the explicit Invite-panel RPC; the model has no membership mutation tool.
+- Only the owner can remove a non-owner. Revocation atomically removes the ACL and
+  invitation audit row, then closes every matching socket with `1008` and reason
+  `Room membership revoked`.
+- A nonemployee cannot create or claim a room. A second employee does not gain
+  access merely because they are an employee; an existing member must invite them.
+- The Worker requires an exact same-origin `Origin` for Agent WebSocket upgrades
+  and checks membership in `routeAgentRequest()` hooks before routing.
+  `shouldSendProtocolMessages()` suppresses initial SDK state/identity frames for
+  an unadmitted connection. `GlideAgent` repeats origin, membership, and expiry
+  checks on HTTP/connection admission, after asynchronous connection-key
+  derivation and expiry-schedule creation, and both before and after each
+  WebSocket frame's limiter await.
+- Privileged RPCs that await external I/O retain a connection-bound authorization
+  lease containing a server-generated socket-session nonce, so a reconnect that
+  reuses the same SDK connection id cannot inherit in-flight authority. Apply/bulk
+  Apply recheck it after credential and ruleset reads and immediately before a
+  Cloudflare write; token replacement, clearing, reverification, and destructive
+  legacy-archive recovery recheck before changing durable state. Migration preview,
+  preflight, diff, Terraform, and CSV operations recheck before retaining a source,
+  plan, check, or export. Active chat turns and response retries register the same
+  exact lease for cancellation; tools recheck it after awaited reads and before
+  room mutation, and retry cancellation reaches `saveMessages()`. Revocation,
+  expiry, or socket replacement/loss therefore aborts remaining model work and
+  suppresses later state/output rather than transferring authority to a reconnect.
+- Glide does not use Agent facets. `onBeforeSubAgent()` returns a non-cacheable
+  `404`, so authenticated users cannot create persistent objects through `/sub/`
+  routes.
+- `onConnect()` creates a durable per-connection schedule at the JWT expiry, which
+  wakes a hibernated room and proactively closes idle expired/revoked sockets with
+  `1008`. Close cancels the schedule; schedule creation failure closes with `1011`.
+  Hibernation state stores only canonical email, expiry/schedule metadata, and
+  SHA-256 subject/client digests, never the raw Access subject.
+- Constructor-only storage created while probing a previously absent room is
+  marked provisional. Denial queues idempotent destruction; bounded schedule
+  retries end by arming a native alarm so destruction still runs in a fresh
+  invocation. The final serialized check preserves any room that gained a member
+  or durable data, then one atomic `deleteAll()` clears provisional storage before
+  the isolate aborts. No durable condemned marker can outlive an interrupted
+  cleanup and erase a later activation. Owner creation removes the marker
+  atomically. A stable attempt id makes the Worker's one cleanup-reset retry replay
+  the original `created`/`claimed` result instead of misreporting it as `member`.
+
+The URL hash identifies a room display id; after bounded path serialization it is
+not an authorization credential. New ids match `^[A-Za-z0-9_-]{1,128}$`, reserve
+`__system__`, and default to a 32-character hyphenless UUIDv4. Shipped non-control
+ids up to 200 characters remain lookup-only for legacy claims when their serialized
+storage name fits 1,024 bytes. Random defaults still reduce accidental discovery
+and should not be posted publicly, but possessing one grants no data or Apply access.
+`/admin#<room>` uses the same Access and membership checks as the chat room. Any
+admitted member can use room controls, including Apply and invitations, so invite
+only people trusted to operate that room's Cloudflare credential. Opening admin
+itself uses inspect-only authorization and cannot create or claim a room.
+
+Worker-served HTML adds `Content-Security-Policy: frame-ancestors 'none'` and
+`X-Frame-Options: DENY` to prevent clickjacking of authenticated controls.
+
+Local Wrangler has no Access edge. `GLIDE_DEV_ACCESS_EMAIL` is therefore an
+explicit development seam accepted only for loopback request URLs. It is ignored
+on deployed hostnames and must never be treated as a production Access substitute.
+Because the URL hostname does not authenticate the network peer, keep Wrangler
+bound to loopback and never publish or reverse-proxy a server using this bypass.
+
+## Authenticated-traffic abuse controls
+
+Authentication and membership are complemented by two
+[Workers Rate Limiting](https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/)
+bindings:
+
+- `AGENT_RATE_LIMITER` allows 120 dynamic HTTP attempts per 60 seconds per opaque
+  client-network key. The check runs before JWT verification to bound invalid-token
+  and JWKS work. Every inbound WebSocket frame then uses a separate
+  120-per-60-second bucket derived from the verified Access subject before the
+  Agents SDK can dispatch state, RPC, or chat protocol work. Membership is checked
+  again after that binding await, so revocation cannot race into dispatch.
+- `CHAT_RATE_LIMITER` allows 20 validated chat submissions per 60 seconds per
+  verified identity and 20 per 60 seconds per room. The identity check happens
+  first, so an identity already over limit cannot consume the room bucket. Response
+  retries and guidance add/delete/reindex RPCs use the same strict budget.
+- `clientRateLimitKey()` hashes only Cloudflare's authoritative
+  `CF-Connecting-IP` header for HTTP admission; it never trusts caller-supplied
+  `X-Forwarded-For`. After authentication, the Worker replaces the internal client
+  key with a digest of the signed Access subject. `opaqueRateLimitKey()` separately
+  hashes room names. No raw IP, subject, room name, or rate-limit digest is logged;
+  structured room events use the opaque Durable Object id as their correlation key.
+- Hashed JS/CSS and non-root asset requests are excluded; the authenticated root
+  document consumes the HTTP bucket. A binding failure gets a non-cacheable
+  HTTP `503` with `Retry-After: 10`, closes an active socket with `1013`, or returns
+  a bounded unavailable error. Exhaustion gets HTTP `429` with `Retry-After: 60`,
+  socket close `1013`, or a bounded chat/RPC response before mutation.
+- Binary protocol messages close with `1003`; byte-oversized messages close with
+  `1009`. Both are rejected before limiter I/O. A
+  per-room in-flight byte budget bounds the combined frames retained by handlers
+  waiting on asynchronous admission. Successful private transcript responses are
+  `private, no-store` as well as being fetched with the browser's no-store mode.
+
+Cloudflare documents these counters as permissive, eventually consistent, and
+local to the Cloudflare location running the call. A burst can briefly exceed the
+nominal threshold, distributed locations have independent counters, and the
+pre-auth network bucket can group users behind one NAT. Input-size guards, the
+identity and room budgets, Durable Object serialization, and Apply approval fences
+remain defense in depth; Access plus the durable ACL is the authorization system.
 
 ## Defense-in-depth around Apply
 
@@ -133,6 +254,13 @@ your Cloudflare account. If you need stronger isolation, put the Worker behind
   methods differ; ruleset entrypoints use a zone/phase key, and zone creation uses
   an account/domain key. A watchdog converts an interrupted attempt into an
   uncertain result that requires verification.
+- **Authorization survives awaits.** Each browser Apply captures the verified
+  connection id, server-generated socket-session nonce, email, and Access expiry.
+  The server rechecks that exact live socket session, JWT expiry, and durable
+  membership after asynchronous setup/safety reads and immediately before
+  dispatching the Cloudflare write. Access loss or same-id socket replacement marks
+  the approval failed without sending the write or scheduling an AI follow-up;
+  bulk Apply stops before the next item.
 - **No blind write retries.** `cfRequest()` does not automatically retry
   non-idempotent writes. Network and 5xx failures may have reached Cloudflare, so
   the UI requires explicit confirmation before retrying an uncertain outcome,
@@ -150,8 +278,9 @@ your Cloudflare account. If you need stronger isolation, put the Worker behind
   state writes. Clients can propose/apply changes only through the callable RPCs;
   `applyAction` also runtime-validates persisted action method/path fields.
 - **Attribution.** Every queued action and every result records who triggered it
-  (`createdBy` / `by`), resolved from the request body or message metadata
-  (`resolveActor()`, `src/server.ts`).
+  (`createdBy` / `by`). Browser actions use the verified connection email;
+  request-body/message metadata is only a bounded fallback for internal or
+  server-driven calls (`resolveActor()`, `src/server.ts`).
 - **Friendly permission errors.** A failed call suggests the likely method-aware
   token permission group (`permissionHint()`, `src/cf-api.ts`) for operators to
   verify and scope narrowly. New-zone creation specifically
@@ -167,6 +296,12 @@ The migration-tool client (`src/migration.ts`) only ever calls **read-only**
 endpoints and deliberately **never** calls `/api/migrations/start` (which would
 deploy directly to Cloudflare). Translating a provider config is pure parsing on
 the tool's side; every real change still flows through Glide's queue → Apply.
+
+The initiating browser or chat socket retains its exact authorization lease across
+migration-service and Cloudflare-read awaits. If membership, Access expiry, or that
+socket session changes, returned preview/check/export data is discarded before the
+room saves a source, plan, check, Terraform artifact, CSV artifact, or onboarding
+completion.
 
 Using the `MIGRATION` **service binding** (rather than `MIGRATION_API_URL`) keeps
 that traffic inside the Cloudflare runtime, so it works even when the migration
@@ -211,6 +346,11 @@ These limits bound resource use and protect the model's context window:
 | Limit | Value | Source |
 | --- | --- | --- |
 | Tool-steps per chat turn | 8 | `stepCountIs(8)`, `src/server.ts` |
+| Dynamic HTTP attempts per client network | 120 per 60 seconds | `AGENT_RATE_LIMITER`, `wrangler.jsonc` |
+| Inbound WebSocket frames per Access identity | 120 per 60 seconds | `AGENT_RATE_LIMITER`, `src/server.ts` |
+| Chat submissions/expensive RPCs per Access identity and per room | 20 per 60 seconds for each bucket | `CHAT_RATE_LIMITER`, `src/server.ts` |
+| Room members | 100 | `MAX_ROOM_MEMBERS`, `src/server.ts` |
+| Session/room-access request | 128 000 response bytes; 15-second deadline | `MAX_ACCESS_RESPONSE_BYTES`, `ACCESS_REQUEST_TIMEOUT_MS`, `src/client/main.tsx` |
 | Read payload echoed to the model | ~6 000 chars | `MAX_READ_CHARS`, `src/server.ts` |
 | Synced action-result history | 25 | `MAX_RECENT_RESULTS`, `src/server.ts` |
 | Migration-plan rules in synced state | 300 | `MAX_PLAN_RULES`, `src/server.ts` |
@@ -229,9 +369,18 @@ These limits bound resource use and protect the model's context window:
 | Duplicate zone proposal | Exact existing-zone lookup, central account/domain queue dedupe, and `cf_write` block for `POST /zones` | A token without read access cannot prove whether a zone exists; use correct Zone Read scope before queueing. |
 | Token theft from storage | AES-256-GCM at rest, key in a Worker secret; never synced/logged/returned | Anyone with both the DO storage **and** `GLIDE_TOKEN_KEY` could decrypt. |
 | Token pasted into chat | Client blocks recognizable `cfat_...`, `cfut_...`, and `cfk_...` values; server redacts new and historical persisted text | Other secret formats or obfuscation can bypass pattern matching; revoke any exposed credential. |
-| Old transcript cannot be redacted because its room token cannot decrypt | Recovery is exposed only from a durable decryption-failed state, requires an exact typed confirmation, deletes in bounded batches, and preserves permanent message-id tombstones | The unrecoverable legacy transcript is permanently deleted. Anyone with the room link can invoke offered recovery, so protect room links or front Glide with Access. |
+| Old transcript cannot be redacted because its room token cannot decrypt | Recovery is exposed only to authenticated room members from a durable decryption-failed state, requires an exact typed confirmation, rechecks the exact socket-session lease after token decryption and before arming deletion, deletes in bounded batches, and preserves permanent message-id tombstones | The unrecoverable legacy transcript is permanently deleted; admitted members must still understand the consequence. |
 | Sensitive text exposed through diagnostics | Structured chat events omit message text and token values | Platform-generated exception metadata may still need normal operator access controls and retention review. |
-| Unauthorized room access | 128-bit unguessable default room id | The link is the credential; sharing it grants Apply rights. Use custom names only for non-sensitive rooms, or front with Access. |
+| Forged or stale identity | RS256 Access JWT verification with issuer/audience/type/email/subject/expiry checks; trusted headers are overwritten | Access policy and identity-provider security remain external dependencies. |
+| Cross-site Agent control or clickjacking | Exact-origin WebSocket/activation checks, pre-connect protocol suppression, CSP `frame-ancestors 'none'`, and `X-Frame-Options: DENY` | A compromised allowed origin or browser remains within the trusted application boundary. |
+| Unauthorized room access | Server-only durable email ACL checked before routing and on every frame; URL possession alone is insufficient | Every admitted member can operate the room and its stored token; invite carefully. |
+| Revocation or same-id reconnect races an active chat, retry, or privileged RPC | Connection-bound authorization leases include a socket-session nonce; active model/retry work is aborted, chat tools recheck after awaits, and Apply/token/archive/migration paths recheck before writes or retained state | A Cloudflare write already dispatched before revocation cannot be recalled; its outcome is still recorded. A read-only upstream request may finish, but its result is discarded. |
+| Authenticated users create Agent facets | `onBeforeSubAgent()` rejects every `/sub/` route with `404` | Revisit this deny-all hook before intentionally adopting sub-agents. |
+| Admin inspection creates or claims a room | Admin and transient-close checks use read-only `intent=inspect`; only the chat activation flow can insert the first owner | A Cloudflare employee using the normal chat activation flow can still intentionally create or claim. |
+| Legacy-room takeover | Only a verified Cloudflare employee may perform the one-time atomic claim | The first employee who knows an unclaimed legacy room id becomes owner; migrate sensitive legacy rooms promptly. |
+| Authenticated probing reserves arbitrary room storage | Previously absent storage stays provisional and denied probes trigger idempotent cleanup with bounded scheduling retries and a final serialized state recheck | Cleanup is asynchronous; transient storage can exist until the scheduled or fallback attempt completes. |
+| Cleanup races first-owner activation | Owner insertion atomically clears the provisional marker; cleanup rechecks marker, members, and durable data under `blockConcurrencyWhile()`; activation retries once with a replay id | A persistent platform failure can still make the activation request fail, but cannot intentionally destroy an activated room through this cleanup path. |
+| Client floods Agent/RPC/AI paths | Layered network request, identity protocol, per-identity chat/RPC, and per-room chat binding checks; rejected work does not mutate state | Counters are permissive and location-local; NATs can affect HTTP admission and rotating IPs/locations can raise the effective ceiling. |
 | Dropping existing ruleset rules on Apply | Re-read + merge at apply time; refuse the write if the safety read fails | Concurrent changes after the final read remain possible; review the live result directly. |
 | A message appears sent during a disconnect | Send-time socket validation and server-authoritative transcript check | Delivery can be temporarily unconfirmed while both WebSocket and verification fetch are unavailable; wait for **live** before retrying. |
 | Migration tool causing writes | Enabled operations are read-only/export only; `/api/migrations/start` is never used, and snapshot/restore/rollback paths fail closed | Trust boundary is the migration service you configure. |
@@ -242,15 +391,21 @@ These limits bound resource use and protect the model's context window:
 
 - Set `GLIDE_TOKEN_KEY` to a strong random value (`openssl rand -base64 32`) so
   GUI tokens are encrypted; rotate it by re-entering tokens if needed.
+- Protect the complete production hostname with Access, set the exact
+  `TEAM_DOMAIN` and `POLICY_AUD`, and verify `/api/session` before inviting users.
+  Never configure `GLIDE_DEV_ACCESS_EMAIL` as a production auth substitute.
 - Scope the Cloudflare API token to **only** the permissions the team needs (see
   the table in [Setup](./setup.md#cloudflare-api-token-permissions)).
 - For new-zone creation, use the documented All zones/domains resource policy;
   do not broaden unrelated account permissions to solve a `POST /zones` failure.
 - Enter tokens only in the Connection form. If one is exposed in chat or anywhere
   else, revoke and rotate it; redaction does not make the old value safe again.
-- Keep default (random) room ids for any room with a real token; share links only
-  with trusted teammates.
-- Consider fronting the Worker with Cloudflare Access for an extra auth layer.
+- Keep default random room ids and grant membership only to people trusted to
+  inspect, change, and invite within that room. URL secrecy is defense in depth,
+  not the authorization boundary.
+- Keep the rate-limit namespace IDs unique within the Cloudflare account, monitor
+  `rate_limit.exceeded` / `rate_limit.unavailable`, and tune thresholds only from
+  observed legitimate traffic. Do not log keys or raw client IPs while debugging.
 - Before a large migration Apply, use `migration_diff_report`, arrange any needed
   external backup/rollback process, and verify the reviewed live configuration
   directly afterward.

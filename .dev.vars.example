@@ -3,6 +3,18 @@
 # Generate with: openssl rand -base64 32
 GLIDE_TOKEN_KEY="replace-with-a-long-random-string"
 
+# Local Wrangler has no Cloudflare Access edge to inject a signed assertion.
+# This explicit bypass works only for loopback request URLs and is ignored on
+# deployed hostnames. Keep Wrangler bound to loopback; do not expose or proxy this
+# development server. Use an @cloudflare.com address to exercise room creation.
+GLIDE_DEV_ACCESS_EMAIL="developer@cloudflare.com"
+
+# Required on deployed/Access-proxied hostnames. Copy both values from the
+# Cloudflare Access application protecting the Worker; never use the local bypass
+# as a production substitute.
+# TEAM_DOMAIN="https://your-team.cloudflareaccess.com"
+# POLICY_AUD="replace-with-the-access-application-aud"
+
 # Optional: override the default Workers AI model used for the chat brain.
 # GLIDE_MODEL="@cf/openai/gpt-oss-120b"
 

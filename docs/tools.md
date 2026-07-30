@@ -42,7 +42,6 @@ it only returns text for the model to relay (`formatRecommendationsForModel()`,
 | --- | --- | --- |
 | `remember` | `key`, `value` | Store a durable fact in room `memory` (survives restarts). |
 | `set_defaults` | `accountId?`, `zoneId?`, `zoneName?` | Set the room's default account id / default zone. |
-| `invite_teammate` | `email` | Record an invite by email (validated, deduped). |
 
 ### Writes — these only QUEUE a pending action
 
@@ -75,6 +74,10 @@ None of these call Cloudflare. Each appends a `PendingAction`; a human must
 | `migration_diff_report` | READ | Show what already exists in the target zone (migration-owned vs manual). |
 | `export_migration_csv` | READ | Export the plan's config as CSV. Downloadable from the sidebar. |
 
+Migration calls retain the initiating chat socket's authorization lease across
+service and Cloudflare-read awaits. If that lease ends, Glide discards returned
+data before saving a source, plan, check, export, onboarding update, or queued rule.
+
 Automated post-migration validation and zone snapshot capture/list/restore/rollback
 are disabled fail-closed and are not exposed as LLM tools. Verify the reviewed
 Cloudflare configuration directly after Apply.
@@ -87,8 +90,28 @@ pipeline and what `queue_migration_rules` can and can't translate.
 ## `@callable` RPCs
 
 These are invoked by the client via `agent.call(method, args)`
-(`src/client/main.tsx`). Most take a trailing `by` (the actor's display name)
-for attribution.
+(`src/client/main.tsx`). Browser calls run only after signed Access identity and
+room membership checks. Legacy trailing `by` arguments remain in several method
+signatures, but browser attribution is replaced with the verified connection email.
+Membership grants are available only through the explicit Invite-panel
+`inviteTeammate` RPC; they are intentionally absent from the model's tool set.
+
+Every callable invocation is an inbound Agent WebSocket frame and must pass the
+`AGENT_RATE_LIMITER` protocol bucket (120 frames per 60 seconds per verified Access
+identity) before the Agents SDK dispatches the method. Membership and JWT expiry
+are rechecked after the binding await immediately before dispatch. The handshake also requires the exact
+application origin, and initial protocol frames are suppressed before admission.
+Binary frames close with `1003`; frames over the protocol byte limit close with
+`1009`, both before rate-limit I/O.
+Exhaustion closes the socket
+with code `1013`, so the pending call rejects and normal client reconnection takes
+over; it never executes in the background. Chat-request frames pass that same
+gate and then `CHAT_RATE_LIMITER` at 20 submissions per 60 seconds both per Access
+identity and per room. A chat-specific rejection uses the normal bounded chat error
+frame and occurs before transcript persistence. HTTP delivery checks at
+`/get-messages` use the separate 120-per-60-second Agent-request bucket. See
+[Architecture](./architecture.md#layered-authenticated-traffic-limits) and
+[Troubleshooting](./troubleshooting.md#rate-limiting).
 
 ### Approvals — the only place real writes happen
 
@@ -103,6 +126,11 @@ for attribution.
 does not bypass action validation, lifecycle state, or resource fences. Disabled
 legacy snapshot-restore approvals are excluded from bulk Apply and rejected by the
 individual server path. See [Security model](./security.md).
+Apply and bulk Apply retain the invoking connection's authorization lease across
+credential/safety-read awaits. If that connection closes, expires, or loses room
+membership before write dispatch, no Cloudflare write is sent and bulk processing
+stops. The lease includes a server-generated socket-session nonce, so reconnecting
+with the same SDK connection id cannot inherit an older in-flight Apply.
 
 ### Token management
 
@@ -114,12 +142,20 @@ individual server path. See [Security model](./security.md).
 
 `tokenValid` confirms that one authentication check succeeded; it does not prove
 the token has every permission needed by later product-specific operations.
+Token replacement, clear, and reverification also recheck the invoking connection's
+exact socket-session lease after awaited work and before credential-state mutation.
 
 ### Client delivery diagnostics
 
 | RPC | Args | Returns | Notes |
 | --- | --- | --- | --- |
-| `reportClientChatIssue` | `{ kind, messageId, connectionEpoch }` | `{ ok: true }` | Records a privacy-safe `chat.client_issue` structured event. `kind` is `not_delivered` or `response_interrupted`; invalid input becomes `unknown`. The RPC accepts no message text or token value. |
+| `reportClientChatIssue` | `{ kind, messageId, connectionEpoch }` | `{ ok: true }` | Records a privacy-safe `chat.client_issue` structured event. `kind` is `not_delivered`, `response_interrupted`, or `accepted_pruned`; invalid input becomes `unknown`. The RPC accepts no message text or token value. |
+| `retryInterruptedResponse` | `messageId`, `interruptedAssistantId?` | `{ ok, message }` | Retries only an authoritative latest unanswered turn. It consumes the strict identity and room chat budget before transcript work. |
+
+Normal chat turns and response retries are bound to the exact initiating
+socket-session nonce. Close, expiry, revocation, or same-id reconnect aborts the
+active request; retry cancellation is passed through transcript save, and chat
+tools suppress post-await output or mutation once the lease ends.
 
 The authoritative delivery check uses the Agents SDK `/get-messages` HTTP endpoint
 plus `acceptedChatMessageIds` for ids that have aged out of retained history. A
@@ -129,11 +165,13 @@ offers **Retry response** for an accepted turn without a completed response, and
 never resends an `accepted_pruned` turn. See
 [Architecture: client delivery lifecycle](./architecture.md#the-client-delivery-lifecycle).
 
-### Invites
+### Access and invites
 
-| RPC | Args | Returns |
-| --- | --- | --- |
-| `inviteTeammate` | `email`, `by?`, `link?` | `{ ok, message }` |
+| RPC | Args | Returns | Notes |
+| --- | --- | --- | --- |
+| `roomAccessStatus` | none | `RoomAccessStatus` | Rechecks the current connection identity/membership and returns canonical email, role, entry status, and the bounded member list. |
+| `inviteTeammate` | `email`, `by?`, `link?` | `{ ok, message, members? }` | Only a current member can call it. Atomically adds the canonical ACL member and durable invite-audit row with the verified inviter, then updates the repairable UI projection. Refuses a 101st member. The optional link is metadata, not the credential. |
+| `removeRoomMember` | `email` | `{ ok, message, members? }` | Owner-only. Refuses owner removal, atomically deletes the target's ACL/audit rows, and immediately closes every matching socket with `1008 Room membership revoked`. |
 
 ### Onboarding
 
@@ -197,7 +235,7 @@ client calls them automatically; they do not change Cloudflare configuration.
 | RPC | Args | Notes |
 | --- | --- | --- |
 | `legacyChatMigrationStatus` | none | Returns `ready`, `migrating`, `recovery_required`, or `discarding`; also recreates a missing continuation schedule while work remains. |
-| `discardLegacyChatArchiveForRecovery` | exact confirmation string | Available only after a durable stored-token decryption failure. Requires `DISCARD LEGACY CHAT ARCHIVE`, preserves retention rows and replay tombstones, and starts bounded archive deletion. |
+| `discardLegacyChatArchiveForRecovery` | exact confirmation string | Available only after a durable stored-token decryption failure. Requires `DISCARD LEGACY CHAT ARCHIVE`, rechecks the exact socket-session lease after token decryption and before arming deletion, preserves retention rows and replay tombstones, and starts bounded archive deletion. |
 
 ### Disabled migration compatibility RPCs
 
@@ -220,9 +258,9 @@ Vectorize RAG index in sync best-effort — see
 
 | RPC | Args | Returns | Notes |
 | --- | --- | --- | --- |
-| `upsertGuidanceDoc` | `input` (`{ id?, title?, body?, enabled? }`), `by?` | `{ ok, message, id? }` | Add or (when `id` matches) update a doc (`src/server.ts`). Title clipped to 120 chars, body to `MAX_GUIDANCE_BODY`; rejects if both are empty or the room already has `MAX_GUIDANCE_DOCS` (25) docs. Then `syncGuidanceVectors()` (re)embeds it if enabled+non-empty, else drops its vector (`src/guidance-rag.ts`). |
-| `deleteGuidanceDoc` | `id` | `{ ok: true }` | Remove the doc from state and delete its vector (`src/server.ts`). |
-| `reindexGuidance` | — | `{ ok, indexed, message }` | Re-embed every doc (upsert enabled, drop the rest). Use to backfill docs created before RAG existed or to repair the index; returns `ok: false` when Vectorize isn't configured (`src/server.ts`). |
+| `upsertGuidanceDoc` | `input` (`{ id?, title?, body?, enabled? }`), `by?` | `{ ok, message, id? }` | Consumes the strict identity/room chat budget, then adds or updates a doc (`src/server.ts`). Title is clipped to 120 chars and body to `MAX_GUIDANCE_BODY`; rejects if both are empty or the room already has `MAX_GUIDANCE_DOCS` (25) docs. Then `syncGuidanceVectors()` (re)embeds it if enabled+non-empty, else drops its vector (`src/guidance-rag.ts`). |
+| `deleteGuidanceDoc` | `id` | `{ ok, message? }` | Consumes the strict identity/room chat budget, then removes the doc from state and deletes its vector (`src/server.ts`). |
+| `reindexGuidance` | — | `{ ok, indexed, message }` | Consumes the strict identity/room chat budget, then re-embeds every doc (upsert enabled, drop the rest). Use to backfill docs created before RAG existed or to repair the index; returns `ok: false` when Vectorize isn't configured (`src/server.ts`). |
 
 These are the only mutating guidance paths; retrieval happens automatically each
 turn via the private `selectGuidanceForPrompt()` (`src/server.ts`), not an RPC.

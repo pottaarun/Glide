@@ -64,6 +64,7 @@ import {
   getZoneManagedWafDeployed,
   getZoneSettingValue,
   getZoneSslMode,
+  getZoneTraffic24h,
   listAccounts,
   listZones,
   resolveRulesetEntrypointBaseline,
@@ -128,6 +129,7 @@ import {
   type PostureReport,
   type ZonePostureFacts,
 } from "./posture";
+import { estimateBlastRadius, formatBlastRadius, type BlastRadiusEstimate } from "./blast-radius";
 import {
   boundedMigrationPreviewRules,
   buildConfigData,
@@ -3805,6 +3807,35 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     return { ok: true, check };
   }
 
+  /**
+   * Estimate a queued change's blast radius by reading the target zone's recent
+   * traffic and running the (pure) estimator. Read-only. When the zone or the
+   * analytics can't be read, the estimator still returns an honest qualitative
+   * assessment (level "unknown") rather than failing.
+   */
+  private async blastRadiusForAction(
+    action: PendingAction,
+    isCurrent: () => boolean,
+  ): Promise<{ ok: true; estimate: BlastRadiusEstimate } | { ok: false; message: string }> {
+    const input = {
+      method: action.method,
+      path: action.path,
+      body: action.body,
+      summary: action.summary,
+      product: action.product,
+    };
+    const zoneId = action.zoneId || zoneIdFromApiPath(action.path) || this.state.defaultZone?.id;
+    if (!zoneId || !/^[0-9a-f]{32}$/i.test(zoneId)) {
+      return { ok: true, estimate: estimateBlastRadius(input, undefined) };
+    }
+    const credential = await this.getCredentialLease();
+    if (!isCurrent()) return { ok: false, message: "Room access ended before the impact preview completed." };
+    if (!credential) return { ok: true, estimate: estimateBlastRadius(input, undefined) };
+    const traffic = await getZoneTraffic24h(credential.token, zoneId);
+    if (!isCurrent()) return { ok: false, message: "Room access ended before the impact preview completed." };
+    return { ok: true, estimate: estimateBlastRadius(input, traffic.ok ? traffic.result : undefined) };
+  }
+
   /** Ensure an onboarding object exists (checklist is filled once a path is chosen). */
   private ensureOnboarding(): OnboardingState {
     return this.state.onboarding ?? { active: true, goals: [], checklist: [] };
@@ -4296,6 +4327,26 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     const created = this.state.pendingActions.find((action) => !before.has(action.id));
     if (!created) return { ok: false, message };
     return { ok: true, message, id: created.id };
+  }
+
+  /**
+   * UI: preview the blast radius of a single queued action — how much of the
+   * zone's real last-24h traffic it would touch — before anyone Applies it. The
+   * "Preview impact" button on a pending-action card. Read-only.
+   */
+  @callable()
+  async estimateActionImpact(
+    actionId: string,
+    by = "someone",
+  ): Promise<{ ok: boolean; message: string; estimate?: BlastRadiusEstimate }> {
+    this.verifiedActor(by);
+    const parsed = validateIdentifier(actionId, "Action id", 100);
+    if (!parsed.ok) return { ok: false, message: parsed.message };
+    const action = this.state.pendingActions.find((a) => a.id === parsed.value);
+    if (!action) return { ok: false, message: "That pending action no longer exists." };
+    const res = await this.blastRadiusForAction(action, () => true);
+    if (!res.ok) return { ok: false, message: res.message };
+    return { ok: true, message: formatBlastRadius(res.estimate), estimate: res.estimate };
   }
 
   /** UI wizard: run a read-only provider-config preview (parses + stores the plan). */
@@ -6848,6 +6899,22 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
           const res = await this.computeSecurityPosture(turn.actor, () => this.isChatTurnAccessCurrent(turn));
           if (!res.ok) return `Error: ${res.message}`;
           return clip(formatPostureForModel(res.report));
+        },
+      }),
+
+      estimate_impact: tool({
+        description:
+          "Preview the BLAST RADIUS of a queued change before anyone Applies it — how much of the zone's real last-24h traffic it would touch (most precise for country-scoped WAF / rate-limit rules, where per-country volume is known). READ-ONLY. Optionally pass a pending action id; otherwise the most recently queued action is assessed. Use when the user asks 'what would this affect', 'how many users', or 'is this safe to apply'.",
+        inputSchema: z.object({ actionId: z.string().max(100).optional() }).strict(),
+        execute: async ({ actionId }) => {
+          const pending = this.state.pendingActions;
+          if (!pending.length) return "There are no queued changes to assess.";
+          const action = actionId ? pending.find((a) => a.id === actionId) : pending[pending.length - 1];
+          if (!action) return `No queued action with id ${actionId}.`;
+          const res = await this.blastRadiusForAction(action, () => this.isChatTurnAccessCurrent(turn));
+          if (!res.ok) return `Error: ${res.message}`;
+          const signals = res.estimate.signals.length ? `\nSignals: ${res.estimate.signals.join("; ")}` : "";
+          return clip(`${action.summary}\n${formatBlastRadius(res.estimate)}${signals}`);
         },
       }),
 

@@ -654,3 +654,152 @@ export async function getZoneDnssecStatus(token: string, zoneId: string): Promis
   const status = typeof res.result?.status === "string" ? res.result.status : "unknown";
   return { ok: true, result: status };
 }
+
+/**
+ * POST a query to the Cloudflare GraphQL Analytics API (/graphql). Unlike the
+ * REST endpoints this returns `{ data, errors }` rather than the `{ success,
+ * result }` envelope, so it needs its own reader. Returns the `data` payload, or
+ * a classified error (GraphQL authorization failures arrive as HTTP 200 with a
+ * populated `errors[]`, so those are surfaced as permission errors with a hint).
+ */
+export async function cfGraphQL<T = unknown>(
+  token: string,
+  query: string,
+  variables: Record<string, unknown>,
+): Promise<CfResult<T>> {
+  if (!token) {
+    return { ok: false, status: 0, category: "auth", message: "No Cloudflare API token is configured." };
+  }
+  const analyticsHint = "Analytics — the API token needs Account Analytics: Read (or Zone Analytics: Read).";
+  let lastNetworkError = "";
+  for (let attempt = 0; attempt <= MAX_RETRIES_GET; attempt++) {
+    if (attempt > 0) await sleep(BACKOFF_FACTOR_MS * attempt);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), TIMEOUT_READ_MS);
+    try {
+      const resp = await fetch(`${CF_API_BASE}/graphql`, {
+        method: "POST",
+        headers: headers(token),
+        body: JSON.stringify({ query, variables }),
+        signal: controller.signal,
+      });
+      const status = resp.status;
+      if (RETRYABLE_STATUSES.has(status) && attempt < MAX_RETRIES_GET) {
+        await cancelResponseBody(resp);
+        continue;
+      }
+      const bodyResult = await readBoundedJson(resp, MAX_CF_API_RESPONSE_BYTES, "response_too_large");
+      if (!bodyResult.ok) {
+        const category = resp.ok ? "unknown" : classifyHttpError(status);
+        return {
+          ok: false,
+          status,
+          category,
+          message: responseBodyFailureMessage(status, bodyResult.failure),
+          hint: category === "permission" ? analyticsHint : undefined,
+        };
+      }
+      if (!resp.ok) {
+        const category = classifyHttpError(status);
+        return {
+          ok: false,
+          status,
+          category,
+          message: `Cloudflare GraphQL returned HTTP ${status}.`,
+          hint: category === "permission" ? analyticsHint : undefined,
+        };
+      }
+      const payload = bodyResult.value as { data?: T; errors?: Array<{ message?: string }> } | null;
+      const gqlErrors = Array.isArray(payload?.errors) ? payload.errors : [];
+      if (gqlErrors.length) {
+        const message = gqlErrors.map((e) => e?.message).filter(Boolean).join("; ") || "GraphQL query error.";
+        const permissionish = /authenticat|authoriz|permission|not allowed|forbidden/i.test(message);
+        return {
+          ok: false,
+          status: permissionish ? 403 : 400,
+          category: permissionish ? "permission" : "validation",
+          message,
+          hint: permissionish ? analyticsHint : undefined,
+        };
+      }
+      if (!payload || payload.data === undefined) {
+        return { ok: false, status, category: "unknown", message: "Cloudflare GraphQL returned no data." };
+      }
+      return { ok: true, result: payload.data };
+    } catch (err) {
+      lastNetworkError = err instanceof Error ? err.message : String(err);
+      if (attempt < MAX_RETRIES_GET) continue;
+      return {
+        ok: false,
+        status: 0,
+        category: "network",
+        message: `Network error calling Cloudflare GraphQL: ${lastNetworkError}`,
+      };
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+  return { ok: false, status: 0, category: "unknown", message: lastNetworkError || "Unknown error" };
+}
+
+/** A bounded snapshot of a zone's recent HTTP traffic, for blast-radius context. */
+export interface ZoneTrafficSnapshot {
+  /** ISO start of the window. */
+  since: string;
+  /** ISO end of the window. */
+  until: string;
+  /** Window length in hours. */
+  windowHours: number;
+  /** Total HTTP requests seen in the window. */
+  totalRequests: number;
+  /** Requests per client country (2-letter code), highest first. */
+  byCountry: Array<{ country: string; requests: number }>;
+}
+
+/**
+ * Read a zone's HTTP request volume over the last 24 hours (total + per-country)
+ * from the GraphQL Analytics API, aggregating the 1-hour groups into a rolling
+ * 24h window. Used by the blast-radius preview to estimate how much live traffic
+ * a queued change would touch before a human Applies it.
+ */
+export async function getZoneTraffic24h(token: string, zoneId: string): Promise<CfResult<ZoneTrafficSnapshot>> {
+  const id = zoneId.trim();
+  if (!id) {
+    return { ok: false, status: 400, category: "validation", message: "A zone id is required to read traffic analytics." };
+  }
+  const until = new Date();
+  const since = new Date(until.getTime() - 24 * 3600 * 1000);
+  const query =
+    "query($zoneTag:String!,$since:Time!,$until:Time!){viewer{zones(filter:{zoneTag:$zoneTag}){" +
+    "httpRequests1hGroups(limit:24,filter:{datetime_geq:$since,datetime_lt:$until},orderBy:[datetime_ASC])" +
+    "{sum{requests countryMap{clientCountryName requests}}}}}}";
+  const res = await cfGraphQL<{
+    viewer?: {
+      zones?: Array<{
+        httpRequests1hGroups?: Array<{
+          sum?: { requests?: number; countryMap?: Array<{ clientCountryName?: string; requests?: number }> };
+        }>;
+      }>;
+    };
+  }>(token, query, { zoneTag: id, since: since.toISOString(), until: until.toISOString() });
+  if (!res.ok) return res;
+  const groups = res.result?.viewer?.zones?.[0]?.httpRequests1hGroups ?? [];
+  let totalRequests = 0;
+  const byCountryMap = new Map<string, number>();
+  for (const group of groups) {
+    const sum = group?.sum;
+    if (typeof sum?.requests === "number") totalRequests += sum.requests;
+    for (const c of sum?.countryMap ?? []) {
+      if (typeof c?.clientCountryName === "string" && typeof c?.requests === "number") {
+        byCountryMap.set(c.clientCountryName, (byCountryMap.get(c.clientCountryName) ?? 0) + c.requests);
+      }
+    }
+  }
+  const byCountry = [...byCountryMap.entries()]
+    .map(([country, requests]) => ({ country, requests }))
+    .sort((a, b) => b.requests - a.requests);
+  return {
+    ok: true,
+    result: { since: since.toISOString(), until: until.toISOString(), windowHours: 24, totalRequests, byCountry },
+  };
+}

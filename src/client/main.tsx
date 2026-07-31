@@ -96,6 +96,7 @@ import {
   recommendationToPending,
   type Recommendation,
 } from "../recommendations";
+import type { BlastRadiusEstimate } from "../blast-radius";
 
 const CHAT_CONNECTION_ERROR = "Glide's live connection closed before the message was sent.";
 const AGENT_MESSAGES_TIMEOUT_MS = 10_000;
@@ -2479,6 +2480,27 @@ function RoomSession({
     [sendChatText],
   );
 
+  // Blast-radius preview: per-pending-action impact estimate, loaded on demand.
+  const [impacts, setImpacts] = useState<
+    Record<string, { loading?: boolean; estimate?: BlastRadiusEstimate; error?: string }>
+  >({});
+  const previewImpact = useCallback(
+    async (actionId: string) => {
+      setImpacts((m) => ({ ...m, [actionId]: { ...m[actionId], loading: true, error: undefined } }));
+      const res = await runRpc<{ ok: boolean; message: string; estimate?: BlastRadiusEstimate }>(
+        "estimateActionImpact",
+        [actionId, name],
+      );
+      setImpacts((m) => ({
+        ...m,
+        [actionId]: res?.ok
+          ? { loading: false, estimate: res.estimate }
+          : { loading: false, error: res?.message ?? "Couldn't estimate impact." },
+      }));
+    },
+    [runRpc, name],
+  );
+
   const onboarding = state?.onboarding;
   // Form is opt-in: only show when the user explicitly opens it.
   const showWizard = !!state && formOpen && !onboarding?.completed;
@@ -3162,6 +3184,7 @@ function RoomSession({
               const applying = busyIds.has(a.id) || isActionApplying(a);
               const failed = status === "failed" || (status === "applying" && !applying);
               const uncertain = isActionOutcomeUncertain(a);
+              const impact = impacts[a.id];
               const statusLabel = disabledRestore
                 ? "restore disabled"
                 : applying
@@ -3203,6 +3226,35 @@ function RoomSession({
                         </div>
                       )}
                     </details>
+                  )}
+                  {!disabledRestore && (
+                    <div style={S.impactRow}>
+                      {impact?.estimate ? (
+                        <div style={{ ...S.impactBox, borderColor: BLAST_COLORS[impact.estimate.level] }}>
+                          <span
+                            style={{
+                              ...S.impactChip,
+                              background: BLAST_COLORS[impact.estimate.level],
+                              color: impact.estimate.level === "medium" ? "#1a1008" : "#f8fafc",
+                            }}
+                          >
+                            {impact.estimate.level === "unknown" ? "impact ?" : `${impact.estimate.level} impact`}
+                          </span>
+                          <span style={S.impactText}>{impact.estimate.summary}</span>
+                        </div>
+                      ) : impact?.error ? (
+                        <span style={S.impactErr}>{impact.error}</span>
+                      ) : (
+                        <button
+                          style={S.miniBtn}
+                          disabled={impact?.loading}
+                          onClick={() => void previewImpact(a.id)}
+                          title="Estimate how much live traffic this change would touch before Apply"
+                        >
+                          {impact?.loading ? "Checking impact…" : "◎ Preview impact"}
+                        </button>
+                      )}
+                    </div>
                   )}
                   {canWrite ? (
                     <div style={S.actionBtns}>
@@ -3741,6 +3793,13 @@ function BusinessProfilePanel({ profile }: { profile: BusinessProfile }) {
 function priColor(pri: Recommendation["priority"]): string {
   return pri === "high" ? "#fb923c" : pri === "medium" ? "#fbbf24" : "#94a3b8";
 }
+
+const BLAST_COLORS: Record<BlastRadiusEstimate["level"], string> = {
+  low: "#22c55e",
+  medium: "#eab308",
+  high: "#ef4444",
+  unknown: "#6b7280",
+};
 
 const GRADE_COLORS: Record<SecurityPostureReport["grade"], string> = {
   A: "#22c55e",
@@ -6451,6 +6510,11 @@ const S: Record<string, React.CSSProperties> = {
   recMsg: { marginTop: 8, fontSize: 12.5, color: "#7dd3fc", background: "rgba(56,189,248,.07)", border: "1px solid rgba(56,189,248,.2)", borderRadius: 8, padding: "8px 10px", whiteSpace: "pre-wrap" },
   recGroupLabel: { fontSize: 11, fontWeight: 700, letterSpacing: 0.5, textTransform: "uppercase", color: "#93a3b8", margin: "2px 0 6px" },
   recRow: { border: "1px solid rgba(148,163,184,.14)", borderRadius: 9, padding: "9px 11px", marginBottom: 8, background: "rgba(9,12,17,.4)" },
+  impactRow: { margin: "8px 0 0" },
+  impactBox: { display: "flex", alignItems: "flex-start", gap: 8, padding: "7px 9px", border: "1px solid", borderRadius: 8, background: "rgba(9,12,17,.4)" },
+  impactChip: { fontSize: 10, fontWeight: 800, textTransform: "uppercase", letterSpacing: 0.4, padding: "2px 7px", borderRadius: 999, whiteSpace: "nowrap", flexShrink: 0 },
+  impactText: { fontSize: 12, color: "#cbd5e1", lineHeight: 1.45 },
+  impactErr: { fontSize: 12, color: "#fca5a5" },
   postureHead: { display: "flex", alignItems: "center", gap: 11, marginBottom: 10 },
   postureGrade: { fontSize: 26, fontWeight: 800, lineHeight: 1, width: 44, height: 44, display: "grid", placeItems: "center", borderRadius: 10, border: "2px solid", background: "rgba(9,12,17,.5)", fontFamily: DISPLAY, flexShrink: 0 },
   recTitleRow: { display: "flex", alignItems: "center", gap: 8 },

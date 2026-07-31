@@ -141,6 +141,13 @@ import { estimateBlastRadius, formatBlastRadius, type BlastRadiusEstimate } from
 import { buildRollbackPlan, invertibleSetting } from "./rollback";
 import { requiresSecondApproval } from "./change-risk";
 import {
+  buildWebhookPayload,
+  validateWebhookUrl,
+  webhookHostLabel,
+  type GovernanceEvent,
+  type GovernanceEventKind,
+} from "./notify";
+import {
   boundedMigrationPreviewRules,
   buildConfigData,
   configFilesSizeError,
@@ -340,6 +347,16 @@ const MAX_SCHEDULE_APPLY_AHEAD_MS = 30 * 24 * 60 * 60 * 1000;
 const REQUIRED_APPROVALS = 2;
 /** Cap on approvals retained per action, to bound synced-state growth. */
 const MAX_ACTION_APPROVALS = 10;
+/** Encrypted-secret name for the outgoing governance webhook URL. */
+const NOTIFY_WEBHOOK_SECRET_NAME = "notify_webhook_url";
+/** Cap on the in-app governance notifications feed retained in synced state. */
+const MAX_NOTIFICATIONS = 25;
+/** Delivery attempts (including the first) before a webhook event is dropped. */
+const WEBHOOK_MAX_ATTEMPTS = 5;
+/** Backoff base (seconds); attempt N waits N × base before retrying. */
+const WEBHOOK_RETRY_BASE_SEC = 30;
+/** Per-attempt outbound webhook timeout. */
+const WEBHOOK_TIMEOUT_MS = 5_000;
 
 function persistedChatMessageRole(
   rowId: string,
@@ -3945,6 +3962,13 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
               { regressions: res.drift.regressions.length },
               "warn",
             );
+            const n = res.drift.regressions.length;
+            await this.emitGovernanceEvent({
+              kind: "drift_detected",
+              title: "Security drift detected",
+              detail: `${n} check${n === 1 ? "" : "s"} regressed from the secure baseline.`,
+              zone: this.state.defaultZone?.name,
+            });
           }
         }
       } catch {
@@ -9153,6 +9177,15 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     const have = updated ? this.distinctApprovers(updated).length : 0;
     if (have < required) {
       const remaining = required - have;
+      if (!already) {
+        await this.emitGovernanceEvent({
+          kind: "approval_recorded",
+          title: "Approval recorded",
+          detail: `${action.summary} (${have}/${required} approved — needs ${remaining} more)`,
+          by: actor,
+          zone: this.state.defaultZone?.name,
+        });
+      }
       return {
         ok: true,
         applied: false,
@@ -9201,6 +9234,186 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     });
     this.recordAudit("withdraw_approval", actor, action.id, `Withdrew approval of "${action.summary}"`);
     return { ok: true, message: "Your approval was withdrawn.", approvals: new Set(approvals.map((a) => a.by)).size };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Governance notifications (in-app feed + outgoing webhook)
+  //
+  // Governance events (changes applied/failed, approvals, auto-reverts, drift)
+  // are recorded to an in-app feed in synced state AND, if an owner configured a
+  // webhook, POSTed to it with durable retrying delivery. The webhook URL is a
+  // secret (Slack URLs embed a token), so it is stored ENCRYPTED in the DO like
+  // the Cloudflare token and never placed in synced state — only its host is
+  // shown. Emission never throws: a notification failure must not break the
+  // governance action that produced it.
+  // ---------------------------------------------------------------------------
+
+  /** Read + decrypt the stored outgoing webhook URL, or undefined if none/unreadable. */
+  private async storedWebhookUrl(): Promise<string | undefined> {
+    const key = this.env.GLIDE_TOKEN_KEY;
+    if (!key) return undefined;
+    const row = this.sql<{ value: string }>`
+      SELECT value FROM glide_secrets WHERE name = ${NOTIFY_WEBHOOK_SECRET_NAME}`[0];
+    if (!row?.value) return undefined;
+    try {
+      return await decryptSecret(key, row.value);
+    } catch {
+      this.logChatEvent("notify.webhook_decrypt_failed", {}, "warn");
+      return undefined;
+    }
+  }
+
+  /**
+   * UI: set or clear the outgoing governance webhook URL — owner only. Pass an
+   * empty string to remove it. The URL is validated (https + SSRF guard) and
+   * stored ENCRYPTED at rest; only its host appears in synced state.
+   */
+  @callable()
+  async setNotifyWebhook(url: string, by = "someone"): Promise<{ ok: boolean; message: string; host?: string }> {
+    const { connection } = getCurrentAgent<GlideAgent>();
+    const identity = this.connectionIdentity(connection);
+    if (!identity || this.isAccessIdentityExpired(identity) || !this.isRoomMember(identity.email)) {
+      return { ok: false, message: "A current room owner session is required to configure notifications." };
+    }
+    if (this.roomRole(identity.email) !== "owner") {
+      return { ok: false, message: "Only the room owner can configure notifications." };
+    }
+    void by;
+    const raw = typeof url === "string" ? url.trim() : "";
+    if (!raw) {
+      this.sql`DELETE FROM glide_secrets WHERE name = ${NOTIFY_WEBHOOK_SECRET_NAME}`;
+      this.setState({ ...this.state, notifyWebhook: { configured: false, by: identity.email, ts: Date.now() } });
+      this.recordAudit("notify_config", identity.email, undefined, "Removed the notifications webhook");
+      return { ok: true, message: "Notifications webhook removed." };
+    }
+    if (!this.env.GLIDE_TOKEN_KEY) {
+      return { ok: false, message: "Server can't store the webhook securely yet — GLIDE_TOKEN_KEY is not set." };
+    }
+    const parsed = validateWebhookUrl(raw);
+    if (!parsed.ok) return { ok: false, message: parsed.message };
+    const host = webhookHostLabel(parsed.url);
+    try {
+      const packed = await encryptSecret(this.env.GLIDE_TOKEN_KEY, parsed.url);
+      this.sql`INSERT OR REPLACE INTO glide_secrets (name, value, ts)
+        VALUES (${NOTIFY_WEBHOOK_SECRET_NAME}, ${packed}, ${Date.now()})`;
+    } catch {
+      this.logChatEvent("notify.webhook_store_failed", {}, "error");
+      return { ok: false, message: "Glide could not store that webhook. Try again." };
+    }
+    this.setState({
+      ...this.state,
+      notifyWebhook: { configured: true, host, by: identity.email, ts: Date.now() },
+    });
+    this.recordAudit(
+      "notify_config",
+      identity.email,
+      undefined,
+      host ? `Set the notifications webhook (${host})` : "Set the notifications webhook",
+    );
+    return {
+      ok: true,
+      message: `Notifications webhook set${host ? ` for ${host}` : ""}. Use "Send test" to confirm delivery.`,
+      host,
+    };
+  }
+
+  /**
+   * UI: send a test event to the configured webhook — owner or member. Confirms
+   * delivery end-to-end without waiting for a real governance event.
+   */
+  @callable()
+  async testNotifyWebhook(by = "someone"): Promise<{ ok: boolean; message: string }> {
+    const { lease } = this.requireCommitRole("test notifications");
+    const actor = lease?.email ?? normalizeActor(by, "a teammate");
+    if (this.state.notifyWebhook?.configured !== true) {
+      return { ok: false, message: "No notifications webhook is configured yet." };
+    }
+    await this.emitGovernanceEvent({
+      kind: "test",
+      title: "Test notification",
+      detail: "If you can read this, Glide can reach your webhook.",
+      by: actor,
+    });
+    return { ok: true, message: "Test notification queued — check your webhook destination." };
+  }
+
+  /**
+   * Record a governance event to the in-app feed AND (if a webhook is configured)
+   * schedule durable, retrying delivery to it. Never throws — notifications must
+   * not break the governance action that produced them.
+   */
+  private async emitGovernanceEvent(input: {
+    kind: GovernanceEventKind;
+    title: string;
+    detail: string;
+    by?: string;
+    zone?: string;
+  }): Promise<void> {
+    const event: GovernanceEvent = {
+      id: crypto.randomUUID(),
+      kind: input.kind,
+      title: input.title,
+      detail: redactCloudflareApiTokens(input.detail, this.tokenForRedaction).slice(0, 500),
+      ...(input.by ? { by: input.by } : {}),
+      ...(input.zone ? { zone: input.zone } : {}),
+      ts: Date.now(),
+    };
+    try {
+      this.setState({
+        ...this.state,
+        notifications: [event, ...(this.state.notifications ?? [])].slice(0, MAX_NOTIFICATIONS),
+      });
+    } catch {
+      /* the in-app feed is best-effort */
+    }
+    if (this.state.notifyWebhook?.configured === true) {
+      try {
+        await this.schedule(1, "deliverWebhook", { event, attempt: 1 }, { idempotent: false });
+      } catch {
+        this.logChatEvent("notify.webhook_schedule_failed", {}, "warn");
+      }
+    }
+  }
+
+  /**
+   * Scheduled callback (public so the DO scheduler can invoke it by name): POST a
+   * single governance event to the configured webhook, retrying with linear
+   * backoff up to WEBHOOK_MAX_ATTEMPTS. A no-op if the webhook was removed.
+   */
+  async deliverWebhook(payload: { event?: GovernanceEvent; attempt?: number }): Promise<void> {
+    const event = payload?.event;
+    const attempt = typeof payload?.attempt === "number" && payload.attempt >= 1 ? payload.attempt : 1;
+    if (!event || typeof event.kind !== "string") return;
+    const url = await this.storedWebhookUrl();
+    if (!url) return;
+    const body = buildWebhookPayload(event, this.state.roomName);
+    let delivered = false;
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(WEBHOOK_TIMEOUT_MS),
+      });
+      delivered = res.ok;
+    } catch {
+      delivered = false;
+    }
+    if (delivered) return;
+    if (attempt < WEBHOOK_MAX_ATTEMPTS) {
+      try {
+        await this.schedule(
+          attempt * WEBHOOK_RETRY_BASE_SEC,
+          "deliverWebhook",
+          { event, attempt: attempt + 1 },
+          { idempotent: false },
+        );
+      } catch {
+        this.logChatEvent("notify.webhook_retry_failed", {}, "warn");
+      }
+    } else {
+      this.logChatEvent("notify.webhook_gave_up", { kind: event.kind }, "warn");
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -9414,6 +9627,17 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     // An applied change (e.g. SSL set, WAF rule live) can complete a go-live step.
     this.recomputeOnboardingChecklist();
     if (notify) await this.scheduleActionResultNotification([safeResult]);
+    // Governance notification: surface applied/failed outcomes in the feed and to
+    // the webhook (rejections are a quiet, expected action — not notified).
+    if (safeResult.status === "applied" || safeResult.status === "failed") {
+      await this.emitGovernanceEvent({
+        kind: safeResult.status === "applied" ? "change_applied" : "change_failed",
+        title: safeResult.status === "applied" ? "Change applied" : "Change failed",
+        detail: safeResult.summary,
+        by: safeResult.by,
+        zone: this.state.defaultZone?.name,
+      });
+    }
     return safeResult;
   }
 
@@ -9547,6 +9771,13 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     // A revert can un-satisfy a go-live step (e.g. SSL mode changed back).
     this.recomputeOnboardingChecklist();
     if (notify) await this.scheduleActionResultNotification([safeResult]);
+    await this.emitGovernanceEvent({
+      kind: "auto_revert",
+      title: safeResult.status === "applied" ? "Change reverted" : "Auto-revert failed",
+      detail: safeResult.summary,
+      by: safeResult.by,
+      zone: this.state.defaultZone?.name,
+    });
     return safeResult;
   }
 

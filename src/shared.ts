@@ -4,6 +4,7 @@
  */
 
 import type { PendingActionStatus } from "./action-lifecycle";
+import type { GovernanceEvent } from "./notify";
 
 export type WriteMethod = "POST" | "PUT" | "PATCH" | "DELETE";
 
@@ -210,7 +211,8 @@ export type RoomAuditAction =
   | "schedule_apply"
   | "four_eyes"
   | "approve"
-  | "withdraw_approval";
+  | "withdraw_approval"
+  | "notify_config";
 
 /**
  * One append-only governance audit entry: who did what, when. Stored in SQLite
@@ -391,6 +393,19 @@ export interface GlideState {
    * single-approval applies. `by` is who last toggled it; `ts` is when.
    */
   fourEyes?: { enabled: boolean; by?: string; ts: number };
+  /**
+   * In-app governance notifications feed (server-authored, newest first, capped).
+   * Consolidates the same events Glide pushes to the outgoing webhook — changes
+   * applied/failed, approvals, auto-reverts, and drift — so the room has one place
+   * to see governance activity. See {@link GovernanceEvent}.
+   */
+  notifications?: GovernanceEvent[];
+  /**
+   * Display-only status of the outgoing governance webhook. The secret URL is
+   * stored ENCRYPTED in the Durable Object and never synced; only whether one is
+   * configured, its host, and who set it appear here.
+   */
+  notifyWebhook?: { configured: boolean; host?: string; by?: string; ts?: number };
   /**
    * A running "further reading" list of Cloudflare docs pages the RAG retriever
    * surfaced while answering this room's questions (see {@link DocLink}). Deduped

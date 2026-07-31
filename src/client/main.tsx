@@ -77,6 +77,7 @@ import {
 } from "../action-lifecycle";
 import { invertibleSetting } from "../rollback";
 import { requiresSecondApproval } from "../change-risk";
+import type { GovernanceEvent } from "../notify";
 import {
   MAX_CHAT_DELIVERY_STATUS_IDS,
   MAX_CHAT_HISTORY_BYTES,
@@ -490,6 +491,15 @@ const STATUS_COLORS: Record<ActionResult["status"], string> = {
   applied: "#16a34a",
   failed: "#dc2626",
   rejected: "#9ca3af",
+};
+
+const NOTIFY_META: Record<GovernanceEvent["kind"], { icon: string; color: string }> = {
+  change_applied: { icon: "✅", color: "#16a34a" },
+  change_failed: { icon: "⚠️", color: "#dc2626" },
+  approval_recorded: { icon: "🖊️", color: "#a78bfa" },
+  auto_revert: { icon: "↩️", color: "#f59e0b" },
+  drift_detected: { icon: "📉", color: "#fb7185" },
+  test: { icon: "🔔", color: "#38bdf8" },
 };
 
 /** Includes snapshot reads, one retried write, and transport overhead. */
@@ -1250,6 +1260,8 @@ function RoomSession({
   /** Pending action whose "Schedule apply" form is open, and its datetime-local draft. */
   const [schedulingId, setSchedulingId] = useState<string | undefined>();
   const [scheduleDraft, setScheduleDraft] = useState("");
+  /** Draft outgoing-webhook URL in the owner's notifications config. */
+  const [webhookInput, setWebhookInput] = useState("");
   const [draft, setDraft] = useState(() => initialDraft?.text ?? "");
   const [recoverableDrafts, setRecoverableDrafts] = useState<PendingDelivery[]>(() =>
     readRecoverableDrafts(sessionStorage, recoverableStorageKey));
@@ -2605,6 +2617,19 @@ function RoomSession({
     },
     [runRpc, name],
   );
+  // Governance notifications: owner-set outgoing webhook (secret stored server-side).
+  const setNotifyWebhook = useCallback(
+    async (url: string) => {
+      const res = await runRpc<{ ok: boolean; message: string; host?: string }>("setNotifyWebhook", [url, name]);
+      if (res?.message) setNotice(res.message);
+      return res;
+    },
+    [runRpc, name],
+  );
+  const testNotifyWebhook = useCallback(async () => {
+    const res = await runRpc<{ ok: boolean; message: string }>("testNotifyWebhook", [name]);
+    if (res?.message) setNotice(res.message);
+  }, [runRpc, name]);
 
   // Blast-radius preview: per-pending-action impact estimate, loaded on demand.
   const [impacts, setImpacts] = useState<
@@ -3812,6 +3837,49 @@ function RoomSession({
                   ? " This room has fewer than two members who can approve — invite a teammate."
                   : ""}
               </p>
+              <div style={S.kvKeyStandalone}>Notifications webhook</div>
+              {state?.notifyWebhook?.configured ? (
+                <>
+                  <p style={S.hint}>
+                    Sending governance events to <strong>{state.notifyWebhook.host ?? "your webhook"}</strong>
+                    {state.notifyWebhook.by ? ` · set by ${state.notifyWebhook.by}` : ""}.
+                  </p>
+                  <div style={S.actionBtns}>
+                    <button style={S.miniBtn} onClick={() => void testNotifyWebhook()}>
+                      Send test
+                    </button>
+                    <button style={S.rejectBtn} onClick={() => void setNotifyWebhook("")}>
+                      Remove
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <p style={S.hint}>
+                    POST governance events (changes applied/failed, approvals, auto-reverts, drift) to a Slack or
+                    generic https webhook. The URL is stored encrypted and never shown again.
+                  </p>
+                  <input
+                    type="url"
+                    value={webhookInput}
+                    onChange={(e) => setWebhookInput(e.target.value)}
+                    placeholder="https://hooks.slack.com/services/…"
+                    autoComplete="off"
+                    spellCheck={false}
+                    style={{ ...S.input, marginBottom: 8 }}
+                  />
+                  <button
+                    style={S.miniBtn}
+                    disabled={!webhookInput.trim()}
+                    onClick={async () => {
+                      const res = await setNotifyWebhook(webhookInput.trim());
+                      if (res?.ok) setWebhookInput("");
+                    }}
+                  >
+                    Save webhook
+                  </button>
+                </>
+              )}
             </Section>
           )}
 
@@ -3913,6 +3981,26 @@ function RoomSession({
               {memory.map(([k, v]) => (
                 <KV key={k} k={k} v={v} />
               ))}
+            </Section>
+          )}
+
+          {(state?.notifications?.length ?? 0) > 0 && (
+            <Section title={`Notifications · ${state!.notifications!.length}`}>
+              {state!.notifications!.map((n: GovernanceEvent) => {
+                const meta = NOTIFY_META[n.kind] ?? { icon: "•", color: "#64748b" };
+                return (
+                  <div key={n.id} style={S.resultRow}>
+                    <span style={{ ...S.dot, background: meta.color }} />
+                    <div style={{ flex: 1 }}>
+                      <div style={S.resultSummary}>
+                        {meta.icon} {n.title}
+                      </div>
+                      <div style={S.resultDetail}>{n.detail}</div>
+                      <div style={S.listMeta}>{[n.by, n.zone, relTime(n.ts)].filter(Boolean).join(" · ")}</div>
+                    </div>
+                  </div>
+                );
+              })}
             </Section>
           )}
 

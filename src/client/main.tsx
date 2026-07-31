@@ -3729,6 +3729,18 @@ function RoomSession({
                   style={S.miniBtn}
                   disabled={!!migBusy}
                   onClick={async () => {
+                    setMigBusy("validate");
+                    await runRpc("runValidate", [state?.defaultZone?.id, name]);
+                    setMigBusy(undefined);
+                  }}
+                  title="Confirm the planned rules are present in the target zone (presence check)"
+                >
+                  {migBusy === "validate" ? "Verifying…" : "Verify"}
+                </button>
+                <button
+                  style={S.miniBtn}
+                  disabled={!!migBusy}
+                  onClick={async () => {
                     setMigBusy("csv");
                     await runRpc("exportMigrationCsv", [name]);
                     setMigBusy(undefined);
@@ -3737,7 +3749,7 @@ function RoomSession({
                   {migBusy === "csv" ? "Exporting…" : "Export CSV"}
                 </button>
               </div>
-              {state.migrationCheck && state.migrationCheck.kind !== "validate" && (
+              {state.migrationCheck && (
                 <div
                   style={{
                     ...S.checkBox,
@@ -3749,7 +3761,9 @@ function RoomSession({
                   <b>
                     {state.migrationCheck.kind === "preflight"
                       ? "Pre-flight"
-                      : "Diff"}
+                      : state.migrationCheck.kind === "diff"
+                        ? "Diff"
+                        : "Verify"}
                     :
                   </b>{" "}
                   {state.migrationCheck.summary}

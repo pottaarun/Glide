@@ -23,7 +23,6 @@ import {
   migrationPreviewValidationError,
   migrationSnapshotDataValidationError,
   MIGRATION_SNAPSHOT_DISABLED,
-  MIGRATION_VALIDATION_DISABLED,
   normalizeMigrationBase,
   preflightPermissions,
   resolveSnapshotTarget,
@@ -422,13 +421,28 @@ test("migration preflight and diff checks reject contradictory counts and flags"
   }
 });
 
-test("post-migration validation is disabled before any migration-service request", async () => {
+test("post-migration validation performs a presence check against the migration service", async () => {
   const realFetch = globalThis.fetch;
-  let requests = 0;
+  let requestedUrl = "";
   try {
-    globalThis.fetch = (async () => {
-      requests += 1;
-      throw new Error("validation request escaped the fail-closed boundary");
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      requestedUrl = String(input);
+      return new Response(
+        JSON.stringify({
+          zoneId: "b".repeat(32),
+          accountId: "a".repeat(32),
+          provider: "akamai",
+          totalIntended: 2,
+          verified: 1,
+          missing: 1,
+          details: [
+            { ruleName: "Block bots", ruleType: "waf_custom", status: "VERIFIED" },
+            { ruleName: "Rate limit", ruleType: "ratelimit", status: "MISSING" },
+          ],
+          timestamp: new Date().toISOString(),
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
     }) as typeof fetch;
     const result = await validateConfig(
       { baseUrl: "https://migration.example" },
@@ -440,8 +454,36 @@ test("post-migration validation is disabled before any migration-service request
         apiToken: "secret",
       },
     );
-    assert.deepEqual(result, { ok: false, message: MIGRATION_VALIDATION_DISABLED });
-    assert.equal(requests, 0);
+    assert.match(requestedUrl, /\/api\/validate-config$/);
+    assert.equal(result.ok, true);
+    assert.ok(result.ok && result.result.totalIntended === 2 && result.result.missing === 1);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test("post-migration validation rejects an inconsistent report from the migration service", async () => {
+  const realFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = (async () =>
+      new Response(
+        JSON.stringify({
+          zoneId: "b".repeat(32),
+          accountId: "a".repeat(32),
+          provider: "akamai",
+          totalIntended: 2,
+          verified: 1,
+          missing: 0, // 1 + 0 !== 2 — counts are inconsistent
+          details: [{ ruleName: "Block bots", ruleType: "waf_custom", status: "VERIFIED" }],
+          timestamp: new Date().toISOString(),
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      )) as typeof fetch;
+    const result = await validateConfig(
+      { baseUrl: "https://migration.example" },
+      { provider: "akamai", configData: {}, accountId: "a".repeat(32), zoneId: "b".repeat(32), apiToken: "secret" },
+    );
+    assert.equal(result.ok, false);
   } finally {
     globalThis.fetch = realFetch;
   }

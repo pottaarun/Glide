@@ -160,7 +160,6 @@ import {
   MAX_CONFIG_FILES,
   MAX_MIGRATION_PREVIEW_RULES,
   MIGRATION_SNAPSHOT_DISABLED,
-  MIGRATION_VALIDATION_DISABLED,
   migrationFilesValidationError,
   migrationPreviewValidationError,
   migrationConfigured,
@@ -169,6 +168,7 @@ import {
   serializeMigrationSource,
   sha256Hex,
   validMigrationProviderKey,
+  validateConfig,
   validateMigrationArtifact,
   type MigrationConfigFormat,
   type MigrationTransport,
@@ -3602,7 +3602,6 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
       return zoneId ? { ...action, zoneId } : action;
     });
     const recoveredAction = pendingActions.some((action, i) => action !== this.state.pendingActions[i]);
-    const legacyValidationCheck = this.state.migrationCheck?.kind === "validate";
     const defaultZoneAccountMismatch = Boolean(
       this.state.defaultZone?.accountId &&
       this.state.defaultAccountId &&
@@ -3613,14 +3612,12 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
       this.state.tokenConfigured !== tokenConfigured ||
       this.state.migrationToolConfigured !== migrationToolConfigured ||
       recoveredAction ||
-      legacyValidationCheck ||
       defaultZoneAccountMismatch ||
       missingDefaultAccount ||
       syncedStateSizeError(this.state) !== undefined
     ) {
-      const { migrationCheck: _legacyValidation, ...stateWithoutValidation } = this.state;
       let nextState: GlideState = {
-        ...(legacyValidationCheck ? stateWithoutValidation : this.state),
+        ...this.state,
         tokenConfigured,
         migrationToolConfigured,
         pendingActions,
@@ -4731,12 +4728,22 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     );
   }
 
-  /** Disabled compatibility RPC retained for older clients. */
+  /**
+   * UI: post-migration verification — confirm the migration plan's intended
+   * rules are PRESENT in the target zone. Read-only. This is a presence check,
+   * not a full value comparison (see {@link doValidate}).
+   */
   @callable()
   async runValidate(zoneId: string | undefined, by = "someone"): Promise<{ ok: boolean; summary: string }> {
-    void zoneId;
-    void by;
-    return { ok: false, summary: MIGRATION_VALIDATION_DISABLED };
+    const accessLease = this.currentRoomAccessLease();
+    if (zoneId !== undefined && (typeof zoneId !== "string" || !/^[a-f0-9]{32}$/i.test(zoneId))) {
+      return { ok: false, summary: "The zone id is invalid." };
+    }
+    return this.doValidate(
+      zoneId,
+      accessLease?.email ?? normalizeActor(by, "a teammate"),
+      () => this.isRoomAccessLeaseCurrent(accessLease),
+    );
   }
 
   /** UI: export the migration plan's config as CSV. */
@@ -8402,6 +8409,109 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
       `. IP lists: ${d.ipLists.total}; LB pools: ${d.loadBalancers.pools}, LBs: ${d.loadBalancers.lbs}. ` +
       "Manual rules are preserved; queued rules merge into the phase entrypoint.";
     return this.recordCheck("diff", true, summary, by, expectedPlan, generation, target, defaultsRevision, credential, isAuthorized);
+  }
+
+  /**
+   * Post-migration verification: confirm the current migration plan's intended
+   * rules are PRESENT in the target zone. Read-only against Cloudflare.
+   *
+   * This is deliberately framed as a *presence* check: the migration service
+   * matches each intended rule by name/type but does not compare full rule
+   * values, so the summary never claims a complete configuration match and
+   * always points the reviewer back to the live config for critical rules.
+   * Mirrors {@link doDiff}'s lease/generation/plan guards exactly, and reuses the
+   * server-side stored config source (never client input) so the verified rules
+   * are the ones the room actually planned.
+   */
+  private async doValidate(
+    zoneId: string | undefined,
+    by: string,
+    isAuthorized: () => boolean = () => true,
+  ): Promise<{ ok: boolean; summary: string }> {
+    if (!isAuthorized()) return { ok: false, summary: "Room access ended before verification started." };
+    const generation = ++this.migrationCheckGeneration;
+    if (!migrationConfigured(this.migrationTransport())) return { ok: false, summary: this.notConfigured() };
+    const expectedPlan = this.state.migrationPlan;
+    if (!expectedPlan) return { ok: false, summary: "No migration plan yet — preview a provider config first." };
+    const provider = expectedPlan.provider;
+    const src = this.loadMigrationSource();
+    if (!src) {
+      return { ok: false, summary: "No stored migration config to verify — preview the provider config again." };
+    }
+    if (src.provider !== provider) {
+      return {
+        ok: false,
+        summary: `The stored config belongs to ${src.provider}, not ${provider}. Preview the current provider config again.`,
+      };
+    }
+    const defaultsRevision = this.migrationDefaultsRevision();
+    const credential = await this.getCredentialLease();
+    if (!isAuthorized()) return { ok: false, summary: "Room access ended before verification completed." };
+    if (!credential) return { ok: false, summary: this.credentialUnavailableMessage() };
+    if (
+      generation !== this.migrationCheckGeneration ||
+      this.state.migrationPlan !== expectedPlan ||
+      defaultsRevision !== this.migrationDefaultsRevision()
+    ) {
+      return { ok: false, summary: "A newer account/zone, token, or migration check replaced this verification request. Retry it." };
+    }
+    const requestedZone = zoneId ?? this.state.defaultZone?.id;
+    if (!requestedZone) {
+      return { ok: false, summary: "Verification needs a target zone — set a default zone (find_zone) or pass a zone id." };
+    }
+    const resolvedTarget = await this.resolveMigrationCheckTarget(credential, requestedZone, isAuthorized);
+    if (
+      !isAuthorized() ||
+      generation !== this.migrationCheckGeneration ||
+      this.state.migrationPlan !== expectedPlan ||
+      defaultsRevision !== this.migrationDefaultsRevision() ||
+      !this.isCredentialLeaseCurrent(credential)
+    ) {
+      return { ok: false, summary: "A newer account/zone or token selection replaced this verification request. Retry it." };
+    }
+    if (!resolvedTarget.ok || !resolvedTarget.zoneId) {
+      return { ok: false, summary: resolvedTarget.ok ? "Couldn't resolve the target zone." : resolvedTarget.message };
+    }
+    const { accountId, zoneId: zone } = resolvedTarget;
+
+    const res = await validateConfig(this.migrationTransport(), {
+      provider,
+      configData: src.configData,
+      accountId,
+      zoneId: zone,
+      apiToken: credential.token,
+    });
+    if (!isAuthorized()) return { ok: false, summary: "Room access ended before verification completed." };
+    const target = { provider, accountId, zoneId: zone };
+    if (!res.ok) {
+      return this.recordCheck("validate", false, `Verification failed: ${res.message}`, by, expectedPlan, generation, target, defaultsRevision, credential, isAuthorized);
+    }
+
+    const v = res.result;
+    // Honest framing: a "present" rule was matched by name/type, not compared
+    // value-for-value — so never imply a complete configuration match.
+    const caveat =
+      "Presence check only — rule values aren't compared, so review critical rules directly in Cloudflare.";
+    let ok: boolean;
+    let summary: string;
+    if (v.totalIntended === 0) {
+      ok = true;
+      summary = `Verify: the ${provider} plan defines no rules to check in zone ${zone}.`;
+    } else if (v.missing === 0) {
+      ok = true;
+      summary = `Verify ✓ — all ${v.totalIntended} intended rule(s) are present in zone ${zone}. ${caveat}`;
+    } else {
+      ok = false;
+      const missingNames = v.details
+        .filter((d) => d.status === "MISSING")
+        .slice(0, 5)
+        .map((d) => d.ruleName);
+      summary =
+        `Verify: ${v.verified}/${v.totalIntended} intended rule(s) present in zone ${zone}; ${v.missing} MISSING` +
+        (missingNames.length ? ` (e.g. ${missingNames.join("; ")}${v.missing > missingNames.length ? " …" : ""})` : "") +
+        `. Re-apply the missing rules, then re-verify. ${caveat}`;
+    }
+    return this.recordCheck("validate", ok, summary, by, expectedPlan, generation, target, defaultsRevision, credential, isAuthorized);
   }
 
   /** Export the migration plan's config as CSV (reuses the stored source, or args). */

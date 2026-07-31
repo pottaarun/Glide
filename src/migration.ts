@@ -36,8 +36,6 @@ export const MAX_MIGRATION_OUTPUT_BYTES = 500_000;
 export const SUPPORTED_MIGRATION_SNAPSHOT_VERSION = 2;
 export const MIGRATION_SNAPSHOT_DISABLED =
   "Zone snapshot capture and restore are disabled because the migration service cannot guarantee complete, fail-safe recovery. Preview and export remain available.";
-export const MIGRATION_VALIDATION_DISABLED =
-  "Automated post-migration validation is disabled because the migration service does not compare complete live rule and setting values. Verify the reviewed Cloudflare configuration directly.";
 
 export async function sha256Hex(value: string): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
@@ -636,9 +634,6 @@ async function call<T>(
   ) {
     return { ok: false, message: MIGRATION_SNAPSHOT_DISABLED };
   }
-  if (pathname === "/api/validate-config") {
-    return { ok: false, message: MIGRATION_VALIDATION_DISABLED };
-  }
   if (!migrationConfigured(t)) {
     return { ok: false, message: NOT_CONFIGURED };
   }
@@ -1138,7 +1133,13 @@ export interface ValidationReportDTO {
   timestamp: string;
 }
 
-/** Validate that the parsed config's rules exist in the zone (optionally a subset of types). */
+/**
+ * Post-migration verification: confirm the rules the parsed config would produce
+ * are PRESENT in the target zone (optionally a subset of types). Read-only. This
+ * is a presence check — each intended rule is matched by name/type, not compared
+ * value-for-value — so callers must present the result as "present", not as a
+ * complete configuration match.
+ */
 export async function validateConfig(
   transport: MigrationTransport,
   input: {

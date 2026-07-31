@@ -51,6 +51,7 @@ import {
   type GlideState,
   type GuidanceDoc,
   type LegacyChatMigrationStatus,
+  type LiveZoneFacts,
   type MigrationPlan,
   type OnboardingPath,
   type OnboardingState,
@@ -593,6 +594,17 @@ function goalLabel(id: string): string {
 
 function setupLabel(s?: SetupType): string {
   return s === "full" ? "Full (primary)" : s === "partial" ? "Partial (CNAME)" : "to be decided";
+}
+
+/** Compact one-line summary of the live zone facts read from Cloudflare. */
+function liveZoneSummary(live: LiveZoneFacts): string {
+  const parts: string[] = [];
+  if (live.status) parts.push(live.status);
+  if (live.sslMode) parts.push(`SSL ${live.sslMode}`);
+  if (typeof live.wafManaged === "boolean") parts.push(`WAF ${live.wafManaged ? "on" : "off"}`);
+  if (typeof live.proxiableRecords === "number")
+    parts.push(`proxied ${live.proxiedRecords ?? 0}/${live.proxiableRecords}`);
+  return parts.join(" · ") || "—";
 }
 
 // ---------------------------------------------------------------------------
@@ -3059,6 +3071,9 @@ function RoomSession({
             <Section title="Defaults">
               {state?.defaultAccountId && <KV k="account" v={state.defaultAccountId} />}
               {state?.defaultZone && <KV k="zone" v={`${state.defaultZone.name} (${state.defaultZone.id})`} />}
+              {state?.liveZone && state.liveZone.zoneId === state?.defaultZone?.id && (
+                <KV k="live" v={liveZoneSummary(state.liveZone)} />
+              )}
             </Section>
           )}
 
@@ -3544,8 +3559,9 @@ function OnboardingPanel({
   onboarding: OnboardingState;
   onToggle: (id: string, done: boolean) => void;
 }) {
-  const done = onboarding.checklist.filter((s) => s.done).length;
-  const pct = onboarding.checklist.length ? Math.round((100 * done) / onboarding.checklist.length) : 0;
+  const complete = onboarding.checklist.filter((s) => s.done || s.na).length;
+  const total = onboarding.checklist.length;
+  const pct = total ? Math.round((100 * complete) / total) : 0;
   return (
     <>
       {onboarding.path && (
@@ -3560,27 +3576,32 @@ function OnboardingPanel({
         <KV k="from" v={onboarding.migratingFromLabel ?? onboarding.migratingFrom ?? ""} />
       )}
       {onboarding.goals.length > 0 && <KV k="goals" v={onboarding.goals.map(goalLabel).join(", ")} />}
-      <div style={S.progressWrap} title={`${done}/${onboarding.checklist.length} steps`}>
+      <div style={S.progressWrap} title={`${complete}/${total} steps`}>
         <div style={{ ...S.progressBar, width: `${pct}%` }} />
       </div>
       <div style={S.checklist}>
-        {onboarding.checklist.map((s) => (
-          <label key={s.id} style={S.checkItem}>
-            <input
-              type="checkbox"
-              checked={s.done}
-              onChange={(e) => onToggle(s.id, e.target.checked)}
-            />
-            <span
-              style={{
-                textDecoration: s.done ? "line-through" : "none",
-                color: s.done ? "#6b7280" : "#e5e7eb",
-              }}
-            >
-              {s.label}
-            </span>
-          </label>
-        ))}
+        {onboarding.checklist.map((s) => {
+          const na = Boolean(s.na) && !s.done;
+          return (
+            <label key={s.id} style={S.checkItem}>
+              <input
+                type="checkbox"
+                checked={s.done}
+                disabled={na}
+                onChange={(e) => onToggle(s.id, e.target.checked)}
+              />
+              <span
+                style={{
+                  textDecoration: s.done ? "line-through" : "none",
+                  color: s.done ? "#6b7280" : na ? "#9aa4b2" : "#e5e7eb",
+                }}
+              >
+                {s.label}
+              </span>
+              {na && <span style={S.naBadge} title="Not applicable for this zone's current state">N/A</span>}
+            </label>
+          );
+        })}
       </div>
     </>
   );
@@ -5536,6 +5557,9 @@ function AdminRoom({
                   {onboarding && onboarding.goals.length > 0 && (
                     <KV k="goals" v={onboarding.goals.map(goalLabel).join(", ")} />
                   )}
+                  {state?.liveZone && state.liveZone.zoneId === state?.defaultZone?.id && (
+                    <KV k="live zone" v={liveZoneSummary(state.liveZone)} />
+                  )}
                   {onboarding && onboarding.checklist.length > 0 && (
                     <>
                       <div style={{ ...S.progressWrap, marginTop: 12 }}>
@@ -5543,26 +5567,32 @@ function AdminRoom({
                           style={{
                             ...S.progressBar,
                             width: `${Math.round(
-                              (100 * onboarding.checklist.filter((s) => s.done).length) /
+                              (100 * onboarding.checklist.filter((s) => s.done || s.na).length) /
                                 onboarding.checklist.length,
                             )}%`,
                           }}
                         />
                       </div>
                       <div style={S.checklist}>
-                        {onboarding.checklist.map((s) => (
-                          <div key={s.id} style={S.checkItem}>
-                            <span style={{ color: s.done ? "#6ee7b7" : "#64748b" }}>{s.done ? "✓" : "○"}</span>
-                            <span
-                              style={{
-                                textDecoration: s.done ? "line-through" : "none",
-                                color: s.done ? "#6b7280" : "#e5e7eb",
-                              }}
-                            >
-                              {s.label}
-                            </span>
-                          </div>
-                        ))}
+                        {onboarding.checklist.map((s) => {
+                          const na = Boolean(s.na) && !s.done;
+                          return (
+                            <div key={s.id} style={S.checkItem}>
+                              <span style={{ color: s.done ? "#6ee7b7" : na ? "#9aa4b2" : "#64748b" }}>
+                                {s.done ? "✓" : na ? "–" : "○"}
+                              </span>
+                              <span
+                                style={{
+                                  textDecoration: s.done ? "line-through" : "none",
+                                  color: s.done ? "#6b7280" : na ? "#9aa4b2" : "#e5e7eb",
+                                }}
+                              >
+                                {s.label}
+                              </span>
+                              {na && <span style={S.naBadge} title="Not applicable for this zone's current state">N/A</span>}
+                            </div>
+                          );
+                        })}
                       </div>
                     </>
                   )}
@@ -5999,6 +6029,7 @@ const S: Record<string, React.CSSProperties> = {
   progressBar: { height: "100%", borderRadius: 999, background: "#f6821f", transition: "width .3s ease-out" },
   checklist: { display: "flex", flexDirection: "column", gap: 7 },
   checkItem: { display: "flex", alignItems: "flex-start", gap: 8, fontSize: 13, cursor: "pointer", lineHeight: 1.4 },
+  naBadge: { fontSize: 10, fontWeight: 700, color: "#9aa4b2", border: "1px solid #3a4253", borderRadius: 5, padding: "0 5px", lineHeight: "16px", flexShrink: 0, letterSpacing: ".04em" },
 
   phaseTags: { display: "flex", flexWrap: "wrap", gap: 6, marginTop: 8 },
   phaseTag: { fontSize: 11, color: "#93c5fd", background: "rgba(96,165,250,.08)", border: "1px solid rgba(96,165,250,.2)", borderRadius: 5, padding: "2px 7px", fontWeight: 600 },

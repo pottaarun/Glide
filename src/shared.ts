@@ -255,6 +255,14 @@ export interface GlideState {
   defaultAccountId?: string;
   defaultZone?: { id: string; name: string; accountId?: string };
   /**
+   * Live facts read from the default zone's real Cloudflare state (activation
+   * status, SSL mode, managed-WAF deployment, DNS proxy coverage). Captured
+   * best-effort by `find_zone` and `list_dns_records` so the go-live checklist
+   * auto-ticks (and marks steps N/A) from the domain's actual configuration —
+   * not just from actions queued inside the room. See {@link LiveZoneFacts}.
+   */
+  liveZone?: LiveZoneFacts;
+  /**
    * Whether this room has a usable GUI-set Cloudflare API token, stored encrypted
    * in its Durable Object.
    */
@@ -498,11 +506,43 @@ export const INITIAL_GLIDE_STATE: GlideState = {
 // Onboarding — a guided, doc-grounded flow for getting a team onto Cloudflare.
 // ---------------------------------------------------------------------------
 
+/**
+ * A snapshot of the default zone's real Cloudflare state, read live from the API
+ * so the onboarding checklist reflects the domain's actual configuration. All
+ * fields beyond `zoneId`/`ts` are best-effort: a reader that fails or lacks
+ * permission simply leaves its field undefined (the related step stays unticked).
+ */
+export interface LiveZoneFacts {
+  /** The zone this snapshot describes (matches {@link GlideState.defaultZone}.id). */
+  zoneId: string;
+  /** Zone name, when known. */
+  name?: string;
+  /** Activation status from the API: "active", "pending", "initializing", "moved", … */
+  status?: string;
+  /** SSL/TLS encryption mode ("off" | "flexible" | "full" | "strict" | "unknown"). */
+  sslMode?: "off" | "flexible" | "full" | "strict" | "unknown";
+  /** Whether the Cloudflare Managed WAF ruleset is deployed on the zone. */
+  wafManaged?: boolean;
+  /** Number of proxiable DNS records that are currently proxied (orange cloud). */
+  proxiedRecords?: number;
+  /** Number of proxiable DNS records total, from the most recent record listing. */
+  proxiableRecords?: number;
+  /** ms epoch these facts were captured. */
+  ts: number;
+}
+
 /** One step in the onboarding checklist (mirrors Cloudflare's go-live path). */
 export interface OnboardingStep {
   id: string;
   label: string;
   done: boolean;
+  /**
+   * Marked "not applicable" for this room's real situation — e.g. lowering TTLs
+   * before cutover once the zone is already active. Auto-derived from the live
+   * zone state (see {@link LiveZoneFacts}); counts as satisfied for progress but
+   * renders distinctly from a completed step. Never unset once set.
+   */
+  na?: boolean;
 }
 
 /** DNS zone setup type the team is targeting (see Cloudflare DNS zone setups). */

@@ -193,9 +193,27 @@ function renderOnboarding(state: GlideState): string {
   if (ob.configProvided) lines.push("- provider config: previewed ✓");
   if (ob.completed) lines.push("- guided setup: completed ✓");
   if (ob.checklist.length) {
-    const done = ob.checklist.filter((s) => s.done).length;
-    lines.push(`- checklist (${done}/${ob.checklist.length} done):`);
-    for (const s of ob.checklist) lines.push(`  - [${s.done ? "x" : " "}] ${s.label}`);
+    const complete = ob.checklist.filter((s) => s.done || s.na).length;
+    lines.push(`- checklist (${complete}/${ob.checklist.length} done):`);
+    for (const s of ob.checklist) {
+      const mark = s.done ? "x" : s.na ? "-" : " ";
+      const note = !s.done && s.na ? " (N/A for this zone)" : "";
+      lines.push(`  - [${mark}] ${s.label}${note}`);
+    }
+  }
+  const live = state.liveZone;
+  if (live && live.zoneId === state.defaultZone?.id) {
+    const parts: string[] = [];
+    if (live.status) parts.push(`status ${live.status}`);
+    if (live.sslMode) parts.push(`SSL ${live.sslMode}`);
+    if (typeof live.wafManaged === "boolean") parts.push(`managed WAF ${live.wafManaged ? "on" : "off"}`);
+    if (typeof live.proxiableRecords === "number")
+      parts.push(`proxied ${live.proxiedRecords ?? 0}/${live.proxiableRecords}`);
+    if (parts.length) {
+      lines.push(
+        `- LIVE ZONE STATE (read from Cloudflare — trust this over assumptions): ${parts.join(", ")}. Steps that this already satisfies are auto-ticked; do NOT ask the team to redo them. If the zone is active, nameserver change and activation are done and lowering TTLs no longer applies.`,
+      );
+    }
   }
   if (ob.path && !ob.domain) {
     lines.push(

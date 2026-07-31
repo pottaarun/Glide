@@ -59,6 +59,8 @@ import {
   cfGetAll,
   cfRequest,
   findZoneByName,
+  getZoneManagedWafDeployed,
+  getZoneSslMode,
   listAccounts,
   listZones,
   resolveRulesetEntrypointBaseline,
@@ -88,6 +90,7 @@ import {
   type GuidanceDoc,
   type Invite,
   type LegacyChatMigrationStatus,
+  type LiveZoneFacts,
   type MigrationCheck,
   type MigrationPlan,
   type MigrationPlanRule,
@@ -660,15 +663,25 @@ function checklistForPath(path?: OnboardingPath): OnboardingStep[] {
  * and the pending/applied action queue). This is what makes "the checklist on
  * the right fills itself in as Glide gathers the required info."
  *
- * It only ever ADDS completions — callers union the result with the existing
- * `done` flags and never uncheck, so manual checks and earlier auto-checks are
+ * It only ever ADDS completions and N/A marks — callers union the result with the
+ * existing flags and never uncheck, so manual checks and earlier auto-checks are
  * sticky. Returned ids that don't exist in the active checklist are ignored.
+ *
+ * `done` are steps proven satisfied (from captured answers, queued/applied
+ * actions, OR the domain's live zone state); `na` are steps that don't apply to
+ * this room's real situation (e.g. lowering TTLs once the zone is already active).
  */
 function autoDoneSteps(
   ob: OnboardingState,
-  signals: { migrationQueued: boolean; pending: PendingAction[]; results: ActionResult[] },
-): Set<string> {
+  signals: {
+    migrationQueued: boolean;
+    pending: PendingAction[];
+    results: ActionResult[];
+    liveZone?: LiveZoneFacts;
+  },
+): { done: Set<string>; na: Set<string> } {
   const done = new Set<string>();
+  const na = new Set<string>();
 
   // --- Captured directly in the guided conversation (or the form) ---
   if (ob.domain && ob.domain.trim()) done.add("domain");
@@ -696,7 +709,28 @@ function autoDoneSteps(
   for (const a of signals.pending) consider(a.product, a.path, a.summary);
   for (const r of signals.results) if (r.status === "applied") consider(r.product, "", r.summary);
 
-  return done;
+  // --- Derived from the domain's real, live Cloudflare state ---
+  // These reflect the actual zone, so they tick go-live steps a human would
+  // otherwise confirm by hand (nameservers/activation) and settings that may
+  // already be in place from outside this room (SSL, WAF, proxy). Callers only
+  // pass `liveZone` when it matches the current default zone, so it can't be
+  // stale here.
+  const live = signals.liveZone;
+  if (live) {
+    if (live.status === "active") {
+      // An active zone means the registrar nameservers already point to
+      // Cloudflare and activation is verified — and TTL-lowering before cutover
+      // is moot, so it no longer applies.
+      done.add("nameservers");
+      done.add("verify");
+      na.add("ttl");
+    }
+    if (live.sslMode === "full" || live.sslMode === "strict") done.add("ssl");
+    if (live.wafManaged === true) done.add("security");
+    if (typeof live.proxiedRecords === "number" && live.proxiedRecords > 0) done.add("proxy");
+  }
+
+  return { done, na };
 }
 
 /**
@@ -3478,6 +3512,55 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
   // Onboarding state (synced to the room; driven by the model and the UI).
   // ---------------------------------------------------------------------------
 
+  /** The live-zone snapshot, but only when it still describes the current default zone. */
+  private currentLiveZone(): LiveZoneFacts | undefined {
+    const live = this.state.liveZone;
+    const zoneId = this.state.defaultZone?.id;
+    return live && zoneId && live.zoneId === zoneId ? live : undefined;
+  }
+
+  /**
+   * Merge freshly-read facts into the room's live-zone snapshot, then re-derive
+   * the checklist so newly-known state ticks (or N/As) steps immediately. A
+   * snapshot for a different zone id is replaced wholesale — stale SSL/WAF/status
+   * must never leak across zones; a same-zone read merges field-by-field.
+   * Undefined fields are dropped so a failed reader never clobbers a prior value.
+   */
+  private mergeLiveZone(facts: Partial<LiveZoneFacts> & { zoneId: string }): void {
+    const prev = this.state.liveZone;
+    const base: LiveZoneFacts = prev && prev.zoneId === facts.zoneId ? prev : { zoneId: facts.zoneId, ts: 0 };
+    const clean = Object.fromEntries(Object.entries(facts).filter(([, v]) => v !== undefined));
+    const next: LiveZoneFacts = { ...base, ...clean, zoneId: facts.zoneId, ts: Date.now() };
+    this.setState({ ...this.state, liveZone: next });
+    this.recomputeOnboardingChecklist();
+  }
+
+  /**
+   * Read the default zone's live SSL mode and managed-WAF status (activation
+   * status is already known from the zone lookup) and fold them into the
+   * live-zone snapshot. Fully best-effort: reader failures/permission gaps just
+   * leave those fields unset, and a superseded credential or a since-changed
+   * default zone aborts the merge so we never record facts for the wrong zone.
+   */
+  private async captureLiveZoneFacts(
+    zoneId: string,
+    zoneName: string,
+    status: string | undefined,
+    credential: CredentialLease,
+  ): Promise<void> {
+    const facts: Partial<LiveZoneFacts> & { zoneId: string } = { zoneId, name: zoneName };
+    if (typeof status === "string" && status) facts.status = status;
+    const [ssl, waf] = await Promise.all([
+      getZoneSslMode(credential.token, zoneId),
+      getZoneManagedWafDeployed(credential.token, zoneId),
+    ]);
+    if (!this.isCredentialLeaseCurrent(credential)) return;
+    if (this.state.defaultZone?.id !== zoneId) return;
+    if (ssl.ok) facts.sslMode = ssl.result;
+    if (waf.ok) facts.wafManaged = waf.result;
+    this.mergeLiveZone(facts);
+  }
+
   /** Ensure an onboarding object exists (checklist is filled once a path is chosen). */
   private ensureOnboarding(): OnboardingState {
     return this.state.onboarding ?? { active: true, goals: [], checklist: [] };
@@ -3559,8 +3642,13 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
       ),
       pending: this.state.pendingActions,
       results: this.state.recentResults,
+      liveZone: this.currentLiveZone(),
     });
-    next.checklist = next.checklist.map((s) => (s.done || auto.has(s.id) ? { ...s, done: true } : s));
+    next.checklist = next.checklist.map((s) => {
+      const done = s.done || auto.done.has(s.id);
+      const na = Boolean(s.na) || auto.na.has(s.id);
+      return done === s.done && na === Boolean(s.na) ? s : { ...s, done, na };
+    });
     const unchanged =
       next.active === ob.active &&
       next.completed === ob.completed &&
@@ -3611,12 +3699,15 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
       ),
       pending: this.state.pendingActions,
       results: this.state.recentResults,
+      liveZone: this.currentLiveZone(),
     });
     let changed = false;
     const checklist = ob.checklist.map((s) => {
-      if (!s.done && auto.has(s.id)) {
+      const done = s.done || auto.done.has(s.id);
+      const na = Boolean(s.na) || auto.na.has(s.id);
+      if (done !== s.done || na !== Boolean(s.na)) {
         changed = true;
-        return { ...s, done: true };
+        return { ...s, done, na };
       }
       return s;
     });
@@ -5839,7 +5930,11 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
             const { defaultAccountId: _unverifiedAccount, ...stateWithoutAccount } = this.state;
             this.setState({ ...stateWithoutAccount, defaultZone: zone });
           }
-          return `Found zone ${zone.name} → ${zone.id}. Saved as the room's default zone.`;
+          // Capture the domain's live state (activation, SSL, WAF) so the go-live
+          // checklist reflects the real zone, not just actions queued in-room.
+          await this.captureLiveZoneFacts(zone.id, zone.name, res.result.status, credential);
+          const activation = res.result.status === "active" ? "" : ` (status: ${res.result.status})`;
+          return `Found zone ${zone.name} → ${zone.id}${activation}. Saved as the room's default zone.`;
         },
       }),
 
@@ -5865,6 +5960,21 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
           // Reviewing scanned DNS records completes the "review DNS records" step.
           if (this.state.onboarding?.active && !this.state.onboarding.dnsReviewed) {
             this.applyOnboardingPatch({ dnsReviewed: true }, turn.actor);
+          }
+          // Fold DNS proxy coverage into the live-zone snapshot so the "proxy
+          // status" step ticks from the real records. Only for a full (untyped)
+          // listing of the room's default zone, so a filtered or other-zone read
+          // never distorts the counts.
+          if (!type && this.state.defaultZone?.id === zoneId) {
+            let proxiable = 0;
+            let proxied = 0;
+            for (const r of res.result) {
+              if (r.proxiable === true) {
+                proxiable += 1;
+                if (r.proxied === true) proxied += 1;
+              }
+            }
+            this.mergeLiveZone({ zoneId, proxiedRecords: proxied, proxiableRecords: proxiable });
           }
           return clip(
             res.result.map((r) => ({

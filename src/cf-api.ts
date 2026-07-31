@@ -554,3 +554,45 @@ export async function findZoneByName(
   }
   return { ok: true, result: zone };
 }
+
+/** SSL/TLS encryption mode as reported by the zone settings endpoint. */
+export type ZoneSslMode = "off" | "flexible" | "full" | "strict" | "unknown";
+
+/**
+ * Read the zone's current SSL/TLS encryption mode (GET /zones/{id}/settings/ssl).
+ * Used to auto-tick the go-live "SSL" checklist step from the domain's real state
+ * rather than only from actions queued inside the room.
+ */
+export async function getZoneSslMode(token: string, zoneId: string): Promise<CfResult<ZoneSslMode>> {
+  const id = zoneId.trim();
+  if (!id) {
+    return { ok: false, status: 400, category: "validation", message: "A zone id is required to read the SSL mode." };
+  }
+  const res = await cfGet<{ value?: string }>(`/zones/${encodeURIComponent(id)}/settings/ssl`, token);
+  if (!res.ok) return res;
+  const value = typeof res.result?.value === "string" ? res.result.value : "";
+  const mode: ZoneSslMode =
+    value === "off" || value === "flexible" || value === "full" || value === "strict" ? value : "unknown";
+  return { ok: true, result: mode };
+}
+
+/**
+ * Report whether the zone has the Cloudflare Managed WAF deployed, by reading the
+ * managed-firewall phase entrypoint and checking for an enabled `execute` rule
+ * (GET /zones/{id}/rulesets/phases/http_request_firewall_managed/entrypoint).
+ * A missing entrypoint (404) is a definitive "not deployed", not an error.
+ */
+export async function getZoneManagedWafDeployed(token: string, zoneId: string): Promise<CfResult<boolean>> {
+  const id = zoneId.trim();
+  if (!id) {
+    return { ok: false, status: 400, category: "validation", message: "A zone id is required to read WAF status." };
+  }
+  const res = await cfGet<{ rules?: Array<Record<string, unknown>> }>(
+    `/zones/${encodeURIComponent(id)}/rulesets/phases/http_request_firewall_managed/entrypoint`,
+    token,
+  );
+  const baseline = resolveRulesetEntrypointBaseline(res);
+  if (!baseline.ok) return baseline;
+  const deployed = baseline.result.some((rule) => rule.action === "execute" && rule.enabled !== false);
+  return { ok: true, result: deployed };
+}

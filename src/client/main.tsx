@@ -4850,6 +4850,30 @@ function parsedAuditEntries(value: unknown): RoomAuditEntry[] {
   return out;
 }
 
+/** A read-only room snapshot returned to a non-member employee by /api/room-inspect. */
+interface InspectionSnapshot {
+  state: GlideState;
+  messages: UIMessage[];
+  audit: RoomAuditEntry[];
+}
+
+/** Defensively parse the `/api/room-inspect` snapshot payload. */
+function parsedInspectionSnapshot(value: unknown): InspectionSnapshot | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const snap = (value as { snapshot?: unknown }).snapshot;
+  if (!snap || typeof snap !== "object" || Array.isArray(snap)) return undefined;
+  const s = snap as { state?: unknown; messages?: unknown; audit?: unknown };
+  if (!s.state || typeof s.state !== "object" || Array.isArray(s.state)) return undefined;
+  const messages = (Array.isArray(s.messages) ? s.messages : []).filter(
+    (m): m is UIMessage =>
+      !!m &&
+      typeof m === "object" &&
+      typeof (m as { id?: unknown }).id === "string" &&
+      Array.isArray((m as { parts?: unknown }).parts),
+  );
+  return { state: s.state as GlideState, messages, audit: parsedAuditEntries(s.audit) };
+}
+
 /** Accent color for an audit action verb, to aid scanning the trail. */
 function auditActionColor(action: string): string {
   switch (action) {
@@ -4931,11 +4955,13 @@ function GuidanceTab({
   onSave,
   onDelete,
   onReindex,
+  readOnly = false,
 }: {
   docs: GuidanceDoc[];
-  onSave: (doc: GuidanceDraft) => Promise<unknown>;
-  onDelete: (id: string) => Promise<unknown>;
-  onReindex: () => Promise<unknown>;
+  onSave?: (doc: GuidanceDraft) => Promise<unknown>;
+  onDelete?: (id: string) => Promise<unknown>;
+  onReindex?: () => Promise<unknown>;
+  readOnly?: boolean;
 }) {
   const [draft, setDraft] = useState<GuidanceDraft | null>(null);
   const [busy, setBusy] = useState(false);
@@ -4943,7 +4969,7 @@ function GuidanceTab({
   const [notice, setNotice] = useState<string>();
 
   const reindex = async () => {
-    if (reindexing) return;
+    if (reindexing || !onReindex) return;
     setReindexing(true);
     try {
       const res = (await onReindex()) as { ok?: boolean; message?: string } | undefined;
@@ -4956,7 +4982,7 @@ function GuidanceTab({
   };
 
   const save = async () => {
-    if (!draft || busy) return;
+    if (!draft || busy || !onSave) return;
     setBusy(true);
     try {
       const res = (await onSave(draft)) as { ok?: boolean; message?: string } | undefined;
@@ -4970,25 +4996,25 @@ function GuidanceTab({
   };
 
   const toggle = (d: GuidanceDoc) =>
-    void onSave({ id: d.id, title: d.title, body: d.body, enabled: !d.enabled });
+    void onSave?.({ id: d.id, title: d.title, body: d.body, enabled: !d.enabled });
 
   const remove = (d: GuidanceDoc) => {
-    if (window.confirm(`Delete guidance "${d.title}"? This can't be undone.`)) void onDelete(d.id);
+    if (onDelete && window.confirm(`Delete guidance "${d.title}"? This can't be undone.`)) void onDelete(d.id);
   };
 
   return (
     <Panel
       title={`Guidance · ${docs.length}`}
-      meta={<span style={S.panelMeta}>steers Glide's questions · live</span>}
+      meta={<span style={S.panelMeta}>steers Glide's questions · {readOnly ? "read-only" : "live"}</span>}
     >
       <p style={S.hint}>
-        Notes you add here are injected into Glide's brain for this room, so it asks relevant,
-        team-specific onboarding questions — and skips what you've already answered. Enabled docs
-        take effect immediately; no rebuild or redeploy needed. With many docs, Glide semantically
-        retrieves only the most relevant ones per message (RAG).
+        Notes {readOnly ? "the team added here are" : "you add here are"} injected into Glide's brain for
+        this room, so it asks relevant, team-specific onboarding questions — and skips what's already
+        been answered. Enabled docs take effect immediately; no rebuild or redeploy needed. With many
+        docs, Glide semantically retrieves only the most relevant ones per message (RAG).
       </p>
 
-      {docs.length > 0 && (
+      {!readOnly && docs.length > 0 && (
         <div style={{ display: "flex", alignItems: "center", gap: 10, margin: "0 0 12px" }}>
           <button style={S.miniBtn} disabled={reindexing} onClick={reindex}>
             {reindexing ? "Reindexing…" : "Reindex for search"}
@@ -4999,7 +5025,7 @@ function GuidanceTab({
 
       {notice && <div style={S.guidanceNotice}>{notice}</div>}
 
-      {draft ? (
+      {!readOnly && (draft ? (
         <div style={S.guidanceEditor} className="glide-glass-card">
           <label style={S.label}>Title</label>
           <input
@@ -5044,10 +5070,16 @@ function GuidanceTab({
         >
           + Add guidance
         </button>
-      )}
+      ))}
 
       <div style={{ marginTop: 16 }}>
-        {docs.length === 0 && <Muted>No guidance yet. Add a note above to steer Glide's questions.</Muted>}
+        {docs.length === 0 && (
+          <Muted>
+            {readOnly
+              ? "No guidance in this room yet."
+              : "No guidance yet. Add a note above to steer Glide's questions."}
+          </Muted>
+        )}
         {docs.map((d) => (
           <div key={d.id} style={S.docRow} className="glide-glass-card">
             <div style={{ padding: "12px 16px" }}>
@@ -5065,15 +5097,19 @@ function GuidanceTab({
               </div>
               {d.body && <div style={S.guidanceBody}>{d.body}</div>}
               <div style={S.guidanceActions}>
-                <button style={S.miniBtn} onClick={() => setDraft({ id: d.id, title: d.title, body: d.body, enabled: d.enabled })}>
-                  Edit
-                </button>
-                <button style={S.miniBtn} onClick={() => toggle(d)}>
-                  {d.enabled ? "Disable" : "Enable"}
-                </button>
-                <button style={S.rejectBtnSm} onClick={() => remove(d)}>
-                  Delete
-                </button>
+                {!readOnly && (
+                  <>
+                    <button style={S.miniBtn} onClick={() => setDraft({ id: d.id, title: d.title, body: d.body, enabled: d.enabled })}>
+                      Edit
+                    </button>
+                    <button style={S.miniBtn} onClick={() => toggle(d)}>
+                      {d.enabled ? "Disable" : "Enable"}
+                    </button>
+                    <button style={S.rejectBtnSm} onClick={() => remove(d)}>
+                      Delete
+                    </button>
+                  </>
+                )}
                 {d.updatedBy && (
                   <span style={{ ...S.listMeta, marginLeft: "auto" }}>
                     by {d.updatedBy} · {relTime(d.ts)}
@@ -5213,32 +5249,77 @@ function AdminGate({ session }: { session: AccessSession }) {
       />
     );
   }
+  return <AdminRoomLoader key={room} room={room} />;
+}
+
+/**
+ * Resolve /admin access via `/api/room-inspect`, then mount the right dashboard:
+ * a member gets the LIVE dashboard (WebSocket); a verified Cloudflare employee
+ * who isn't a member gets the read-only INSPECTOR dashboard fed by an audited
+ * HTTP snapshot (no socket, zero mutation surface).
+ */
+function AdminRoomLoader({ room }: { room: string }) {
+  const [attempt, setAttempt] = useState(0);
+  const [payload, setPayload] = useState<{
+    access: RoomAccessStatus & { message?: string };
+    snapshot?: InspectionSnapshot;
+  }>();
+  const [error, setError] = useState<string>();
+  const recheck = useCallback(() => setAttempt((value) => value + 1), []);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    setPayload(undefined);
+    setError(undefined);
+    void fetchAccessJson(`/api/room-inspect?room=${encodeURIComponent(room)}`, controller.signal, "POST")
+      .then((value) => {
+        const access = parsedRoomAccessStatus(value);
+        if (!access) throw new Error("Glide returned a malformed inspection response.");
+        const snapshot = access.entry === "inspect" ? parsedInspectionSnapshot(value) : undefined;
+        if (access.entry === "inspect" && !snapshot) {
+          throw new Error("Glide returned an incomplete inspection snapshot.");
+        }
+        setPayload({ access, snapshot });
+      })
+      .catch((reason: unknown) => {
+        if (!controller.signal.aborted) {
+          setError(reason instanceof Error ? reason.message : "Glide could not open this room.");
+        }
+      });
+    return () => controller.abort();
+  }, [room, attempt]);
+
+  if (error) {
+    return (
+      <AccessCard
+        title="Room access required"
+        message={error}
+        action={<button style={S.primaryBtn} onClick={recheck}>Try again</button>}
+      />
+    );
+  }
+  if (!payload) return <AccessCard title="Opening room" message="Checking your access…" />;
+
+  const { access, snapshot } = payload;
   return (
-    <RoomAccessGate key={room} mode="inspect" room={room}>
-      {(access, recheckAccess) => (
-        <Suspense
-          fallback={
-            <div style={{ ...S.shell, alignItems: "center", justifyContent: "center" }} className="glide-shell">
-              <span style={{ color: "#9ca3af", fontSize: 15 }}>Loading admin…</span>
-            </div>
-          }
-        >
-          <AdminRoom
-            access={access}
-            key={room}
-            room={room}
-            name={access.email}
-            onAccessLost={recheckAccess}
-          />
-        </Suspense>
+    <Suspense
+      fallback={
+        <div style={{ ...S.shell, alignItems: "center", justifyContent: "center" }} className="glide-shell">
+          <span style={{ color: "#9ca3af", fontSize: 15 }}>Loading admin…</span>
+        </div>
+      }
+    >
+      {access.entry === "inspect" && snapshot ? (
+        <InspectorAdminRoom access={access} room={room} name={access.email} snapshot={snapshot} />
+      ) : (
+        <LiveAdminRoom access={access} room={room} name={access.email} onAccessLost={recheck} />
       )}
-    </RoomAccessGate>
+    </Suspense>
   );
 }
 
-/** The room-scoped admin dashboard: comms, actions, dev docs, onboarding & migration. */
-
-function AdminRoom({
+/** Members' admin dashboard: live WebSocket, editable guidance, on-demand audit. */
+function LiveAdminRoom({
   access,
   room,
   name,
@@ -5250,10 +5331,7 @@ function AdminRoom({
   onAccessLost: () => void;
 }) {
   const agentRoom = requiredRoomStorageName(room);
-  const docsManifest = use(loadAdminDocs());
   const [state, setState] = useState<GlideState>();
-  const [tab, setTab] = useState<AdminTab>("comms");
-  const [openDoc, setOpenDoc] = useState<string | null>(null);
   const [members, setMembers] = useState(access.members);
   const [audit, setAudit] = useState<RoomAuditEntry[]>();
   const [auditError, setAuditError] = useState<string>();
@@ -5277,18 +5355,6 @@ function AdminRoom({
     const candidate = actionResultEventCandidate(message);
     return !candidate || !verifiedActionResultEvents.has(actionResultEventKey(candidate));
   });
-
-  const chatLink = `/#${encodeURIComponent(room)}`;
-  const pending = state?.pendingActions ?? [];
-  const results = state?.recentResults ?? [];
-  const invites = state?.invites ?? [];
-  const applied = results.filter((r) => r.status === "applied").length;
-  const failed = results.filter((r) => r.status === "failed").length;
-  const rejected = results.filter((r) => r.status === "rejected").length;
-  const onboarding = state?.onboarding;
-  const plan = state?.migrationPlan;
-  const guidance = state?.guidance ?? [];
-  const guidanceActive = guidance.filter((d) => d.enabled).length;
 
   useEffect(() => {
     let cancelled = false;
@@ -5320,9 +5386,107 @@ function AdminRoom({
       .finally(() => setAuditLoading(false));
   }, [agent]);
 
+  return (
+    <AdminDashboard
+      mode="live"
+      room={room}
+      name={name}
+      state={state}
+      messages={messages}
+      members={members}
+      audit={audit}
+      auditError={auditError}
+      auditLoading={auditLoading}
+      onRefreshAudit={loadAudit}
+      canManageGuidance
+      onGuidanceSave={(doc) => agent.call("upsertGuidanceDoc", [doc, name])}
+      onGuidanceDelete={(id) => agent.call("deleteGuidanceDoc", [id])}
+      onGuidanceReindex={() => agent.call("reindexGuidance")}
+    />
+  );
+}
+
+/** Non-member employee's read-only inspector: rendered from an audited HTTP snapshot. */
+function InspectorAdminRoom({
+  access,
+  room,
+  name,
+  snapshot,
+}: {
+  access: RoomAccessStatus;
+  room: string;
+  name: string;
+  snapshot: InspectionSnapshot;
+}) {
+  // The snapshot is server-authoritative, so reserved action-result events are
+  // trusted and simply filtered out of the transcript (they surface under Actions).
+  const messages = snapshot.messages.filter((m) => !actionResultEventCandidate(m));
+  return (
+    <AdminDashboard
+      mode="inspect"
+      room={room}
+      name={name}
+      state={snapshot.state}
+      messages={messages}
+      members={access.members}
+      audit={snapshot.audit}
+      canManageGuidance={false}
+    />
+  );
+}
+
+/** The room-scoped admin dashboard: comms, actions, dev docs, onboarding & migration. */
+function AdminDashboard({
+  mode,
+  room,
+  name,
+  state,
+  messages,
+  members,
+  audit,
+  auditError,
+  auditLoading = false,
+  onRefreshAudit,
+  canManageGuidance,
+  onGuidanceSave,
+  onGuidanceDelete,
+  onGuidanceReindex,
+}: {
+  mode: "live" | "inspect";
+  room: string;
+  name: string;
+  state: GlideState | undefined;
+  messages: UIMessage[];
+  members: RoomMember[];
+  audit: RoomAuditEntry[] | undefined;
+  auditError?: string;
+  auditLoading?: boolean;
+  onRefreshAudit?: () => void;
+  canManageGuidance: boolean;
+  onGuidanceSave?: (doc: GuidanceDraft) => Promise<unknown>;
+  onGuidanceDelete?: (id: string) => Promise<unknown>;
+  onGuidanceReindex?: () => Promise<unknown>;
+}) {
+  const docsManifest = use(loadAdminDocs());
+  const [tab, setTab] = useState<AdminTab>("comms");
+  const [openDoc, setOpenDoc] = useState<string | null>(null);
+  const inspecting = mode === "inspect";
+
+  const chatLink = `/#${encodeURIComponent(room)}`;
+  const pending = state?.pendingActions ?? [];
+  const results = state?.recentResults ?? [];
+  const invites = state?.invites ?? [];
+  const applied = results.filter((r) => r.status === "applied").length;
+  const failed = results.filter((r) => r.status === "failed").length;
+  const rejected = results.filter((r) => r.status === "rejected").length;
+  const onboarding = state?.onboarding;
+  const plan = state?.migrationPlan;
+  const guidance = state?.guidance ?? [];
+  const guidanceActive = guidance.filter((d) => d.enabled).length;
+
   useEffect(() => {
-    if (tab === "audit") loadAudit();
-  }, [tab, loadAudit]);
+    if (tab === "audit") onRefreshAudit?.();
+  }, [tab, onRefreshAudit]);
 
   const tabs: Array<{ id: AdminTab; label: string; count?: number }> = [
     { id: "comms", label: "Comms", count: messages.length },
@@ -5340,6 +5504,11 @@ function AdminRoom({
           <img src="/cloudflare-mark.png" alt="Cloudflare" style={S.cfMark} />
           <span style={S.brandSm} className="glide-brand">Glide</span>
           <span style={S.adminTag}>Admin</span>
+          {inspecting && (
+            <span style={S.adminTag} title="You are not a member of this room — read-only inspection, and this visit is audited.">
+              inspecting · read-only
+            </span>
+          )}
           {state?.roomName && <span style={S.roomNameTag} title="Room name">{state.roomName}</span>}
           <span style={S.roomPill} className="glide-room-pill">#{room}</span>
         </div>
@@ -5491,9 +5660,10 @@ function AdminRoom({
         {tab === "guidance" && (
           <GuidanceTab
             docs={guidance}
-            onSave={(doc) => agent.call("upsertGuidanceDoc", [doc, name])}
-            onDelete={(id) => agent.call("deleteGuidanceDoc", [id])}
-            onReindex={() => agent.call("reindexGuidance")}
+            readOnly={!canManageGuidance}
+            onSave={onGuidanceSave}
+            onDelete={onGuidanceDelete}
+            onReindex={onGuidanceReindex}
           />
         )}
 
@@ -5708,10 +5878,12 @@ function AdminRoom({
             title={`Audit trail${audit ? ` · ${audit.length}` : ""}`}
             meta={
               <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-                <span style={S.panelMeta}>owner-only</span>
-                <button style={S.miniBtn} disabled={auditLoading} onClick={() => loadAudit()}>
-                  {auditLoading ? "Loading…" : "Refresh"}
-                </button>
+                <span style={S.panelMeta}>{inspecting ? "read-only" : "owner-only"}</span>
+                {onRefreshAudit && (
+                  <button style={S.miniBtn} disabled={auditLoading} onClick={() => onRefreshAudit()}>
+                    {auditLoading ? "Loading…" : "Refresh"}
+                  </button>
+                )}
                 <button
                   style={S.miniBtn}
                   disabled={!audit || audit.length === 0}
@@ -5733,7 +5905,9 @@ function AdminRoom({
           >
             <p style={S.hint}>
               Append-only record of who queued, applied, rejected, invited, and changed settings in this room.
-              Visible to the room owner only.
+              {inspecting
+                ? " Shown here for your read-only inspection; this visit was itself recorded."
+                : " Visible to the room owner only."}
             </p>
             {auditError ? (
               <Muted>{auditError}</Muted>

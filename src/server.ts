@@ -528,6 +528,28 @@ interface RoomAuthorizationResult {
   access?: RoomAccessStatus;
 }
 
+/**
+ * A read-only, point-in-time view of a room returned to a verified Cloudflare
+ * employee inspecting a room they are not a member of. Sourced entirely from the
+ * server's own persisted state — there is no socket, so nothing here can be
+ * mutated. Contains no secrets: {@link GlideState} only ever carries the token's
+ * last-4/validity, never the token itself.
+ */
+interface RoomInspectionSnapshot {
+  state: GlideState;
+  messages: UIMessage[];
+  audit: RoomAuditEntry[];
+}
+
+interface RoomInspectionResult {
+  allowed: boolean;
+  code: "member" | "inspect" | "room_membership_required";
+  message: string;
+  access?: RoomAccessStatus;
+  /** Present only when a non-member employee is granted read-only inspection. */
+  snapshot?: RoomInspectionSnapshot;
+}
+
 /** Runtime guard for persisted queue data before it can reach the privileged API client. */
 function pendingActionValidationError(action: PendingAction): string | undefined {
   if (!action || typeof action !== "object") return "Action data is not an object.";
@@ -2276,6 +2298,91 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
 
   async authorizeRoomAccess(identity: AccessIdentity): Promise<RoomAuthorizationResult> {
     return this.finalizeRoomAuthorization(this.evaluateRoomAuthorization(identity));
+  }
+
+  /**
+   * Read-only inspection for the `/admin` dashboard. Deliberately SEPARATE from
+   * {@link authorizeRoomAccess} (the socket/activation gate, which stays
+   * members-only) so widening inspection can never widen write access.
+   *
+   * - A room member is told to use the live socket (no snapshot, no audit entry).
+   * - A verified Cloudflare employee who is NOT a member gets an audited,
+   *   read-only snapshot of the room — state, transcript, and audit trail — and
+   *   never a connection, so the inspection has zero mutation surface.
+   * - Anyone else is denied. A room that was never activated (no members) is
+   *   reported as non-existent and queued for provisional cleanup, so inspecting
+   *   an unknown id can't materialize a junk room.
+   */
+  async inspectRoom(identity: AccessIdentity): Promise<RoomInspectionResult> {
+    const email = canonicalizeEmail(identity?.email);
+    const subject = typeof identity?.subject === "string" ? identity.subject.trim() : "";
+    const expiresAt = identity?.expiresAt;
+    if (
+      !email ||
+      !subject ||
+      subject.length > 512 ||
+      !Number.isSafeInteger(expiresAt) ||
+      expiresAt <= Math.floor(Date.now() / 1_000)
+    ) {
+      return {
+        allowed: false,
+        code: "room_membership_required",
+        message: "A current verified identity is required to inspect this room.",
+      };
+    }
+
+    const member = this.sql<{ role: RoomMember["role"] }>`SELECT role FROM glide_room_members
+      WHERE email = ${email} LIMIT 1`[0];
+    if (member) {
+      return {
+        allowed: true,
+        code: "member",
+        message: "Room access granted.",
+        access: {
+          email,
+          isEmployee: isCloudflareEmployeeEmail(email),
+          role: member.role,
+          members: this.roomMembers(),
+          entry: "member",
+        },
+      };
+    }
+
+    const memberCount = this.sql<{ count: number }>`SELECT COUNT(*) AS count FROM glide_room_members`[0]?.count ?? 0;
+    if (memberCount === 0) {
+      await this.queueFreshDeniedRoomDestroy();
+      return {
+        allowed: false,
+        code: "room_membership_required",
+        message: "This room does not exist yet.",
+      };
+    }
+    if (!isCloudflareEmployeeEmail(email)) {
+      return {
+        allowed: false,
+        code: "room_membership_required",
+        message: "This room is private. Ask a room member to invite your verified email address.",
+      };
+    }
+
+    this.recordAudit("inspect", email, undefined, "Opened the read-only admin inspector");
+    return {
+      allowed: true,
+      code: "inspect",
+      message: "Read-only inspection access granted.",
+      access: {
+        email,
+        isEmployee: true,
+        role: "inspector",
+        members: this.roomMembers(),
+        entry: "inspect",
+      },
+      snapshot: {
+        state: this.state,
+        messages: this.messages,
+        audit: this.roomAuditEntries(DEFAULT_ROOM_AUDIT_PAGE),
+      },
+    };
   }
 
   async activateRoomAccess(
@@ -8550,6 +8657,49 @@ export default {
       }
       return Response.json(
         { ...authorization.access, message: authorization.message },
+        { headers: { "Cache-Control": "no-store" } },
+      );
+    }
+
+    // Read-only inspection for the /admin dashboard. Members are told to use the
+    // live socket; verified Cloudflare employees who are NOT members get an
+    // audited, read-only snapshot (state + transcript + audit) and never a
+    // connection. Same-origin + authenticated, like /api/room-access.
+    if (requestUrl.pathname === "/api/room-inspect") {
+      if (request.method !== "POST") {
+        return new Response("Method not allowed", { status: 405, headers: { Allow: "POST" } });
+      }
+      if (!isSameOriginRequest(request)) {
+        return Response.json(
+          { code: "invalid_origin", message: "Room inspection requests require a same-origin request." },
+          { status: 403, headers: { "Cache-Control": "no-store" } },
+        );
+      }
+      const room = requestUrl.searchParams.get("room")?.trim();
+      const storageRoom = roomStorageName(room);
+      if (!storageRoom || isReservedSystemRoom(storageRoom)) {
+        return Response.json(
+          { code: "invalid_room", message: "Provide a valid room id." },
+          {
+            status: storageRoom && isReservedSystemRoom(storageRoom) ? 404 : 400,
+            headers: { "Cache-Control": "no-store" },
+          },
+        );
+      }
+      const authenticated = await authenticatedDynamicRequest(request, env);
+      if (authenticated instanceof Response) return authenticated;
+      const agent = await getAgentByName(env.GlideAgent, storageRoom);
+      // The Workers RPC return-type mapper reduces the embedded UIMessage[] to
+      // `never`; the runtime value is the real, structured-cloneable result.
+      const result = (await agent.inspectRoom(authenticated.identity)) as unknown as RoomInspectionResult;
+      if (!result.allowed || !result.access) {
+        return Response.json(
+          { code: result.code, message: result.message },
+          { status: 403, headers: { "Cache-Control": "no-store" } },
+        );
+      }
+      return Response.json(
+        { ...result.access, message: result.message, snapshot: result.snapshot },
         { headers: { "Cache-Control": "no-store" } },
       );
     }

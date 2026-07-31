@@ -12,6 +12,7 @@
 
 import {
   Component,
+  Fragment,
   StrictMode,
   Suspense,
   use,
@@ -2459,6 +2460,20 @@ function RoomSession({
 
   const pending = state?.pendingActions ?? [];
   const memory = useMemo(() => Object.entries(state?.memory ?? {}), [state?.memory]);
+  // The most recent assistant turn that ran `recommend_configuration` gets an
+  // inline, actionable recommendations card rendered right under it — same
+  // engine, same one-click Queue RPC as the sidebar panel, but surfaced where
+  // the advice actually appears in the conversation.
+  let lastRecommendMsgId: string | undefined;
+  for (const m of visibleMessages) {
+    if (
+      m.role !== "user" &&
+      messageText(m).tools.some(
+        (tool) => tool.name === "recommend_configuration" && tool.status === "complete",
+      )
+    )
+      lastRecommendMsgId = m.id;
+  }
   const anyActionApplying = pending.some(
     (action) => busyIds.has(action.id) || isActionApplying(action),
   );
@@ -2713,7 +2728,8 @@ function RoomSession({
               const { who, userStyle } = messageAuthor(m);
               const mine = m.role === "user" && who === name;
               return (
-                <div key={m.id} style={{ ...S.msgRow, justifyContent: mine ? "flex-end" : "flex-start" }}>
+                <Fragment key={m.id}>
+                <div style={{ ...S.msgRow, justifyContent: mine ? "flex-end" : "flex-start" }}>
                   {!mine && (
                     <div style={{ ...S.avatar, ...(userStyle ? S.avatarUser : S.avatarAi) }}>
                       {userStyle ? who.charAt(0).toUpperCase() : "G"}
@@ -2749,6 +2765,30 @@ function RoomSession({
                     <div style={{ ...S.avatar, ...S.avatarMine }}>{who.charAt(0).toUpperCase()}</div>
                   )}
                 </div>
+                {m.id === lastRecommendMsgId && hasProfileSignal(state?.businessProfile) && (
+                  <div style={{ ...S.msgRow, justifyContent: "flex-start" }}>
+                    <div style={{ ...S.avatar, ...S.avatarAi, visibility: "hidden" }} aria-hidden>
+                      G
+                    </div>
+                    <div
+                      className="glide-bubble"
+                      style={{ ...S.bubble, ...S.aiBubble, maxWidth: "min(94%, 560px)", width: "100%" }}
+                    >
+                      <div style={S.msgWho}>Recommended for you</div>
+                      <RecommendationsPanel
+                        profile={state!.businessProfile!}
+                        goals={onboarding?.goals}
+                        setupType={onboarding?.setupType}
+                        zoneId={state?.defaultZone?.id}
+                        pending={pending}
+                        results={state?.recentResults ?? []}
+                        onQueue={queueRecommendation}
+                        onAsk={askAboutRecommendation}
+                      />
+                    </div>
+                  </div>
+                )}
+                </Fragment>
               );
             })}
             {busy && (

@@ -107,6 +107,8 @@ import {
   type RoomAuditEntry,
   type RoomMember,
   type RoomRole,
+  type PostureDeltaView,
+  type PostureDriftView,
   type RoomSummary,
   type SecurityPostureCheckView,
   type SecurityPostureReport,
@@ -121,11 +123,15 @@ import {
   recommendationToPending,
 } from "./recommendations";
 import {
+  diffPosture,
+  formatDriftForModel,
   formatPostureForModel,
   isPostureFixQueueable,
   postureFixToPending,
   scorePosture,
   type PostureCheck,
+  type PostureDelta,
+  type PostureDrift,
   type PostureReport,
   type ZonePostureFacts,
 } from "./posture";
@@ -315,6 +321,8 @@ const LEGACY_CHAT_MIGRATION_RETRY_SEC = 30;
 const MAX_LEGACY_ARCHIVE_MESSAGE_BYTES = 1_800_000;
 const LEGACY_CHAT_TOKEN_DECRYPTION_FAILED = "token_decryption_failed";
 const LEGACY_CHAT_ENCRYPTION_KEY_UNAVAILABLE = "encryption_key_unavailable";
+/** Interval (seconds) between scheduled security-posture drift checks (~weekly). */
+const DRIFT_WATCH_INTERVAL_SEC = 7 * 24 * 60 * 60;
 
 function persistedChatMessageRole(
   rowId: string,
@@ -3751,14 +3759,107 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
   }
 
   /**
+   * Rebuild a minimal {@link PostureReport} from a stored baseline view so it can
+   * be fed to the pure {@link diffPosture}. Only the fields the differ reads
+   * (id/area/title/status per check, plus grade/score/ts) are meaningful; the
+   * check `weight`/`docs` are placeholders and never used for diffing.
+   */
+  private postureReportFromView(view: SecurityPostureReport): PostureReport {
+    return {
+      zoneId: view.zoneId,
+      zoneName: view.zoneName,
+      grade: view.grade,
+      score: view.score,
+      summary: view.summary,
+      tally: view.tally,
+      ts: view.ts,
+      checks: view.checks.map(
+        (c): PostureCheck => ({
+          id: c.id,
+          area: c.area,
+          title: c.title,
+          status: c.status,
+          detail: c.detail,
+          weight: 0,
+          docs: c.doc ? [c.doc] : [],
+        }),
+      ),
+    };
+  }
+
+  /**
+   * Project a computed drift onto the client-facing shape. The per-delta
+   * `queueable` flag is taken from the *current* report's checks so the drift
+   * banner can offer to re-queue a one-click fix for a regressed check.
+   */
+  private toClientDrift(drift: PostureDrift, current: PostureReport): PostureDriftView {
+    const queueableById = new Map(current.checks.map((c) => [c.id, isPostureFixQueueable(c)] as const));
+    const view = (d: PostureDelta): PostureDeltaView => ({
+      id: d.id,
+      area: d.area,
+      title: d.title,
+      from: d.from,
+      to: d.to,
+      direction: d.direction,
+      queueable: queueableById.get(d.id) ?? false,
+    });
+    return {
+      baselineTs: drift.baselineTs,
+      currentTs: drift.currentTs,
+      baselineGrade: drift.baselineGrade,
+      currentGrade: drift.currentGrade,
+      baselineScore: drift.baselineScore,
+      currentScore: drift.currentScore,
+      regressions: drift.regressions.map(view),
+      improvements: drift.improvements.map(view),
+      drifted: drift.drifted,
+      summary: drift.summary,
+    };
+  }
+
+  /** True when a report read enough to actually grade (>0 readable checks). */
+  private isGradeableReport(report: PostureReport): boolean {
+    return report.tally.pass + report.tally.warn + report.tally.fail > 0;
+  }
+
+  /**
+   * Fold a freshly-scored report into synced state: store the scorecard, and
+   * either auto-capture the zone's baseline (first gradeable check, or when the
+   * target zone changed) or recompute drift against the existing baseline. Shared
+   * by the on-demand posture check and the scheduled drift watch so both keep the
+   * baseline/drift bookkeeping identical. Returns the projected drift (if any).
+   */
+  private recordPostureReport(report: PostureReport, by?: string): PostureDriftView | undefined {
+    const next: GlideState = { ...this.state, securityPosture: this.toClientPostureReport(report, by) };
+    const baseline = this.state.postureBaseline;
+    const sameZoneBaseline = baseline && baseline.zoneId === report.zoneId;
+    let drift: PostureDriftView | undefined;
+    if (!sameZoneBaseline) {
+      // No baseline for this zone yet (or the target zone changed): bless the
+      // current report as the baseline once it's actually gradeable, and clear any
+      // stale drift carried over from a previous zone.
+      if (this.isGradeableReport(report)) {
+        next.postureBaseline = this.toClientPostureReport(report, by);
+      }
+      next.postureDrift = undefined;
+    } else {
+      drift = this.toClientDrift(diffPosture(this.postureReportFromView(baseline), report), report);
+      next.postureDrift = drift;
+    }
+    this.setState(next);
+    return drift;
+  }
+
+  /**
    * Read the room's default zone's live config, grade it, store the scorecard in
-   * synced state, and return the full report (for chat relay). Shared by the
-   * `security_posture` tool, the "Check now" RPC, and (later) the drift watch.
+   * synced state (auto-capturing/comparing the drift baseline), and return the
+   * full report (for chat relay). Shared by the `security_posture` tool, the
+   * "Check now" RPC, and the scheduled drift watch.
    */
   private async computeSecurityPosture(
     by: string,
     isCurrent: () => boolean,
-  ): Promise<{ ok: true; report: PostureReport } | { ok: false; message: string }> {
+  ): Promise<{ ok: true; report: PostureReport; drift?: PostureDriftView } | { ok: false; message: string }> {
     const zone = this.state.defaultZone;
     if (!zone) return { ok: false, message: "No target zone yet — ask Glide to find your zone first." };
     const credential = await this.getCredentialLease();
@@ -3771,8 +3872,71 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
       return { ok: false, message: "The target zone changed while the posture check ran — run it again." };
     }
     const report = scorePosture(facts);
-    this.setState({ ...this.state, securityPosture: this.toClientPostureReport(report, by) });
-    return { ok: true, report };
+    const drift = this.recordPostureReport(report, by);
+    return { ok: true, report, drift };
+  }
+
+  /**
+   * Arm the recurring drift watch: schedule the next `runDriftWatch` and cancel
+   * any stale siblings. Mirrors {@link armLegacyChatMigration} — the successor is
+   * created *before* cleanup so an in-flight alarm callback (whose one-shot row
+   * the SDK deletes on return) isn't returned by idempotent scheduling.
+   */
+  private async armDriftWatch(delaySeconds: number, replace = false): Promise<void> {
+    const successor = await this.schedule(delaySeconds, "runDriftWatch", {}, { idempotent: !replace });
+    for (const schedule of await this.listSchedules()) {
+      if (schedule.callback !== "runDriftWatch" || schedule.id === successor.id) continue;
+      try {
+        await this.cancelSchedule(schedule.id);
+      } catch {
+        this.logChatEvent("posture.drift_watch_schedule_cleanup_failed", {}, "warn");
+      }
+    }
+  }
+
+  /** Cancel every scheduled drift-watch run (used when the watch is turned off). */
+  private async cancelDriftWatchSchedules(): Promise<void> {
+    for (const schedule of await this.listSchedules()) {
+      if (schedule.callback === "runDriftWatch") await this.cancelSchedule(schedule.id);
+    }
+  }
+
+  /**
+   * Scheduled callback (public so the DO scheduler can invoke it by name): the
+   * weekly drift check. Re-scores the zone's live posture — which updates the
+   * synced scorecard and drift banner via {@link recordPostureReport} — records
+   * the run time, and re-arms itself for the next interval while the watch stays
+   * enabled. It never posts chat messages or mutates Cloudflare; drift surfaces
+   * only through synced state. Failures are swallowed so a transient outage never
+   * kills the recurring schedule.
+   */
+  async runDriftWatch(): Promise<void> {
+    const watch = this.state.driftWatch;
+    if (!watch?.enabled) {
+      // The watch was turned off since this run was scheduled — stop the loop.
+      await this.cancelDriftWatchSchedules();
+      return;
+    }
+    if (this.state.defaultZone) {
+      try {
+        const res = await this.computeSecurityPosture("the weekly drift watch", () => true);
+        if (res.ok) {
+          this.setState({ ...this.state, driftWatch: { ...watch, lastCheckedTs: Date.now() } });
+          if (res.drift?.drifted) {
+            this.logChatEvent(
+              "posture.drift_detected",
+              { regressions: res.drift.regressions.length },
+              "warn",
+            );
+          }
+        }
+      } catch {
+        this.logChatEvent("posture.drift_watch_failed", {}, "warn");
+      }
+    }
+    // Recurring: re-arm for the next interval (replacing this executing one-shot)
+    // as long as the watch is still enabled.
+    if (this.state.driftWatch?.enabled) await this.armDriftWatch(DRIFT_WATCH_INTERVAL_SEC, true);
   }
 
   /**
@@ -3796,8 +3960,8 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     if (!isCurrent()) return { ok: false, message: "Room access ended before the fix could be prepared." };
     if (!this.isCredentialLeaseCurrent(credential)) return { ok: false, message: this.credentialSupersededMessage() };
     const report = scorePosture(facts);
-    // Refresh the stored scorecard while we have fresh facts.
-    this.setState({ ...this.state, securityPosture: this.toClientPostureReport(report, this.state.securityPosture?.by) });
+    // Refresh the stored scorecard (and drift) while we have fresh facts.
+    this.recordPostureReport(report, this.state.securityPosture?.by);
     const check = report.checks.find((c) => c.id === checkId);
     if (!check) return { ok: false, message: "That posture check no longer applies to this zone." };
     if (check.status === "pass") return { ok: false, message: `"${check.title}" already passes — nothing to queue.` };
@@ -4282,15 +4446,101 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
   @callable()
   async refreshSecurityPosture(
     by = "someone",
-  ): Promise<{ ok: boolean; message: string; grade?: string; score?: number }> {
+  ): Promise<{ ok: boolean; message: string; grade?: string; score?: number; drifted?: boolean }> {
     const actor = this.verifiedActor(by);
     const res = await this.computeSecurityPosture(actor, () => true);
     if (!res.ok) return { ok: false, message: res.message };
+    const drift =
+      res.drift && res.drift.drifted
+        ? ` ${res.drift.regressions.length} check${res.drift.regressions.length === 1 ? "" : "s"} drifted from the baseline.`
+        : "";
     return {
       ok: true,
-      message: `Security posture graded ${res.report.grade} (${res.report.score}/100).`,
+      message: `Security posture graded ${res.report.grade} (${res.report.score}/100).${drift}`,
       grade: res.report.grade,
       score: res.report.score,
+      drifted: res.drift?.drifted,
+    };
+  }
+
+  /**
+   * UI: bless the zone's *current* live configuration as the known-good baseline
+   * the drift watch compares against — the "Set baseline" button in the Security
+   * posture panel. Member-or-owner only (a room-config change, not a proposal).
+   * Re-reads live state so the baseline reflects reality, then clears any drift.
+   */
+  @callable()
+  async setPostureBaseline(
+    by = "someone",
+  ): Promise<{ ok: boolean; message: string; grade?: string; score?: number }> {
+    this.requireCommitRole("set the security-posture baseline");
+    const actor = this.verifiedActor(by);
+    const res = await this.computeSecurityPosture(actor, () => true);
+    if (!res.ok) return { ok: false, message: res.message };
+    if (!this.isGradeableReport(res.report)) {
+      return {
+        ok: false,
+        message:
+          "Couldn't read enough of the zone's configuration to set a baseline — check the API token's read permissions.",
+      };
+    }
+    // Bless the freshly-scored live report as the new baseline and clear drift —
+    // there is nothing to compare against a brand-new baseline.
+    this.setState({
+      ...this.state,
+      postureBaseline: this.toClientPostureReport(res.report, actor),
+      postureDrift: undefined,
+    });
+    this.recordAudit(
+      "posture_baseline",
+      actor,
+      res.report.zoneId,
+      `grade ${res.report.grade} (${res.report.score}/100)`,
+    );
+    return {
+      ok: true,
+      message: `Baseline set at grade ${res.report.grade} (${res.report.score}/100). Glide will flag any future drift from this.`,
+      grade: res.report.grade,
+      score: res.report.score,
+    };
+  }
+
+  /**
+   * UI: enable or disable the weekly configuration-drift watch — the "Watch
+   * weekly" toggle in the Security posture panel. Member-or-owner only. Enabling
+   * auto-captures a baseline (if none) so the first scheduled run has something to
+   * compare against, then arms a recurring ~7-day posture recheck that updates the
+   * synced drift banner. No chat messages are posted (that's a later phase).
+   */
+  @callable()
+  async setDriftWatch(
+    enabled: boolean,
+    by = "someone",
+  ): Promise<{ ok: boolean; message: string; enabled: boolean }> {
+    this.requireCommitRole("change the configuration-drift watch");
+    const actor = this.verifiedActor(by);
+    const on = enabled === true;
+    if (on && !this.state.defaultZone) {
+      return { ok: false, message: "No target zone yet — ask Glide to find your zone first.", enabled: false };
+    }
+    if (on && (!this.state.postureBaseline || this.state.postureBaseline.zoneId !== this.state.defaultZone?.id)) {
+      // Auto-capture a baseline so the watch has something to compare against.
+      const res = await this.computeSecurityPosture(actor, () => true);
+      if (!res.ok) return { ok: false, message: res.message, enabled: false };
+    }
+    this.setState({
+      ...this.state,
+      driftWatch: { enabled: on, by: actor, ts: Date.now(), lastCheckedTs: this.state.driftWatch?.lastCheckedTs },
+    });
+    if (on) await this.armDriftWatch(DRIFT_WATCH_INTERVAL_SEC, true);
+    else await this.cancelDriftWatchSchedules();
+    this.recordAudit("drift_watch", actor, this.state.defaultZone?.id, on ? "enabled" : "disabled");
+    return {
+      ok: true,
+      enabled: on,
+      message: on
+        ? "Weekly drift watch is on — Glide will re-check this zone's posture about every 7 days and flag drift from the baseline."
+        : "Drift watch is off.",
     };
   }
 
@@ -6898,7 +7148,9 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
         execute: async () => {
           const res = await this.computeSecurityPosture(turn.actor, () => this.isChatTurnAccessCurrent(turn));
           if (!res.ok) return `Error: ${res.message}`;
-          return clip(formatPostureForModel(res.report));
+          let text = formatPostureForModel(res.report);
+          if (res.drift?.drifted) text += `\n\n---\n${formatDriftForModel(res.drift)}`;
+          return clip(text);
         },
       }),
 

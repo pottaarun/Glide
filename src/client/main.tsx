@@ -57,6 +57,7 @@ import {
   type OnboardingPath,
   type OnboardingState,
   type PendingAction,
+  type PostureDriftView,
   type RoomAccessStatus,
   type RoomAuditEntry,
   type RoomMember,
@@ -2479,6 +2480,18 @@ function RoomSession({
     },
     [sendChatText],
   );
+  // Configuration-drift watch: bless the zone's current live state as the
+  // known-good baseline, and toggle the weekly drift check. Both are member+
+  // config changes; the server re-reads live state to build the baseline.
+  const setPostureBaseline = useCallback(
+    () => runRpc<{ ok: boolean; message: string; grade?: string; score?: number }>("setPostureBaseline", [name]),
+    [runRpc, name],
+  );
+  const setDriftWatch = useCallback(
+    (enabled: boolean) =>
+      runRpc<{ ok: boolean; message: string; enabled: boolean }>("setDriftWatch", [enabled, name]),
+    [runRpc, name],
+  );
 
   // Blast-radius preview: per-pending-action impact estimate, loaded on demand.
   const [impacts, setImpacts] = useState<
@@ -3146,9 +3159,15 @@ function RoomSession({
               <SecurityPosturePanel
                 report={state?.securityPosture}
                 zoneId={state?.defaultZone?.id}
+                baseline={state?.postureBaseline}
+                drift={state?.postureDrift}
+                driftWatch={state?.driftWatch}
+                canWrite={canWrite}
                 onRefresh={refreshSecurityPosture}
                 onQueueFix={queuePostureFix}
                 onAsk={askPostureFix}
+                onSetBaseline={setPostureBaseline}
+                onSetDriftWatch={setDriftWatch}
               />
             </Section>
           )}
@@ -3836,15 +3855,28 @@ const POSTURE_STATUS_RANK: Record<SecurityPostureCheckView["status"], number> = 
 function SecurityPosturePanel({
   report,
   zoneId,
+  baseline,
+  drift,
+  driftWatch,
+  canWrite,
   onRefresh,
   onQueueFix,
   onAsk,
+  onSetBaseline,
+  onSetDriftWatch,
 }: {
   report?: SecurityPostureReport;
   zoneId?: string;
+  baseline?: SecurityPostureReport;
+  drift?: PostureDriftView;
+  driftWatch?: { enabled: boolean; by?: string; ts: number; lastCheckedTs?: number };
+  /** Member-or-owner: gates the baseline/drift-watch config controls (viewers can still read). */
+  canWrite?: boolean;
   onRefresh?: () => Promise<{ ok: boolean; message: string } | undefined>;
   onQueueFix?: (checkId: string) => Promise<{ ok: boolean; message: string; id?: string } | undefined>;
   onAsk?: (ask: string) => void;
+  onSetBaseline?: () => Promise<{ ok: boolean; message: string } | undefined>;
+  onSetDriftWatch?: (enabled: boolean) => Promise<{ ok: boolean; message: string; enabled: boolean } | undefined>;
 }) {
   const [busy, setBusy] = useState<string>();
   const [msg, setMsg] = useState<string>();
@@ -3864,6 +3896,24 @@ function SecurityPosturePanel({
     setBusy(checkId);
     setMsg(undefined);
     const res = await onQueueFix(checkId);
+    setBusy(undefined);
+    if (res && !res.ok) setMsg(res.message);
+  };
+
+  const setBaseline = async () => {
+    if (!onSetBaseline) return;
+    setBusy("__baseline");
+    setMsg(undefined);
+    const res = await onSetBaseline();
+    setBusy(undefined);
+    if (res) setMsg(res.message);
+  };
+
+  const toggleWatch = async () => {
+    if (!onSetDriftWatch) return;
+    setBusy("__watch");
+    setMsg(undefined);
+    const res = await onSetDriftWatch(!driftWatch?.enabled);
     setBusy(undefined);
     if (res && !res.ok) setMsg(res.message);
   };
@@ -3915,6 +3965,67 @@ function SecurityPosturePanel({
           </button>
         )}
       </div>
+      {!readOnly && canWrite && (onSetBaseline || onSetDriftWatch) && (
+        <div style={S.driftControls}>
+          {onSetBaseline && (
+            <button
+              style={{ ...S.miniBtn, ...(!zoneId || busy === "__baseline" ? S.recBtnDisabled : null) }}
+              disabled={!zoneId || busy === "__baseline"}
+              onClick={() => void setBaseline()}
+              title="Bless the zone's current live configuration as the known-good baseline to watch for drift against"
+            >
+              {busy === "__baseline" ? "Setting…" : baseline ? "Reset baseline" : "Set baseline"}
+            </button>
+          )}
+          {onSetDriftWatch && (
+            <button
+              style={{
+                ...S.miniBtn,
+                ...(driftWatch?.enabled ? S.driftWatchOn : null),
+                ...(!zoneId || busy === "__watch" ? S.recBtnDisabled : null),
+              }}
+              disabled={!zoneId || busy === "__watch"}
+              onClick={() => void toggleWatch()}
+              title="Re-check this zone's posture about every 7 days and flag any drift from the baseline"
+            >
+              {busy === "__watch" ? "…" : driftWatch?.enabled ? "Watching weekly ✓" : "Watch weekly"}
+            </button>
+          )}
+        </div>
+      )}
+      {baseline && (
+        <div style={S.postureBaselineMeta}>
+          Baseline grade {baseline.grade} ({baseline.score}/100) · set {relTime(baseline.ts)}
+          {driftWatch?.enabled && driftWatch.lastCheckedTs ? ` · last watch ${relTime(driftWatch.lastCheckedTs)}` : ""}
+        </div>
+      )}
+      {drift?.drifted && (
+        <div style={S.driftBanner}>
+          <div style={S.driftBannerHead}>⚠ Drift from baseline — {drift.summary}</div>
+          {drift.regressions.map((d) => (
+            <div key={d.id} style={S.driftRow}>
+              <span style={S.driftText}>
+                [{d.area}] {d.title}: {d.from} → <b>{d.to}</b>
+              </span>
+              {!readOnly && d.queueable && (
+                <button
+                  style={{ ...S.recQueueBtn, ...(!zoneId || busy === d.id ? S.recBtnDisabled : null) }}
+                  disabled={!zoneId || busy === d.id}
+                  onClick={() => void queueFix(d.id)}
+                  title="Queue the fix to restore this check to the baseline"
+                >
+                  {busy === d.id ? "Queuing…" : "Queue fix"}
+                </button>
+              )}
+            </div>
+          ))}
+          {drift.improvements.length > 0 && (
+            <div style={S.driftImproved}>
+              {drift.improvements.length} check{drift.improvements.length === 1 ? "" : "s"} recovered since the baseline.
+            </div>
+          )}
+        </div>
+      )}
       {msg && <div style={S.recMsg}>{msg}</div>}
       {checks.map((c) => (
         <div key={c.id} style={S.recRow} className="glide-lift">
@@ -6517,6 +6628,14 @@ const S: Record<string, React.CSSProperties> = {
   impactErr: { fontSize: 12, color: "#fca5a5" },
   postureHead: { display: "flex", alignItems: "center", gap: 11, marginBottom: 10 },
   postureGrade: { fontSize: 26, fontWeight: 800, lineHeight: 1, width: 44, height: 44, display: "grid", placeItems: "center", borderRadius: 10, border: "2px solid", background: "rgba(9,12,17,.5)", fontFamily: DISPLAY, flexShrink: 0 },
+  driftControls: { display: "flex", alignItems: "center", gap: 8, marginBottom: 8, flexWrap: "wrap" },
+  driftWatchOn: { borderColor: "rgba(52,211,153,.4)", background: "rgba(52,211,153,.1)", color: "#6ee7b7" },
+  postureBaselineMeta: { fontSize: 11, color: "#8595a8", marginBottom: 8 },
+  driftBanner: { border: "1px solid rgba(251,191,36,.3)", background: "rgba(251,191,36,.06)", borderRadius: 8, padding: "9px 11px", marginBottom: 10 },
+  driftBannerHead: { fontSize: 12.5, fontWeight: 700, color: "#fbbf24", lineHeight: 1.4, marginBottom: 7 },
+  driftRow: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, margin: "5px 0", flexWrap: "wrap" },
+  driftText: { fontSize: 12, color: "#cbd5e1", lineHeight: 1.4 },
+  driftImproved: { fontSize: 11, color: "#6ee7b7", marginTop: 6 },
   recTitleRow: { display: "flex", alignItems: "center", gap: 8 },
   recDot: { width: 8, height: 8, borderRadius: 999, flexShrink: 0 },
   recTitle: { fontSize: 13.5, fontWeight: 600, color: "#f1f5f9", lineHeight: 1.35 },

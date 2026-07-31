@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  diffPosture,
+  formatDriftForModel,
   formatPostureForModel,
   gradeForScore,
   isPostureFixQueueable,
@@ -175,4 +177,111 @@ test("formatPostureForModel renders the grade and groups by status", () => {
   assert.match(text, /grade [A-F] \(\d+\/100\)/i);
   assert.match(text, /FAILING/);
   assert.match(text, /Fix: queue/);
+});
+
+// --- Configuration-drift watch (diffPosture) -------------------------------
+
+test("identical posture reports show no drift", () => {
+  const baseline = scorePosture(strongFacts(), 1_000);
+  const current = scorePosture(strongFacts(), 2_000);
+  const drift = diffPosture(baseline, current);
+  assert.equal(drift.drifted, false);
+  assert.equal(drift.regressions.length, 0);
+  assert.equal(drift.improvements.length, 0);
+  assert.equal(drift.baselineTs, 1_000);
+  assert.equal(drift.currentTs, 2_000);
+  assert.equal(drift.baselineGrade, "A");
+  assert.equal(drift.currentGrade, "A");
+  assert.match(drift.summary, /no posture drift/i);
+});
+
+test("a check that got worse is reported as a regression with from/to", () => {
+  const baseline = scorePosture(strongFacts());
+  const current = scorePosture(strongFacts({ sslMode: "flexible" }));
+  const drift = diffPosture(baseline, current);
+  assert.equal(drift.drifted, true);
+  assert.equal(drift.regressions.length, 1);
+  const reg = drift.regressions[0];
+  assert.equal(reg.id, "ssl_mode");
+  assert.equal(reg.from, "pass");
+  assert.equal(reg.to, "fail");
+  assert.equal(reg.direction, "regression");
+  assert.ok(drift.currentScore < drift.baselineScore);
+  assert.match(drift.summary, /1 posture regression/i);
+});
+
+test("a check that recovered is an improvement, not drift", () => {
+  const baseline = scorePosture(strongFacts({ sslMode: "flexible" }));
+  const current = scorePosture(strongFacts());
+  const drift = diffPosture(baseline, current);
+  assert.equal(drift.drifted, false);
+  assert.equal(drift.regressions.length, 0);
+  assert.equal(drift.improvements.length, 1);
+  assert.equal(drift.improvements[0].id, "ssl_mode");
+  assert.equal(drift.improvements[0].direction, "improvement");
+  assert.match(drift.summary, /improved/i);
+});
+
+test("transitions involving an unreadable status are ignored (both directions)", () => {
+  const readable = scorePosture(strongFacts());
+  const sslUnknown = scorePosture(strongFacts({ sslMode: undefined }));
+  assert.equal(checkById(sslUnknown, "ssl_mode").status, "unknown");
+  // pass -> unknown is not a regression.
+  assert.equal(diffPosture(readable, sslUnknown).regressions.length, 0);
+  assert.equal(diffPosture(readable, sslUnknown).improvements.length, 0);
+  // unknown -> pass is not an improvement.
+  assert.equal(diffPosture(sslUnknown, readable).improvements.length, 0);
+  assert.equal(diffPosture(sslUnknown, readable).regressions.length, 0);
+});
+
+test("regressions are ordered worst severity-jump first", () => {
+  const baseline = scorePosture(strongFacts());
+  // hsts pass->warn (jump 1); ssl_mode pass->fail (jump 2).
+  const current = scorePosture(strongFacts({ hsts: false, sslMode: "flexible" }));
+  const drift = diffPosture(baseline, current);
+  assert.deepEqual(
+    drift.regressions.map((d) => d.id),
+    ["ssl_mode", "hsts"],
+  );
+});
+
+test("a regression carries whether its fix is one-click queueable", () => {
+  const baseline = scorePosture(strongFacts());
+  // ssl_mode (queueable one-click) regresses; managed_waf (chat-guided) also regresses.
+  const current = scorePosture(strongFacts({ sslMode: "flexible", managedWaf: false }));
+  const drift = diffPosture(baseline, current);
+  const ssl = drift.regressions.find((d) => d.id === "ssl_mode");
+  const waf = drift.regressions.find((d) => d.id === "managed_waf");
+  assert.equal(ssl?.direction, "regression");
+  assert.equal(waf?.direction, "regression");
+  // diffPosture itself doesn't compute queueable (the server projection does), but
+  // the underlying checks must still map correctly for that projection.
+  assert.equal(isPostureFixQueueable(checkById(current, "ssl_mode")), true);
+  assert.equal(isPostureFixQueueable(checkById(current, "managed_waf")), false);
+});
+
+test("mixed regressions and improvements are both reported", () => {
+  const baseline = scorePosture(strongFacts({ sslMode: "flexible" })); // ssl fails
+  const current = scorePosture(strongFacts({ hsts: false })); // ssl recovers, hsts warns
+  const drift = diffPosture(baseline, current);
+  assert.equal(drift.drifted, true);
+  assert.deepEqual(drift.regressions.map((d) => d.id), ["hsts"]);
+  assert.deepEqual(drift.improvements.map((d) => d.id), ["ssl_mode"]);
+  assert.match(drift.summary, /regression/i);
+  assert.match(drift.summary, /improvement/i);
+});
+
+test("formatDriftForModel renders regressions and the re-queue prompt", () => {
+  const drift = diffPosture(scorePosture(strongFacts()), scorePosture(strongFacts({ sslMode: "flexible" })));
+  const text = formatDriftForModel(drift);
+  assert.match(text, /## REGRESSIONS/);
+  assert.match(text, /PASS → FAIL/);
+  assert.match(text, /re-queue the one-click fixes/i);
+});
+
+test("formatDriftForModel shows improvements without a regressions section", () => {
+  const drift = diffPosture(scorePosture(strongFacts({ sslMode: "flexible" })), scorePosture(strongFacts()));
+  const text = formatDriftForModel(drift);
+  assert.match(text, /## IMPROVEMENTS/);
+  assert.doesNotMatch(text, /## REGRESSIONS/);
 });

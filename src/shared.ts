@@ -179,7 +179,9 @@ export type RoomAuditAction =
   | "token_clear"
   | "rename"
   | "destroy"
-  | "inspect";
+  | "inspect"
+  | "posture_baseline"
+  | "drift_watch";
 
 /**
  * One append-only governance audit entry: who did what, when. Stored in SQLite
@@ -289,6 +291,28 @@ export interface GlideState {
    * {@link SecurityPostureReport}.
    */
   securityPosture?: SecurityPostureReport;
+  /**
+   * The known-good security-posture scorecard a member blessed as this zone's
+   * baseline. The scheduled drift watch (and the on-demand posture check) compare
+   * the live report against it to surface configuration that has drifted away
+   * from the secure baseline. Auto-captured the first time posture is scored, and
+   * re-settable from the UI via `setPostureBaseline`. See {@link SecurityPostureReport}.
+   */
+  postureBaseline?: SecurityPostureReport;
+  /**
+   * The most recent comparison of the live posture against {@link postureBaseline}
+   * (which checks regressed vs. recovered, and the grade/score movement). Recomputed
+   * whenever posture is scored and by the weekly drift watch. See {@link PostureDriftView}.
+   */
+  postureDrift?: PostureDriftView;
+  /**
+   * Weekly configuration-drift watch. When enabled, a scheduled task rescopes the
+   * zone's live posture roughly every 7 days and updates {@link postureDrift} in
+   * synced state (no chat messages are posted — external/chat notification is a
+   * later phase). `ts` is when the watch was last (un)armed; `lastCheckedTs` is the
+   * last scheduled run.
+   */
+  driftWatch?: { enabled: boolean; by?: string; ts: number; lastCheckedTs?: number };
   /**
    * A running "further reading" list of Cloudflare docs pages the RAG retriever
    * surfaced while answering this room's questions (see {@link DocLink}). Deduped
@@ -585,6 +609,43 @@ export interface SecurityPostureReport {
   ts: number;
   /** Who ran the check (email/name), for display. */
   by?: string;
+}
+
+/**
+ * A single posture check whose status changed between the blessed baseline and
+ * the current report, projected to the room UI. See {@link ./posture.PostureDelta}.
+ */
+export interface PostureDeltaView {
+  id: string;
+  area: "TLS" | "WAF" | "DNS" | "Network";
+  title: string;
+  from: PostureCheckStatus;
+  to: PostureCheckStatus;
+  direction: "regression" | "improvement";
+  /** True when this regressed check has a one-click fix that can be re-queued. */
+  queueable: boolean;
+}
+
+/**
+ * Configuration-drift summary synced to the UI: how the room's live posture has
+ * moved relative to {@link GlideState.postureBaseline}. Powers the drift banner
+ * in the posture panel. See {@link ./posture.PostureDrift} for the source shape.
+ */
+export interface PostureDriftView {
+  baselineTs: number;
+  currentTs: number;
+  baselineGrade: "A" | "B" | "C" | "D" | "F";
+  currentGrade: "A" | "B" | "C" | "D" | "F";
+  baselineScore: number;
+  currentScore: number;
+  /** Checks that drifted toward less-secure, worst first. */
+  regressions: PostureDeltaView[];
+  /** Checks that recovered since the baseline. */
+  improvements: PostureDeltaView[];
+  /** True when there is at least one regression. */
+  drifted: boolean;
+  /** One-line natural-language summary. */
+  summary: string;
 }
 
 /** One step in the onboarding checklist (mirrors Cloudflare's go-live path). */

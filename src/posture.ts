@@ -475,3 +475,132 @@ export function formatPostureForModel(report: PostureReport): string {
   );
   return lines.join("\n");
 }
+
+// ---------------------------------------------------------------------------
+// Configuration-drift watch
+//
+// A "baseline" is simply a previously-scored PostureReport that a human blessed
+// as the known-good state. diffPosture compares a fresh report against it and
+// reports which checks *regressed* (drifted away from secure) or *recovered*.
+// Like everything else here it is pure and deterministic so the scheduled watch
+// and the on-demand tool share exactly one implementation.
+// ---------------------------------------------------------------------------
+
+/** Severity ordering used to decide whether a status change is a regression. */
+const DRIFT_SEVERITY: Record<PostureStatus, number> = { pass: 0, warn: 1, fail: 2, unknown: -1 };
+
+/** A single check whose status changed between the baseline and the current report. */
+export interface PostureDelta {
+  id: string;
+  area: PostureArea;
+  title: string;
+  /** Status in the baseline report. */
+  from: PostureStatus;
+  /** Status in the current report. */
+  to: PostureStatus;
+  /** "regression" = drifted toward less-secure; "improvement" = recovered. */
+  direction: "regression" | "improvement";
+}
+
+/** The result of comparing a current report against a blessed baseline. */
+export interface PostureDrift {
+  /** ms epoch of the baseline report. */
+  baselineTs: number;
+  /** ms epoch of the current report. */
+  currentTs: number;
+  baselineGrade: PostureGrade;
+  currentGrade: PostureGrade;
+  baselineScore: number;
+  currentScore: number;
+  /** Checks that got worse, worst jump first. */
+  regressions: PostureDelta[];
+  /** Checks that got better. */
+  improvements: PostureDelta[];
+  /** True when there is at least one regression. */
+  drifted: boolean;
+  /** One-line natural-language summary (deterministic — no dates). */
+  summary: string;
+}
+
+/**
+ * Compare a freshly-scored report against a blessed baseline. Transitions that
+ * involve an `unknown` (unreadable) status on either side are ignored — a fact we
+ * couldn't read is not evidence that the configuration changed. Pure and
+ * deterministic: identical inputs always produce an identical drift.
+ */
+export function diffPosture(baseline: PostureReport, current: PostureReport): PostureDrift {
+  const baseById = new Map(baseline.checks.map((c) => [c.id, c] as const));
+  const regressions: PostureDelta[] = [];
+  const improvements: PostureDelta[] = [];
+  for (const cur of current.checks) {
+    const base = baseById.get(cur.id);
+    if (!base) continue; // a check that didn't exist at baseline — nothing to compare
+    if (base.status === "unknown" || cur.status === "unknown") continue;
+    if (base.status === cur.status) continue;
+    const delta: PostureDelta = {
+      id: cur.id,
+      area: cur.area,
+      title: cur.title,
+      from: base.status,
+      to: cur.status,
+      direction: DRIFT_SEVERITY[cur.status] > DRIFT_SEVERITY[base.status] ? "regression" : "improvement",
+    };
+    (delta.direction === "regression" ? regressions : improvements).push(delta);
+  }
+  // Worst regressions first (largest severity jump).
+  const jump = (d: PostureDelta) => DRIFT_SEVERITY[d.to] - DRIFT_SEVERITY[d.from];
+  regressions.sort((a, b) => jump(b) - jump(a));
+  improvements.sort((a, b) => jump(a) - jump(b));
+
+  const gradeMove =
+    current.grade === baseline.grade
+      ? `grade held at ${current.grade}`
+      : `grade ${baseline.grade}→${current.grade}`;
+  let summary: string;
+  if (regressions.length === 0 && improvements.length === 0) {
+    summary = `No posture drift since the baseline — ${gradeMove} (${current.score}/100).`;
+  } else if (regressions.length > 0) {
+    summary =
+      `${regressions.length} posture regression${regressions.length === 1 ? "" : "s"} since the baseline` +
+      (improvements.length ? ` (and ${improvements.length} improvement${improvements.length === 1 ? "" : "s"})` : "") +
+      `: ${gradeMove} (${baseline.score}→${current.score}).`;
+  } else {
+    summary =
+      `Posture improved since the baseline: ${improvements.length} check${improvements.length === 1 ? "" : "s"} recovered — ` +
+      `${gradeMove} (${baseline.score}→${current.score}).`;
+  }
+
+  return {
+    baselineTs: baseline.ts,
+    currentTs: current.ts,
+    baselineGrade: baseline.grade,
+    currentGrade: current.grade,
+    baselineScore: baseline.score,
+    currentScore: current.score,
+    regressions,
+    improvements,
+    drifted: regressions.length > 0,
+    summary,
+  };
+}
+
+/** Render a drift result as compact text for the model to relay in chat. */
+export function formatDriftForModel(drift: PostureDrift): string {
+  const lines: string[] = [drift.summary];
+  const render = (d: PostureDelta) => `- [${d.area}] ${d.title}: ${d.from.toUpperCase()} → ${d.to.toUpperCase()}`;
+  if (drift.regressions.length) {
+    lines.push("", "## REGRESSIONS (config drifted away from a secure baseline)");
+    for (const d of drift.regressions) lines.push(render(d));
+  }
+  if (drift.improvements.length) {
+    lines.push("", "## IMPROVEMENTS (recovered since the baseline)");
+    for (const d of drift.improvements) lines.push(render(d));
+  }
+  if (drift.regressions.length) {
+    lines.push(
+      "",
+      "Offer to re-queue the one-click fixes for the regressed checks (each is a proposal a human Applies — never claim anything changed until Applied).",
+    );
+  }
+  return lines.join("\n");
+}

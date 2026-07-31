@@ -18,9 +18,11 @@ and the threat model's sharp edges.
   that execute an LLM-queued `PendingAction` with
   `cfRequest(action.method, action.path, …)`. `applyAll()` delegates to the same
   internal path for an exact reviewed ID set; it is not a second write mechanism.
-- Automated migration validation and zone snapshot capture/list/restore/rollback
-  are disabled fail-closed. They have no LLM tools or UI controls; compatibility
-  RPCs return disabled errors, and legacy restore approvals are rejected.
+- Post-migration **Verify** (`runValidate`) is read-only and browser-initiated
+  (not an LLM tool): it checks only that intended rules are *present*, never
+  comparing values. Zone snapshot capture/list/restore/rollback stay disabled
+  fail-closed with no LLM tools or UI controls; their compatibility RPCs return
+  disabled errors, and legacy restore approvals are rejected.
 - The system prompt reinforces this (`src/system-prompt.ts`): the model is
   instructed never to claim a change is "done/live/created" until it's applied.
 
@@ -328,6 +330,42 @@ remain defense in depth; Access plus the durable ACL is the authorization system
   their error. A durable scheduled chat event informs Glide of Apply/Reject
   outcomes, so the conversation does not keep waiting on a completed decision.
 
+## Governance & change-safety controls
+
+These optional controls sit on top of the queue → Apply contract. None of them
+lets a single click widen the write surface: real writes still route through the
+one `applyActionInternal()` path with its credential-lease and safety-read guards.
+
+- **Four-eyes dual approval.** `setFourEyes` is **owner-only**. When enabled, an
+  action needs `REQUIRED_APPROVALS` = 2 **distinct verified approvers**
+  (`approveAction`) before it applies — approvals are deduped by verified email, so
+  the same person clicking twice doesn't count, and `withdrawApproval` backs one out
+  before Apply. The apply happens in the final approver's session, under their own
+  authorization lease.
+- **Auto-rollback window.** When a member opts in while applying an *invertible*
+  zone-setting change, Glide records a **server-authored** inverse
+  (`buildRollbackPlan`, `src/rollback.ts`) and arms a 15-minute `runAutoRollback`
+  alarm. The change auto-reverts unless someone calls `keepAppliedChange`, or reverts
+  early via `revertAppliedChange`. The Keep/Revert RPCs take only the window id —
+  clients never supply the executable inverse, which lives in synced state they
+  can't mutate. `executeRollback` removes the window before sending the inverse, so
+  a manual "Revert now" racing the timer can't double-apply.
+- **Scheduled / maintenance-window Apply.** `scheduleApply` stamps a queued action
+  with `scheduledFor`; it stays `pending` until a `runScheduledApply` alarm fires and
+  applies it through the normal path. `cancelScheduledApply` clears the timer.
+- **Drift watch.** `setDriftWatch` arms a weekly `runDriftWatch` alarm that re-scores
+  the zone with the room's stored credential, compares it to the saved baseline, and
+  raises a governance event on movement. It reads only.
+- **Governance notifications.** `setNotifyWebhook` is **owner-only**. The URL must be
+  HTTPS and pass an SSRF guard (`validateWebhookUrl`, `src/notify.ts`): it rejects
+  IP-literal hosts, the `localhost` / `metadata.google.internal` denylist and the
+  `.internal` / `.local` / `.localdomain` suffixes, and requires a fully-qualified
+  public hostname. It is stored AES-256-GCM encrypted in `glide_secrets` (the same
+  `GLIDE_TOKEN_KEY`-derived scheme as API tokens), is **never** synced or returned
+  (only a masked host appears in state), and `deliverWebhook` bounds each POST with a
+  timeout and backoff retry. Governance events also populate a capped in-app
+  `notifications` feed.
+
 ## Migration previews never write
 
 The migration-tool client (`src/migration.ts`) only ever calls **read-only**
@@ -346,11 +384,15 @@ that traffic inside the Cloudflare runtime, so it works even when the migration
 tool's public hostname is protected by Cloudflare Access — no public request, no
 Access challenge.
 
-Automated post-migration validation is disabled because the migration service
-does not compare complete live rule and setting values. Snapshot capture, listing,
-restore, and rollback are disabled because complete, fail-safe recovery cannot be
-guaranteed. The server exposes neither capability to the model or UI and returns
-explicit errors from compatibility RPCs.
+Post-migration **Verify** (the `runValidate` RPC) confirms the plan's intended
+rules are *present* in the target zone. Because the migration service does not
+compare complete live rule and setting values, this is a name/type presence check
+that never implies a full match — its summary says so explicitly, and critical
+rules still get a direct review. Verify is read-only and browser-initiated (not an
+LLM tool). Snapshot capture, listing, restore, and rollback stay disabled because
+complete, fail-safe recovery cannot be guaranteed; the server exposes those to
+neither the model nor the UI and returns explicit errors from their compatibility
+RPCs.
 
 ## The Cloudflare-docs RAG only reads public docs
 
@@ -367,14 +409,19 @@ canonical. Successful pages replace deterministic vectors in place; removed page
 are deleted only after complete product enumeration. The job has no write path to
 your Cloudflare account.
 
-## Disabled migration validation and recovery paths
+## Post-migration verify and disabled recovery paths
 
-There is no current snapshot or automated validation workflow. `runValidate`,
-`snapshotZone`, `refreshSnapshots`, and `restoreSnapshot` are compatibility stubs
-that always return `{ ok: false }`. The UI has no controls for them, the LLM has no
+`runValidate` (the **Verify** button) is an active, read-only check: it calls
+`/api/validate-config` and reports how many of the plan's intended rules are
+*present* in the target zone by name/type. It never compares rule values, and its
+summary says so, so a pass means "present," not "correct."
+
+There is no snapshot or automated-recovery workflow. `snapshotZone`,
+`refreshSnapshots`, and `restoreSnapshot` are compatibility stubs that always
+return `{ ok: false }`. The UI has no controls for them, the LLM has no
 corresponding tools, and legacy `/api/restore` or `/api/rollback` approvals are
-recognized and refused by Apply. Operators must verify the reviewed live
-configuration directly and use an external backup/change-management process when
+recognized and refused by Apply. Operators must verify critical live rule and
+setting values directly and use an external backup/change-management process when
 rollback protection is required.
 
 ## Input-size & resource limits
@@ -429,7 +476,7 @@ These limits bound resource use and protect the model's context window:
 | Dropping existing ruleset rules on Apply | Re-read + merge at apply time; refuse the write if the safety read fails | Concurrent changes after the final read remain possible; review the live result directly. |
 | A message appears sent during a disconnect | Send-time socket validation and server-authoritative transcript check | Delivery can be temporarily unconfirmed while both WebSocket and verification fetch are unavailable; wait for **live** before retrying. |
 | Migration tool causing writes | Enabled operations are read-only/export only; `/api/migrations/start` is never used, and snapshot/restore/rollback paths fail closed | Trust boundary is the migration service you configure. |
-| False confidence from incomplete migration validation | Automated validation is disabled; operators verify the reviewed live values directly | Verification is manual and must cover the intended rules and settings. |
+| False confidence from incomplete migration validation | Verify reports only name/type *presence* and is framed as such ("values aren't compared, so review critical rules directly"); it never claims a full match | Present ≠ correct — operators must still review critical rule values directly. |
 | Incomplete snapshot restore | Snapshot capture/list/restore/rollback have no tools or UI; compatibility paths fail closed and legacy approvals are refused | Glide provides no automated rollback; use an external recovery process. |
 
 ## Operator recommendations

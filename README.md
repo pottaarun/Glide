@@ -135,8 +135,18 @@ This README is the overview. In-depth docs live in [`docs/`](docs/):
 - **Provider migration (read-only first).** Translate an exported Akamai / Fastly /
   Imperva / Zscaler / Prisma Access / Cisco Umbrella / Proofpoint config into
   Cloudflare rules, with pre-flight permission checks, a target-zone diff, and
-  Terraform & CSV export. Automated post-migration validation and zone snapshot
-  operations are disabled fail-closed; verify the reviewed live configuration directly.
+  Terraform & CSV export, plus an on-demand **Verify** that confirms the plan's
+  intended rules are present in the target zone (a name/type presence check —
+  values aren't compared, so critical rules still get a direct review). Zone
+  snapshot capture/restore/rollback stay disabled fail-closed.
+- **Governance & change-safety controls.** A security-posture scorecard (graded
+  A–F across TLS/WAF/DNS/Network) with one-click **Queue fix**, an optional weekly
+  **drift watch** against a saved baseline, a per-action **blast-radius** estimate,
+  an opt-in 15-minute **auto-rollback** window on invertible changes,
+  **scheduled/maintenance-window Apply**, owner-set **four-eyes** dual approval, and
+  **governance notifications** (an in-app feed plus an owner-set, encrypted,
+  SSRF-guarded webhook). All of it keeps the reads-run / writes-wait contract —
+  nothing here widens what a single click can change.
 - **Team guidance (semantic RAG).** Admins add per-room "guidance" docs (house
   rules, preferred defaults, onboarding questions to ask). They're embedded with
   Workers AI and stored in **Vectorize**; at chat time Glide retrieves only the
@@ -214,7 +224,7 @@ it cannot create a new room or claim an unowned legacy room.
 | `src/chat-delivery.ts` | Server-authoritative delivery classification and admission validation plus Cloudflare token detection and persistence redaction. |
 | `src/chat-message-ledger.ts` | Durable accepted-user-message ID ledger schema and trigger, preventing replay after transcript pruning. |
 | `src/rate-limits.ts` | Pure abuse-control policy helpers: opaque client/room keys, binding outcomes, route selection, and retryable HTTP responses. |
-| `src/migration.ts` | Client for the Switchflare / migration tool Worker (preview, Terraform/CSV, pre-flight, and diff), with fail-closed guards for disabled validation and snapshot mutation endpoints. |
+| `src/migration.ts` | Client for the Switchflare / migration tool Worker (preview, Terraform/CSV, pre-flight, diff, and a read-only post-migration verify presence check), with fail-closed guards for the disabled snapshot mutation endpoints. |
 | `src/env.d.ts` | Augments the generated `Cloudflare.Env` with secrets not declared in `wrangler.jsonc`. |
 | `vite.config.ts` | Builds the client to `dist/client` and exposes the build-time docs manifest (`virtual:glide-docs`) that powers the admin **Dev docs** tab. |
 | `wrangler.jsonc` | Worker config: Durable Object, AI, Vectorize, rate-limit, optional MIGRATION, and static-asset bindings plus the model vars. |
@@ -591,15 +601,61 @@ preview path is **read-only** — nothing changes until queued rules are Applied
 **Supported providers:** Akamai, Fastly, Imperva (Incapsula), Zscaler ZIA,
 Zscaler ZPA, Prisma Access, Cisco Umbrella, Akamai EAA, Proofpoint.
 
-Automated post-migration validation is **disabled fail-closed** because the
-migration service does not compare complete live rule and setting values. Verify
-the reviewed Cloudflare configuration directly after Apply. Zone snapshot capture,
-listing, restore, and rollback are also disabled because complete, fail-safe
-recovery cannot be guaranteed. Glide exposes no model tools or UI controls for
-these paths; compatibility RPCs return disabled errors.
+After Apply, a **Verify** button (the `runValidate` RPC) confirms the plan's
+intended rules are **present** in the target zone. This is a name/type presence
+check — the migration service does not compare complete live rule and setting
+values — so it never implies a full match; review critical rules directly in
+Cloudflare. Verify is browser-initiated only; it is **not** an LLM tool. Zone
+snapshot capture, listing, restore, and rollback remain disabled because
+complete, fail-safe recovery cannot be guaranteed. Glide exposes no model tools
+or UI controls for those snapshot paths; their compatibility RPCs return disabled
+errors.
 
 > Deep dive (wizard steps, checklists, the translation table for what
 > `queue_migration_rules` can map): [docs/onboarding-and-migration.md](docs/onboarding-and-migration.md).
+
+---
+
+## Governance & change-safety controls
+
+Glide layers change-management controls on top of the reads-run / writes-wait
+contract. Everything here is server-authored and audited, and none of it lets a
+single click widen the write surface.
+
+- **Security posture scorecard** (`src/posture.ts`). `refreshSecurityPosture`
+  scores the default zone's live TLS/WAF/DNS/Network configuration into a graded
+  report card (A–F, 0–100) with per-check pass/warn/fail and concrete fixes;
+  unreadable checks are `unknown` and don't move the grade. The model can read it
+  through the `security_posture` tool, and a **Queue fix** button
+  (`queuePostureFix`) turns a recommendation into a normal pending action.
+- **Drift watch** (`src/posture.ts`). `setPostureBaseline` saves the current
+  scorecard as a baseline; `setDriftWatch` arms a weekly `runDriftWatch` alarm that
+  re-scores the zone, compares it to the baseline, and raises a governance event
+  (and a banner) when posture moves.
+- **Blast-radius estimate** (`src/blast-radius.ts`). A pure `estimateBlastRadius`
+  classifies a pending action's reach as low / medium / high / unknown before you
+  Apply — surfaced as the `estimate_impact` tool and the `estimateActionImpact` RPC.
+- **Auto-rollback window** (`src/rollback.ts`). When a member opts in while applying
+  an *invertible* zone-setting change, Glide stores the server-authored inverse and
+  arms a 15-minute revert timer (`runAutoRollback`). The change auto-reverts when
+  the timer fires unless someone hits **Keep** (`keepAppliedChange`) first — or
+  reverts early with **Revert now** (`revertAppliedChange`).
+- **Scheduled / maintenance-window Apply** (`scheduleApply` / `cancelScheduledApply`).
+  A queued action can carry a `scheduledFor` timestamp; it stays pending until a
+  Durable Object alarm (`runScheduledApply`) fires, then applies through the normal
+  path.
+- **Four-eyes dual approval** (`setFourEyes`, owner-only). When enabled, a queued
+  action needs a second member's `approveAction` before it can be applied;
+  `withdrawApproval` backs one out.
+- **Governance notifications** (`src/notify.ts`). Applied/failed changes, rollbacks,
+  drift, and approvals appear in an in-app notifications feed and, if an **owner**
+  configures a webhook (`setNotifyWebhook` / `testNotifyWebhook`), post to Slack or
+  a structured JSON endpoint. The URL is validated (HTTPS + SSRF guard), stored
+  AES-256-GCM encrypted, and never synced back to clients (only a masked host is
+  shown); delivery (`deliverWebhook`) times out and retries with backoff.
+
+> Deep dive: [docs/security.md](docs/security.md) (controls and threat model) and
+> [docs/tools.md](docs/tools.md) (the exact RPCs and tools).
 
 ---
 
@@ -671,6 +727,8 @@ only add a pending action for human approval.
 | `list_dns_records` | List DNS records for a zone (optionally by type). Folds proxy coverage into the live-zone facts (ticks the proxy-status step). |
 | `cf_get` | Generic READ against Cloudflare v4 JSON REST endpoints that use the standard API envelope. |
 | `recommend_configuration` | Turn the room's business profile into tailored, priority-ranked Cloudflare recommendations (rationale + docs). Read-only — it proposes; the write builders queue. |
+| `security_posture` | Score the default zone's live TLS/WAF/DNS/Network config into a graded (A–F) report card with per-check pass/warn/fail and fixes. Read-only. |
+| `estimate_impact` | Estimate a pending action's blast radius (low / medium / high / unknown) before it's applied. Read-only. |
 
 ### Memory & collaboration
 
@@ -773,10 +831,11 @@ answers that drive `recommend_configuration`), `list_migration_providers`,
   snapshot; ruleset-phase replacements re-read current rules and fail closed if
   that safety read fails.
 - **Migration previews never write.** Glide only calls the migration tool's
-  enabled read-only/export endpoints; it never triggers a direct deploy. Automated
-  validation and snapshot/restore/rollback paths are disabled fail-closed. Preview
-  sources/plans, checks, and Terraform/CSV artifacts are saved only while the
-  initiating socket-session lease remains current.
+  enabled read-only/export endpoints; it never triggers a direct deploy. The
+  post-migration **Verify** presence check is read-only; snapshot/restore/rollback
+  paths remain disabled fail-closed. Preview sources/plans, checks, and
+  Terraform/CSV artifacts are saved only while the initiating socket-session lease
+  remains current.
 
 > Full threat model, the encryption scheme (HKDF → AES-256-GCM), and operator
 > recommendations: [docs/security.md](docs/security.md).

@@ -11,11 +11,11 @@ These pages document how Glide actually works, drawn directly from the source in
 
 | Doc | What's inside |
 | --- | --- |
-| [Architecture](./architecture.md) | The Worker + `GlideAgent` Durable Object, room-name mapping, Access authorization and provisional-room lifecycle, room naming/deletion + the room registry (`GET /api/rooms`), per-room roles + audit table, the audited employee room-inspection path (`POST /api/room-inspect`), layered rate limiting, request/chat-turn and delivery lifecycles, the source-file map, synced state, SQLite tables, structured events, both RAG paths, the weekly cron, and `/admin`. |
+| [Architecture](./architecture.md) | The Worker + `GlideAgent` Durable Object, room-name mapping, Access authorization and provisional-room lifecycle, room naming/deletion + the room registry (`GET /api/rooms`), per-room roles + audit table, the audited employee room-inspection path (`POST /api/room-inspect`), layered rate limiting, request/chat-turn and delivery lifecycles, the source-file map, synced state (incl. the governance & change-safety fields), SQLite tables, structured events, both RAG paths, the weekly cron, and `/admin`. |
 | [Setup & configuration](./setup.md) | Prerequisites, local development, Access application and membership setup, every env var / secret and binding, rate-limit namespace/tuning details, Cloudflare-docs RAG, API-token permissions, and production deployment. |
-| [Tools & RPC reference](./tools.md) | Every LLM tool (reads run, writes queue), rate-limited active client RPCs, and fail-closed compatibility stubs: approvals, token setup, invites + roles (`setMemberRole`) + audit log, room naming/deletion, delivery reports, onboarding, recommendations, migration, and guidance. |
+| [Tools & RPC reference](./tools.md) | Every LLM tool (reads run, writes queue), rate-limited active client RPCs, and fail-closed compatibility stubs: approvals, token setup, invites + roles (`setMemberRole`) + audit log, room naming/deletion, delivery reports, onboarding, recommendations, migration, the governance & change-safety controls (posture, drift, blast-radius, auto-rollback, scheduled Apply, four-eyes, notifications), and guidance. |
 | [Onboarding & migration](./onboarding-and-migration.md) | The guided wizard, rate-limit-safe retries, onboarding checklists (auto-ticked from live-zone state, with N/A steps), business discovery, tailored recommendations, and the read-only provider-migration pipeline. |
-| [Security model](./security.md) | Signed Access identity, durable room ACLs and denied-probe cleanup, per-room roles (owner/member/viewer) + the audit trail, owner-gated room deletion, the employee-only room registry and read-only room inspection, at-rest token encryption, redaction, authenticated-traffic abuse controls, writes-always-through-a-human, disabled recovery paths, and the threat model. |
+| [Security model](./security.md) | Signed Access identity, durable room ACLs and denied-probe cleanup, per-room roles (owner/member/viewer) + the audit trail, owner-gated room deletion, the employee-only room registry and read-only room inspection, at-rest token encryption, redaction, authenticated-traffic abuse controls, writes-always-through-a-human, the governance & change-safety controls, post-migration verify vs. the disabled recovery paths, and the threat model. |
 | [Troubleshooting & observability](./troubleshooting.md) | LIVE/RECONNECTING recovery, `429`/`503` handling, authoritative delivery checks, structured events, production log queries, and incident workflow. |
 
 ## The one thing to remember
@@ -29,8 +29,8 @@ mutating Cloudflare endpoint. Creating/updating/deleting only appends a
 `PendingAction` to the room's shared queue; an LLM-queued write reaches Cloudflare
 only through the server approval path after a person reviews its request and
 clicks **Apply**. Uncertain outcomes cannot be bulk retried. See [Security
-model](./security.md) for the full guarantee and the fail-closed disabled
-validation/snapshot paths.
+model](./security.md) for the full guarantee, the governance & change-safety
+controls, and the fail-closed disabled snapshot/recovery paths.
 
 ## Operational quick links
 

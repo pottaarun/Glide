@@ -441,13 +441,22 @@ field is broadcast to all clients via `onStateUpdate` (`src/client/main.tsx`).
 | `migrationPlan` | `MigrationPlan?` | Most recent provider-config preview as CF rules (rules capped at `MAX_PLAN_RULES` = 300, `src/server.ts`). |
 | `terraform` | `TerraformArtifact?` | Most recent Terraform export (downloadable). |
 | `csv` | `TerraformArtifact?` | Most recent CSV export (downloadable). |
-| `migrationCheck` | `MigrationCheck?` | Result of the last active preflight or diff. Legacy validation results are removed on room startup. |
+| `migrationCheck` | `MigrationCheck?` | Result of the last active migration check — `preflight`, `diff`, or `validate` (post-migration **Verify**; `src/shared.ts`). |
 | `snapshots` | `SnapshotInfo[]?` | Legacy state shape only; current code neither populates nor renders it, and snapshot-list RPCs fail closed. |
 | `migrationToolConfigured` | `boolean?` | Whether migration import is configured (binding or URL); this is not a health check. |
+| `securityPosture` | `SecurityPostureReport?` | Latest security-posture scorecard for the default zone (grade A–F, 0–100 score, per-check pass/warn/fail; `src/posture.ts`). Populated by `refreshSecurityPosture` / the `security_posture` tool and the drift watch. |
+| `postureBaseline` | `SecurityPostureReport?` | Saved scorecard that drift is compared against (`setPostureBaseline`). |
+| `postureDrift` | `PostureDriftView?` | Most recent comparison of live posture to `postureBaseline`; powers the drift banner. |
+| `driftWatch` | `{ enabled, by?, ts, lastCheckedTs? }?` | Weekly `runDriftWatch` alarm state (armed by `setDriftWatch`). |
+| `pendingRollbacks` | `PendingRollback[]?` | Armed auto-rollback windows (server-authored inverse + expiry) for just-applied invertible changes; reverted by the `runAutoRollback` alarm unless kept, capped at `MAX_PENDING_ROLLBACKS`. |
+| `fourEyes` | `{ enabled, by?, ts }?` | Owner-set dual-approval policy; when on, actions need `REQUIRED_APPROVALS` = 2 distinct approvers. |
+| `notifications` | `GovernanceEvent[]?` | Capped in-app feed of governance events (applied/failed changes, rollbacks, drift, approvals). |
+| `notifyWebhook` | `{ configured, host?, by?, ts? }?` | Owner-set governance webhook status — masked host only; the URL is encrypted in `glide_secrets`, delivered by `deliverWebhook`, and never synced. |
 | `guidance` | `GuidanceDoc[]?` | Team-guidance docs for the room (`title`, `body`, `enabled`, `updatedBy`, `ts`; `src/shared.ts`), capped at `MAX_GUIDANCE_DOCS` = 25 (`src/server.ts`). Edited from the admin dashboard; embedded into Vectorize (see below). |
 | `docsIndex` | `DocsIndexState?` | Internal progress of the cron-owned Cloudflare-docs reindex job: status, products/pages/chunks counters, `runId`, and attribution. Present only on the fixed system Durable Object, not normal rooms. |
 
-> **What is _not_ synced:** the decrypted token and the raw provider config
+> **What is _not_ synced:** the decrypted token, the governance webhook URL
+> (`glide_secrets`), and the raw provider config
 > (`glide_migration_src`). Those live only in SQLite. The legacy
 > `glide_snapshots` table is dropped on startup. Guidance **vectors** are likewise not synced —
 > they live in Vectorize (only the plain-text `guidance` docs are in state). The
@@ -460,7 +469,9 @@ field is broadcast to all clients via `onStateUpdate` (`src/client/main.tsx`).
 - **`PendingAction`** (`src/shared.ts`) — `product`, `summary`, `method`
   (`POST|PUT|PATCH|DELETE`), `path`, optional `body`, optional `zoneId`,
   `createdBy`, `ts`, lifecycle `status` (`pending | applying | failed`), last
-  `error` / `attemptedAt`, and an optional `mergeEntrypoint` (see below).
+  `error` / `attemptedAt`, an optional `mergeEntrypoint` (see below), an optional
+  `scheduledFor` timestamp (maintenance-window Apply, run by `runScheduledApply`),
+  and `approvals` (four-eyes dual approval).
 - **`ActionResult`** (`src/shared.ts`) — outcome of an apply/reject, `status`
   is `applied | failed | rejected`.
 - **`OnboardingState`** / **`MigrationPlan`** / **`BusinessProfile`** — documented
@@ -551,16 +562,21 @@ through Glide's queue → Apply contract.
   `https://migration.internal${path}` (the host is ignored by the target Worker's
   path router).
 - Active endpoints: `/api/providers`, `/api/preview-rules`,
-  `/api/generate-terraform`, `/api/preflight`, `/api/diff-report`, and
-  `/api/export-csv`.
+  `/api/generate-terraform`, `/api/preflight`, `/api/diff-report`,
+  `/api/export-csv`, and the read-only `/api/validate-config` (post-migration
+  **Verify**).
+- `/api/validate-config` powers the `runValidate` RPC (the **Verify** button). It
+  reports whether the plan's intended rules are *present* in the target zone — a
+  name/type presence check, not a value comparison — and its summary says so
+  explicitly, so it never implies a full configuration match.
 - The invoking socket-session lease is rechecked after awaited config parsing,
   migration-service calls, target/credential reads, and immediately before saving
-  a source, plan, preflight/diff check, Terraform/CSV artifact, onboarding update,
-  or migration-derived queue state. Results are discarded if the lease ended.
-- Disabled paths: automated `/api/validate-config` and snapshot
-  capture/restore/rollback requests fail closed. Snapshot listing is not exposed
-  through a tool or UI; its compatibility RPC returns before making a migration
-  service request.
+  a source, plan, preflight/diff/validate check, Terraform/CSV artifact, onboarding
+  update, or migration-derived queue state. Results are discarded if the lease
+  ended.
+- Disabled paths: snapshot capture/restore/rollback requests fail closed. Snapshot
+  listing is not exposed through a tool or UI; its compatibility RPC returns before
+  making a migration service request.
 - Limits: 20 s timeout; inline and uploaded config are capped at
   `MAX_CONFIG_BYTES` = 850 000 UTF-8 bytes so worst-case JSON escaping stays below
   the SQLite row limit. Uploads are capped at `MAX_CONFIG_FILES` = 50.
@@ -719,7 +735,7 @@ The convention: inline `S` wins on the base property; `index.css` layers on the
 | `src/chat-delivery.ts` | Pure delivery classification and admission validation plus Cloudflare token detection and redaction helpers shared by the client and server. |
 | `src/chat-message-ledger.ts` | Durable accepted-user-message ID ledger schema and trigger, preventing replay after transcript pruning. |
 | `src/rate-limits.ts` | Pure rate-limit policy helpers: SHA-256 client/room keys, binding decision normalization, and retryable `429`/`503` responses. |
-| `src/migration.ts` | Client for the Switchflare / migration tool Worker (preview, Terraform/CSV, pre-flight, and diff), with fail-closed guards for disabled validation and snapshot mutation paths. |
+| `src/migration.ts` | Client for the Switchflare / migration tool Worker (preview, Terraform/CSV, pre-flight, diff, and a read-only post-migration verify presence check), with fail-closed guards for the disabled snapshot mutation paths. |
 | `src/env.d.ts` | Augments the generated `Cloudflare.Env` with Access/local-development values and secrets not declared in `wrangler.jsonc`. |
 | `wrangler.jsonc` | Worker config: Durable Object, AI, `VECTORIZE`, rate-limit, optional `MIGRATION`, and static-asset bindings plus model vars. |
 | `vite.config.ts` | Builds the React client to `dist/client` (served by the `ASSETS` binding) and generates the `virtual:glide-docs` manifest for the admin **Dev docs** tab. |

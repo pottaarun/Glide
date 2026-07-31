@@ -357,9 +357,12 @@ config parsing, migration-service requests, and Cloudflare target reads. If the
 socket closes, expires, is revoked, or is replaced, Glide discards the result before
 saving migration source/plan/check/export state or queueing migration rules.
 
-After Apply, verify the reviewed Cloudflare rules and setting values directly.
-Automated post-migration validation is disabled fail-closed because the migration
-service does not compare complete live values.
+After Apply, use **Verify** (the `runValidate` RPC) to confirm the plan's intended
+rules are *present* in the target zone. Because the migration service does not
+compare complete live values, this is a name/type presence check — the summary
+says so ("values aren't compared, so review critical rules directly") — so a pass
+means "present," not "correct." Review critical rule and setting values in
+Cloudflare directly.
 
 ### What `queue_migration_rules` can translate
 
@@ -393,14 +396,20 @@ without writing and retains the action for correction; it never replaces the
 phase from an empty baseline. Apply does not capture a local pre-mutation
 snapshot. See [Security model](./security.md).
 
-### Disabled validation and snapshot paths
+### Post-migration verify and the disabled snapshot paths
 
-Zone snapshot capture, listing, restore, and rollback are disabled because the
+`runValidate` (the **Verify** button) calls the read-only `/api/validate-config`
+endpoint and records a `validate` check: it reports how many of the plan's
+intended rules are *present* in the target zone by name/type. It never compares
+rule values — the summary says so — so a passing Verify means "present," not
+"correct."
+
+Zone snapshot capture, listing, restore, and rollback stay disabled because the
 migration service cannot guarantee complete, fail-safe recovery. Glide exposes no
-LLM tools or UI controls for these operations. `runValidate`, `snapshotZone`,
-`refreshSnapshots`, and `restoreSnapshot` remain only as compatibility RPCs and
-always return `{ ok: false }`; legacy restore approvals are refused by Apply. On
-room startup, Glide drops the legacy local `glide_snapshots` breadcrumb table.
+LLM tools or UI controls for those operations: `snapshotZone`, `refreshSnapshots`,
+and `restoreSnapshot` remain only as compatibility RPCs and always return
+`{ ok: false }`; legacy restore approvals are refused by Apply. On room startup,
+Glide drops the legacy local `glide_snapshots` breadcrumb table.
 
 ---
 

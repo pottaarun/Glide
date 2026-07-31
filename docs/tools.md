@@ -29,6 +29,8 @@ to the model are clipped to ~6 KB. See [Architecture](./architecture.md#the-chat
 | `list_dns_records` | `zoneId`, `type?` | List DNS records for a zone (optionally by record type). During an active onboarding it sets `dnsReviewed` (ticking the "review DNS records" step) and, for an untyped listing of the default zone, folds proxy coverage into `GlideState.liveZone` (ticking the "proxy status" step). |
 | `cf_get` | `path` | Generic READ against v4 JSON REST endpoints using the standard Cloudflare API envelope (path after `…/client/v4`). |
 | `recommend_configuration` | `focus?` (`all\|security\|performance\|reliability\|privacy\|bots\|api\|tls`) | Turn the room's captured `businessProfile` into tailored, priority-ranked Cloudflare recommendations (rationale, triggering profile signals, and a docs citation). **Read-only — it proposes and QUEUES NOTHING**; the model then presents the items grouped by theme and offers to queue the concrete ones via the write builders. Runs the local engine (`src/recommendations.ts`), so it never calls Cloudflare. |
+| `security_posture` | — | Grade the room's default zone's live security config (SSL/TLS mode, Always-Use-HTTPS, min TLS, TLS 1.3, HSTS, Managed WAF, DNSSEC, proxy coverage) into an A–F scorecard with per-check pass/warn/fail and one-click fixes to QUEUE. **Read-only** (`src/posture.ts`); needs a default zone + token. |
+| `estimate_impact` | `actionId?` | Preview a queued change's blast radius from the zone's real last-24h traffic (most precise for country-scoped WAF / rate-limit rules); defaults to the most recently queued action. **Read-only** (`src/blast-radius.ts`). |
 
 The Cloudflare reads never change anything, and their failures come back through
 `readError()` (`src/server.ts`), which appends a permission hint when
@@ -79,9 +81,12 @@ Migration calls retain the initiating chat socket's authorization lease across
 service and Cloudflare-read awaits. If that lease ends, Glide discards returned
 data before saving a source, plan, check, export, onboarding update, or queued rule.
 
-Automated post-migration validation and zone snapshot capture/list/restore/rollback
-are disabled fail-closed and are not exposed as LLM tools. Verify the reviewed
-Cloudflare configuration directly after Apply.
+Post-migration **Verify** (`runValidate`, a browser RPC surfaced as the Verify
+button — not an LLM tool) confirms the plan's intended rules are *present* in the
+target zone. It's a name/type presence check, not a value comparison, so its
+summary says so and critical rules still need a direct review. Zone snapshot
+capture/list/restore/rollback stay disabled fail-closed and are exposed as neither
+tools nor UI.
 
 See [Onboarding & migration](./onboarding-and-migration.md) for the end-to-end
 pipeline and what `queue_migration_rules` can and can't translate.
@@ -132,6 +137,38 @@ credential/safety-read awaits. If that connection closes, expires, or loses room
 membership before write dispatch, no Cloudflare write is sent and bulk processing
 stops. The lease includes a server-generated socket-session nonce, so reconnecting
 with the same SDK connection id cannot inherit an older in-flight Apply.
+
+### Governance & change-safety controls
+
+Change-management controls layered on the queue → Apply contract.
+`refreshSecurityPosture`, `setPostureBaseline`, `setDriftWatch`, `queuePostureFix`,
+`estimateActionImpact`, `scheduleApply`, `cancelScheduledApply`, and
+`approveAction` / `withdrawApproval` require a commit role; `setFourEyes` and
+`setNotifyWebhook` are **owner-only**.
+
+| RPC | Args | Returns | Notes |
+| --- | --- | --- | --- |
+| `refreshSecurityPosture` | `by?` | `{ ok, message, grade?, score?, drifted? }` | Re-score the default zone and store `securityPosture`. Read-only against Cloudflare. |
+| `setPostureBaseline` | `by?` | `{ ok, message, grade?, score? }` | Save the current scorecard as `postureBaseline` for drift comparison. |
+| `setDriftWatch` | `enabled`, `by?` | `{ ok, message, enabled }` | Arm/disarm the weekly `runDriftWatch` alarm that compares live posture to the baseline and raises a governance event on drift. |
+| `queuePostureFix` | `checkId`, `zoneId`, `by?` | `{ ok, message }` | Turn a posture recommendation into a normal pending action (still needs Apply). |
+| `estimateActionImpact` | `actionId`, `by?` | `{ ok, message, estimate? }` | Blast-radius estimate (low / medium / high / unknown) for a queued action, from last-24h traffic. |
+| `setFourEyes` | `enabled`, `by?` | `{ ok, message, enabled }` | **Owner-only.** Toggle dual approval: a queued action then needs a second approver before Apply. |
+| `approveAction` | `id`, `by?` | `{ ok, message, applied, approvals, required, result? }` | Record an approval; applies automatically once `required` distinct approvers is met. |
+| `withdrawApproval` | `id`, `by?` | `{ ok, message, approvals }` | Remove your approval before the action is applied. |
+| `scheduleApply` | `id`, `whenTs`, `by?` | `{ ok, message, … }` | Set `scheduledFor` on a queued action; a `runScheduledApply` alarm applies it at `whenTs` through the normal path. |
+| `cancelScheduledApply` | `id`, `by?` | `{ ok, message }` | Clear a pending schedule; the action stays queued for manual Apply. |
+| `keepAppliedChange` | `rollbackId`, `by?` | `{ ok, message }` | Cancel a just-applied change's 15-minute auto-rollback timer and keep it live. |
+| `revertAppliedChange` | `rollbackId`, `by?` | `ActionResult` | Revert an applied change now, sending the server-authored inverse. |
+| `setNotifyWebhook` | `url`, `by?` | `{ ok, message, host? }` | **Owner-only.** Validate (HTTPS + SSRF guard) and store an AES-256-GCM-encrypted governance webhook; only a masked host is synced. |
+| `testNotifyWebhook` | `by?` | `{ ok, message }` | Post a test event to the configured webhook. |
+
+The webhook URL is never returned or synced to clients. Governance events
+(applied/failed changes, rollbacks, drift, approvals) fan out to the in-app
+`notifications` feed and, when a webhook is configured, to it via `deliverWebhook`
+(timeout + backoff retry). The posture, blast-radius, rollback, and notification
+engines are pure and unit-tested (`src/posture.ts`, `src/blast-radius.ts`,
+`src/rollback.ts`, `src/notify.ts`).
 
 ### Token management
 
@@ -272,11 +309,11 @@ client calls them automatically; they do not change Cloudflare configuration.
 ### Disabled migration compatibility RPCs
 
 These callable methods remain only as fail-closed compatibility stubs. The React
-client exposes no validation or snapshot controls.
+client exposes no snapshot controls. (`runValidate` is **not** in this list — it's
+an active, read-only Verify presence check; see above.)
 
 | RPC | Behaviour |
 | --- | --- |
-| `runValidate` | Always returns `{ ok: false }` with the automated-validation-disabled explanation. |
 | `snapshotZone` | Always returns `{ ok: false }`; no snapshot is captured. |
 | `refreshSnapshots` | Always returns `{ ok: false }`; no snapshot list is loaded. |
 | `restoreSnapshot` | Always returns `{ ok: false }`; no restore or rollback is queued or executed. |

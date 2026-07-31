@@ -135,6 +135,21 @@ export interface PendingAction {
   scheduleApplyId?: string;
   /** Verified email of the member who scheduled the apply (for display/audit). */
   scheduledBy?: string;
+  /**
+   * Four-eyes sign-offs recorded for this change (see {@link ActionApproval}).
+   * Only meaningful while the room's {@link GlideState.fourEyes} policy is on and
+   * the change is risk-classified as needing a second approver. Deduped by
+   * verified approver email; the change auto-applies once two distinct members
+   * have approved. Removed with the action when it applies or is rejected.
+   */
+  approvals?: ActionApproval[];
+  ts: number;
+}
+
+/** One four-eyes sign-off on a pending change by a verified room member. */
+export interface ActionApproval {
+  /** Canonical verified email of the approver (server-authored; never client input). */
+  by: string;
   ts: number;
 }
 
@@ -192,7 +207,10 @@ export type RoomAuditAction =
   | "posture_baseline"
   | "drift_watch"
   | "rollback"
-  | "schedule_apply";
+  | "schedule_apply"
+  | "four_eyes"
+  | "approve"
+  | "withdraw_approval";
 
 /**
  * One append-only governance audit entry: who did what, when. Stored in SQLite
@@ -365,6 +383,14 @@ export interface GlideState {
    * last scheduled run.
    */
   driftWatch?: { enabled: boolean; by?: string; ts: number; lastCheckedTs?: number };
+  /**
+   * Four-eyes (dual-approval) change-control policy. When enabled by an owner,
+   * destructive or traffic-affecting changes (classified in `change-risk.ts`)
+   * require two DISTINCT room members to approve before they apply — routine
+   * low-risk changes still apply with a single click. Opt-in; omitted/false means
+   * single-approval applies. `by` is who last toggled it; `ts` is when.
+   */
+  fourEyes?: { enabled: boolean; by?: string; ts: number };
   /**
    * A running "further reading" list of Cloudflare docs pages the RAG retriever
    * surfaced while answering this room's questions (see {@link DocLink}). Deduped

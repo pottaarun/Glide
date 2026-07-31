@@ -85,6 +85,7 @@ import {
   normalizeRoomName,
   ROOM_DELETE_CONFIRMATION,
   roomStorageName,
+  type ActionApproval,
   type ActionResult,
   type BusinessProfile,
   type DocChunk,
@@ -138,6 +139,7 @@ import {
 } from "./posture";
 import { estimateBlastRadius, formatBlastRadius, type BlastRadiusEstimate } from "./blast-radius";
 import { buildRollbackPlan, invertibleSetting } from "./rollback";
+import { requiresSecondApproval } from "./change-risk";
 import {
   boundedMigrationPreviewRules,
   buildConfigData,
@@ -334,6 +336,10 @@ const MAX_PENDING_ROLLBACKS = 20;
 const MIN_SCHEDULE_APPLY_LEAD_MS = 60 * 1000;
 /** A maintenance-window apply may be scheduled at most this far out. */
 const MAX_SCHEDULE_APPLY_AHEAD_MS = 30 * 24 * 60 * 60 * 1000;
+/** Distinct member sign-offs a four-eyes-gated change needs before it applies. */
+const REQUIRED_APPROVALS = 2;
+/** Cap on approvals retained per action, to bound synced-state growth. */
+const MAX_ACTION_APPROVALS = 10;
 
 function persistedChatMessageRole(
   rowId: string,
@@ -8613,6 +8619,28 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
       };
     }
 
+    // Four-eyes gate: a destructive/traffic-affecting change under the room's
+    // dual-approval policy cannot apply until two distinct members have approved.
+    // This is the single chokepoint every apply path (manual, bulk, scheduled,
+    // and the final approval) funnels through, so nothing can bypass it. The
+    // final approver's approveAction records the second sign-off *before* calling
+    // here, so the legitimate apply passes. Returns an ephemeral refusal (no state
+    // change) so the action stays pending for approval.
+    if (this.fourEyesRequiredFor(action)) {
+      const have = this.distinctApprovers(action).length;
+      if (have < REQUIRED_APPROVALS) {
+        return {
+          id,
+          product: action.product,
+          summary: action.summary,
+          status: "failed",
+          detail: `This change needs ${REQUIRED_APPROVALS} approvers before it applies (${have}/${REQUIRED_APPROVALS} so far). Use Approve so another room member can sign off.`,
+          by,
+          ts: Date.now(),
+        };
+      }
+    }
+
     const resourceKey = actionResourceKey(action);
     const restoring = action.actionType === "snapshot_restore";
     const conflictingAction = this.state.pendingActions.find(
@@ -8993,6 +9021,189 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
   }
 
   // ---------------------------------------------------------------------------
+  // Four-eyes (dual-approval) change control
+  //
+  // When an owner turns on state.fourEyes, changes classified as destructive or
+  // traffic-affecting (change-risk.ts) require two DISTINCT members to approve
+  // before they apply — routine low-risk changes still apply with one click.
+  // Approvals are server-authored (keyed to the approver's verified lease email),
+  // stored on the PendingAction, and enforced by the gate in applyActionInternal
+  // so no apply path (manual, bulk, or scheduled) can bypass them. The second
+  // distinct approval applies the change immediately in that approver's session.
+  // ---------------------------------------------------------------------------
+
+  /** True when the room's four-eyes policy is on. */
+  private fourEyesEnabled(): boolean {
+    return this.state.fourEyes?.enabled === true;
+  }
+
+  /** True when this change needs two distinct approvers under the active policy. */
+  private fourEyesRequiredFor(action: PendingAction): boolean {
+    return this.fourEyesEnabled() && requiresSecondApproval(action).required;
+  }
+
+  /** Distinct verified approver emails recorded on an action. */
+  private distinctApprovers(action: PendingAction): string[] {
+    return [...new Set((action.approvals ?? []).map((approval) => approval.by))];
+  }
+
+  /** Room members who can approve (owner/member). Four-eyes needs at least two. */
+  private approverCount(): number {
+    return this.roomMembers().filter((member) => member.role === "owner" || member.role === "member").length;
+  }
+
+  /**
+   * UI: turn the room's four-eyes (dual-approval) policy on or off — owner only.
+   * When on, destructive/traffic-affecting changes need two distinct members to
+   * approve before they apply.
+   */
+  @callable()
+  async setFourEyes(
+    enabled: boolean,
+    by = "someone",
+  ): Promise<{ ok: boolean; message: string; enabled: boolean }> {
+    const { connection } = getCurrentAgent<GlideAgent>();
+    const identity = this.connectionIdentity(connection);
+    if (!identity || this.isAccessIdentityExpired(identity) || !this.isRoomMember(identity.email)) {
+      return {
+        ok: false,
+        message: "A current room owner session is required to change the approval policy.",
+        enabled: this.fourEyesEnabled(),
+      };
+    }
+    if (this.roomRole(identity.email) !== "owner") {
+      return { ok: false, message: "Only the room owner can change the approval policy.", enabled: this.fourEyesEnabled() };
+    }
+    void by;
+    const on = enabled === true;
+    this.setState({ ...this.state, fourEyes: { enabled: on, by: identity.email, ts: Date.now() } });
+    this.recordAudit(
+      "four_eyes",
+      identity.email,
+      undefined,
+      on ? "Enabled dual approval for risky changes" : "Disabled dual approval",
+    );
+    const warn =
+      on && this.approverCount() < REQUIRED_APPROVALS
+        ? " Note: this room has fewer than two members who can approve — invite a teammate, or risky changes can't be applied."
+        : "";
+    return {
+      ok: true,
+      enabled: on,
+      message: on
+        ? `Dual approval is on — destructive or traffic-affecting changes now need ${REQUIRED_APPROVALS} members to approve before they apply.${warn}`
+        : "Dual approval is off — changes apply with a single approval.",
+    };
+  }
+
+  /**
+   * UI: record the caller's four-eyes approval of a pending change — the "Approve"
+   * button on a gated pending-action card. Member-or-owner only. When the change
+   * reaches the required number of DISTINCT approvers it applies immediately in
+   * the final approver's session. Approvals are keyed to the caller's verified
+   * lease email, so a member cannot approve twice or approve as someone else.
+   */
+  @callable()
+  async approveAction(
+    id: string,
+    by = "someone",
+  ): Promise<{ ok: boolean; message: string; applied: boolean; approvals: number; required: number; result?: ActionResult }> {
+    const { lease } = this.requireCommitRole("approve changes");
+    const actor = lease?.email ?? normalizeActor(by, "a teammate");
+    const parsedId = validateIdentifier(id, "Action id", 200);
+    if (!parsedId.ok) {
+      return { ok: false, message: parsedId.message, applied: false, approvals: 0, required: REQUIRED_APPROVALS };
+    }
+    const action = this.state.pendingActions.find((a) => a.id === parsedId.value);
+    if (!action) {
+      return { ok: false, message: "That action is no longer pending.", applied: false, approvals: 0, required: REQUIRED_APPROVALS };
+    }
+    if (isSnapshotRestoreAction(action)) {
+      return {
+        ok: false,
+        message: MIGRATION_SNAPSHOT_DISABLED,
+        applied: false,
+        approvals: this.distinctApprovers(action).length,
+        required: REQUIRED_APPROVALS,
+      };
+    }
+    if (isActionApplying(action)) {
+      return {
+        ok: false,
+        message: "That action is already being applied.",
+        applied: false,
+        approvals: this.distinctApprovers(action).length,
+        required: REQUIRED_APPROVALS,
+      };
+    }
+    const required = this.fourEyesRequiredFor(action) ? REQUIRED_APPROVALS : 1;
+    // Record this approval (deduped by verified approver email).
+    const already = this.distinctApprovers(action).includes(actor);
+    if (!already) {
+      const approvals: ActionApproval[] = [...(action.approvals ?? []), { by: actor, ts: Date.now() }].slice(
+        -MAX_ACTION_APPROVALS,
+      );
+      this.setState({
+        ...this.state,
+        pendingActions: this.state.pendingActions.map((a) => (a.id === action.id ? { ...a, approvals } : a)),
+      });
+      this.recordAudit("approve", actor, action.id, `Approved "${action.summary}"`);
+    }
+    const updated = this.state.pendingActions.find((a) => a.id === parsedId.value);
+    const have = updated ? this.distinctApprovers(updated).length : 0;
+    if (have < required) {
+      const remaining = required - have;
+      return {
+        ok: true,
+        applied: false,
+        approvals: have,
+        required,
+        message: already
+          ? `You've already approved this — ${remaining} more approval(s) needed from other members.`
+          : `Approval recorded (${have}/${required}). ${remaining} more member(s) must approve before it applies.`,
+      };
+    }
+    // Threshold met — apply now in this approver's session (uses their lease so
+    // the write is tied to a live, authorized member).
+    const result = await this.applyActionInternal(parsedId.value, actor, true, false, undefined, lease);
+    return {
+      ok: result.status !== "failed",
+      applied: result.status === "applied",
+      approvals: have,
+      required,
+      result,
+      message:
+        result.status === "applied"
+          ? `Final approval received — "${action.summary}" applied.`
+          : `Final approval received, but the apply did not succeed: ${result.detail}`,
+    };
+  }
+
+  /**
+   * UI: withdraw the caller's own four-eyes approval of a pending change.
+   * Member-or-owner only; a member can only retract their own sign-off.
+   */
+  @callable()
+  async withdrawApproval(id: string, by = "someone"): Promise<{ ok: boolean; message: string; approvals: number }> {
+    const { lease } = this.requireCommitRole("withdraw an approval");
+    const actor = lease?.email ?? normalizeActor(by, "a teammate");
+    const parsedId = validateIdentifier(id, "Action id", 200);
+    if (!parsedId.ok) return { ok: false, message: parsedId.message, approvals: 0 };
+    const action = this.state.pendingActions.find((a) => a.id === parsedId.value);
+    if (!action) return { ok: false, message: "That action is no longer pending.", approvals: 0 };
+    if (!this.distinctApprovers(action).includes(actor)) {
+      return { ok: false, message: "You haven't approved this change.", approvals: this.distinctApprovers(action).length };
+    }
+    const approvals = (action.approvals ?? []).filter((approval) => approval.by !== actor);
+    this.setState({
+      ...this.state,
+      pendingActions: this.state.pendingActions.map((a) => (a.id === action.id ? { ...a, approvals } : a)),
+    });
+    this.recordAudit("withdraw_approval", actor, action.id, `Withdrew approval of "${action.summary}"`);
+    return { ok: true, message: "Your approval was withdrawn.", approvals: new Set(approvals.map((a) => a.by)).size };
+  }
+
+  // ---------------------------------------------------------------------------
   // Maintenance-window (scheduled) Apply
   //
   // A member can defer a pending action's Apply to a future time. The action
@@ -9059,6 +9270,14 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
         ok: false,
         message:
           "That action's last attempt was interrupted — verify the live configuration and retry it individually before scheduling.",
+      };
+    }
+    // A four-eyes-gated change can't be scheduled until it has the required
+    // approvals (otherwise the scheduled apply would just be refused at fire time).
+    if (this.fourEyesRequiredFor(action) && this.distinctApprovers(action).length < REQUIRED_APPROVALS) {
+      return {
+        ok: false,
+        message: `This change needs ${REQUIRED_APPROVALS} approvers before it can be scheduled — get the approvals first.`,
       };
     }
     // Replace any existing window for this action.

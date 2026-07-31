@@ -76,6 +76,7 @@ import {
   pendingActionStatus,
 } from "../action-lifecycle";
 import { invertibleSetting } from "../rollback";
+import { requiresSecondApproval } from "../change-risk";
 import {
   MAX_CHAT_DELIVERY_STATUS_IDS,
   MAX_CHAT_HISTORY_BYTES,
@@ -2560,6 +2561,50 @@ function RoomSession({
       runRpc<{ ok: boolean; message: string; enabled: boolean }>("setDriftWatch", [enabled, name]),
     [runRpc, name],
   );
+  // Four-eyes (dual-approval) change control.
+  const setFourEyes = useCallback(
+    async (enabled: boolean) => {
+      const res = await runRpc<{ ok: boolean; message: string; enabled: boolean }>("setFourEyes", [enabled, name]);
+      if (res?.message) setNotice(res.message);
+    },
+    [runRpc, name],
+  );
+  const approveAction = useCallback(
+    async (id: string) => {
+      setBusyIds((prev) => new Set(prev).add(id));
+      try {
+        const res = await runRpc<{ ok: boolean; message: string; applied: boolean }>(
+          "approveAction",
+          [id, name],
+          { timeout: APPLY_RPC_TIMEOUT_MS },
+        );
+        if (res?.message) setNotice(res.message);
+      } finally {
+        setBusyIds((prev) => {
+          const next = new Set(prev);
+          next.delete(id);
+          return next;
+        });
+      }
+    },
+    [runRpc, name],
+  );
+  const withdrawApproval = useCallback(
+    async (id: string) => {
+      setBusyIds((prev) => new Set(prev).add(id));
+      try {
+        const res = await runRpc<{ ok: boolean; message: string }>("withdrawApproval", [id, name]);
+        if (res?.message) setNotice(res.message);
+      } finally {
+        setBusyIds((prev) => {
+          const next = new Set(prev);
+          next.delete(id);
+          return next;
+        });
+      }
+    },
+    [runRpc, name],
+  );
 
   // Blast-radius preview: per-pending-action impact estimate, loaded on demand.
   const [impacts, setImpacts] = useState<
@@ -2616,12 +2661,19 @@ function RoomSession({
     const uncertainCount = pending.filter(
       (action) => !isSnapshotRestoreAction(action) && isActionOutcomeUncertain(action),
     ).length;
+    // Four-eyes-gated changes still awaiting a second approval can't be applied in
+    // bulk (the server fails them closed) — approve them individually instead.
+    const awaitingApproval = (action: PendingAction) =>
+      state?.fourEyes?.enabled === true &&
+      requiresSecondApproval(action).required &&
+      new Set((action.approvals ?? []).map((ap) => ap.by)).size < 2;
     const ids = pending
       .filter(
         (action) =>
           !isSnapshotRestoreAction(action) &&
           !isActionApplying(action) &&
-          !isActionOutcomeUncertain(action),
+          !isActionOutcomeUncertain(action) &&
+          !awaitingApproval(action),
       )
       .map((action) => action.id);
     if (!ids.length) {
@@ -3279,6 +3331,15 @@ function RoomSession({
               // Maintenance-window schedule: the action auto-applies at this time.
               const scheduledFor = typeof a.scheduledFor === "number" ? a.scheduledFor : undefined;
               const scheduling = schedulingId === a.id;
+              // Four-eyes: gated changes need two distinct members to approve
+              // before they apply (mirrors REQUIRED_APPROVALS on the server).
+              const risk = state?.fourEyes?.enabled && !disabledRestore
+                ? requiresSecondApproval(a)
+                : { required: false as const };
+              const gated = risk.required;
+              const approvers = [...new Set((a.approvals ?? []).map((ap) => ap.by))];
+              const approvedByMe = approvers.includes(name);
+              const awaitingApproval = gated && approvers.length < 2;
               const statusLabel = disabledRestore
                 ? "restore disabled"
                 : applying
@@ -3350,6 +3411,18 @@ function RoomSession({
                       )}
                     </div>
                   )}
+                  {gated && (
+                    <div style={S.approvalBox}>
+                      <div style={S.approvalHead}>
+                        <span style={S.approvalBadge}>◇ needs 2 approvals</span>
+                        <span style={S.approvalCount}>{approvers.length}/2 approved</span>
+                      </div>
+                      {risk.reason && <div style={S.approvalReason}>{risk.reason}</div>}
+                      {approvers.length > 0 && (
+                        <div style={S.approvalWho}>Approved by {approvers.join(", ")}</div>
+                      )}
+                    </div>
+                  )}
                   {scheduledFor !== undefined && (
                     <div style={S.scheduledRow} title={`Auto-applies at ${fmtWhen(scheduledFor)}`}>
                       <span style={S.scheduledBadge}>⏰ scheduled</span>
@@ -3369,51 +3442,94 @@ function RoomSession({
                     </div>
                   )}
                   {canWrite ? (
-                    <div style={S.actionBtns}>
-                      <button
-                        style={{ ...S.applyBtn, opacity: applying ? 0.6 : 1 }}
-                        disabled={applying || disabledRestore}
-                        onClick={() => {
-                          if (!state?.tokenConfigured) {
-                            setShowTokenForm(true);
-                            setNotice("Add a Cloudflare API token before applying this change.");
-                            return;
-                          }
-                          if (
-                            uncertain &&
-                            !window.confirm(
-                              "Cloudflare may already have applied this change. Verify the live configuration first. Retry anyway?",
-                            )
-                          ) {
-                            return;
-                          }
-                          void apply(a.id, uncertain, autoRevert);
-                        }}
-                      >
-                        {applying
-                          ? "Applying…"
-                          : disabledRestore
-                            ? "Disabled"
-                          : !state?.tokenConfigured
-                            ? "Set token first"
-                            : uncertain
-                              ? "Retry anyway"
-                              : failed
-                                ? "Retry"
-                                : "Apply"}
-                      </button>
-                      <button
-                        style={S.rejectBtn}
-                        disabled={applying}
-                        onClick={() => void runRpc("rejectAction", [a.id, name])}
-                      >
-                        Reject
-                      </button>
-                    </div>
+                    awaitingApproval ? (
+                      <div style={S.actionBtns}>
+                        {approvedByMe ? (
+                          <>
+                            <span style={S.approvedByMe}>✓ You approved</span>
+                            <button
+                              style={S.rejectBtn}
+                              disabled={applying}
+                              onClick={() => void withdrawApproval(a.id)}
+                            >
+                              Withdraw
+                            </button>
+                          </>
+                        ) : (
+                          <button
+                            style={{ ...S.approveBtn, opacity: applying ? 0.6 : 1 }}
+                            disabled={applying}
+                            onClick={() => {
+                              if (!state?.tokenConfigured) {
+                                setShowTokenForm(true);
+                                setNotice("Add a Cloudflare API token before approving this change.");
+                                return;
+                              }
+                              void approveAction(a.id);
+                            }}
+                          >
+                            {applying ? "Working…" : `Approve (${approvers.length}/2)`}
+                          </button>
+                        )}
+                        <button
+                          style={S.rejectBtn}
+                          disabled={applying}
+                          onClick={() => void runRpc("rejectAction", [a.id, name])}
+                        >
+                          Reject
+                        </button>
+                      </div>
+                    ) : (
+                      <div style={S.actionBtns}>
+                        <button
+                          style={{ ...S.applyBtn, opacity: applying ? 0.6 : 1 }}
+                          disabled={applying || disabledRestore}
+                          onClick={() => {
+                            if (!state?.tokenConfigured) {
+                              setShowTokenForm(true);
+                              setNotice("Add a Cloudflare API token before applying this change.");
+                              return;
+                            }
+                            if (
+                              uncertain &&
+                              !window.confirm(
+                                "Cloudflare may already have applied this change. Verify the live configuration first. Retry anyway?",
+                              )
+                            ) {
+                              return;
+                            }
+                            void apply(a.id, uncertain, autoRevert);
+                          }}
+                        >
+                          {applying
+                            ? "Applying…"
+                            : disabledRestore
+                              ? "Disabled"
+                            : !state?.tokenConfigured
+                              ? "Set token first"
+                              : uncertain
+                                ? "Retry anyway"
+                                : failed
+                                  ? "Retry"
+                                  : "Apply"}
+                        </button>
+                        <button
+                          style={S.rejectBtn}
+                          disabled={applying}
+                          onClick={() => void runRpc("rejectAction", [a.id, name])}
+                        >
+                          Reject
+                        </button>
+                      </div>
+                    )
                   ) : (
-                    <div style={S.hint}>Read-only — ask a room member or owner to apply or reject this.</div>
+                    <div style={S.hint}>
+                      {awaitingApproval
+                        ? "Read-only — this change needs two room members or owners to approve."
+                        : "Read-only — ask a room member or owner to apply or reject this."}
+                    </div>
                   )}
-                  {canWrite && invertible && !failed && !uncertain && !scheduling && scheduledFor === undefined && (
+                  {canWrite && invertible && !failed && !uncertain && !scheduling && !awaitingApproval && scheduledFor === undefined && (
                     <label style={S.autoRevertRow} title="After Apply, Glide restores the previous value in 15 minutes unless you click Keep — a safety net for changes that might break traffic.">
                       <input
                         type="checkbox"
@@ -3432,7 +3548,7 @@ function RoomSession({
                       <span>Auto-revert in 15 min unless I Keep it</span>
                     </label>
                   )}
-                  {canWrite && !disabledRestore && !applying && !uncertain && scheduledFor === undefined && (
+                  {canWrite && !disabledRestore && !applying && !uncertain && !awaitingApproval && scheduledFor === undefined && (
                     scheduling ? (
                       <div style={S.scheduleForm}>
                         <input
@@ -3672,6 +3788,30 @@ function RoomSession({
                   Download all (.tf)
                 </button>
               )}
+            </Section>
+          )}
+
+          {myRole === "owner" && (
+            <Section title="Change controls">
+              <label
+                style={S.autoRevertRow}
+                title="Require two distinct members to approve destructive or traffic-affecting changes before they apply."
+              >
+                <input
+                  type="checkbox"
+                  checked={state?.fourEyes?.enabled === true}
+                  onChange={(e) => void setFourEyes(e.target.checked)}
+                />
+                <span>Require two approvals for risky changes (four-eyes)</span>
+              </label>
+              <p style={S.hint}>
+                When on, destructive or traffic-affecting changes (resource deletions, firewall/WAF rules,
+                TLS settings) need a second room member to approve before they apply. Routine changes still
+                apply with one click.
+                {state?.fourEyes?.enabled && members.filter((m) => m.role !== "viewer").length < 2
+                  ? " This room has fewer than two members who can approve — invite a teammate."
+                  : ""}
+              </p>
             </Section>
           )}
 
@@ -6827,6 +6967,14 @@ const S: Record<string, React.CSSProperties> = {
   scheduleInput: { fontSize: 12, color: "#e2e8f0", background: "rgba(15,20,30,.85)", border: "1px solid rgba(148,163,184,.28)", borderRadius: 6, padding: "4px 8px", colorScheme: "dark" },
   scheduleToggle: { fontSize: 12, fontWeight: 600, border: "1px dashed rgba(56,189,248,.35)", background: "transparent", color: "#7dd3fc", borderRadius: 6, padding: "4px 10px", cursor: "pointer", marginTop: 9 },
   scheduleCancelForm: { fontSize: 15, lineHeight: 1, color: "#9aa7b8", background: "transparent", border: "none", cursor: "pointer", padding: "0 4px" },
+  approvalBox: { marginTop: 9, padding: "7px 10px", background: "rgba(167,139,250,.08)", border: "1px solid rgba(167,139,250,.28)", borderRadius: 7 },
+  approvalHead: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 },
+  approvalBadge: { fontSize: 11, fontWeight: 700, color: "#0b1220", background: "#a78bfa", borderRadius: 5, padding: "2px 7px", whiteSpace: "nowrap" },
+  approvalCount: { fontSize: 12, fontWeight: 600, color: "#c4b5fd" },
+  approvalReason: { fontSize: 12, color: "#d6ccf7", marginTop: 5, lineHeight: 1.4 },
+  approvalWho: { fontSize: 11, color: "#a99fc4", marginTop: 4, wordBreak: "break-all" },
+  approveBtn: { flex: 1, fontSize: 13, fontWeight: 700, border: "none", background: "#a78bfa", color: "#0b1220", borderRadius: 7, padding: "8px 12px", cursor: "pointer" },
+  approvedByMe: { flex: 1, fontSize: 13, fontWeight: 600, color: "#c4b5fd", display: "flex", alignItems: "center", padding: "8px 4px" },
 
   kv: { display: "flex", justifyContent: "space-between", gap: 10, fontSize: 13, padding: "5px 0", borderBottom: "1px solid rgba(148,163,184,.1)" },
   kvKey: { color: "#93a3b8" },

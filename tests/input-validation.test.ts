@@ -9,6 +9,7 @@ import {
   normalizeActor,
   syncedStateSizeError,
   validateBusinessProfilePatch,
+  validateFutureTimestamp,
   validateOnboardingPatch,
 } from "../src/input-validation.ts";
 import {
@@ -83,4 +84,29 @@ test("business profile RPC patches enforce canonical values and text limits", ()
   assert.equal(validateBusinessProfilePatch({ appTypes: ["shell"] }).ok, false);
   assert.equal(validateBusinessProfilePatch({ notes: "x".repeat(MAX_PROFILE_NOTES_CHARS + 1) }).ok, false);
   assert.equal(validateBusinessProfilePatch({ updatedBy: "browser" }).ok, false);
+});
+
+test("future-timestamp validation enforces lead time and horizon", () => {
+  const now = 1_000_000_000_000;
+  const minLead = 60_000; // 1 min
+  const maxAhead = 30 * 86_400_000; // 30 days
+  const ok = validateFutureTimestamp(now + 5 * 60_000, now, minLead, maxAhead);
+  assert.equal(ok.ok, true);
+  assert.equal(ok.ok && ok.value, now + 5 * 60_000);
+  // Fractional inputs are rounded to an integer ms epoch.
+  const rounded = validateFutureTimestamp(now + 5 * 60_000 + 0.7, now, minLead, maxAhead);
+  assert.equal(rounded.ok && rounded.value, now + 5 * 60_000 + 1);
+  // Too soon (before the minimum lead), in the past, and non-finite are rejected.
+  assert.equal(validateFutureTimestamp(now + 30_000, now, minLead, maxAhead).ok, false);
+  assert.equal(validateFutureTimestamp(now - 1, now, minLead, maxAhead).ok, false);
+  assert.equal(validateFutureTimestamp(Number.NaN, now, minLead, maxAhead).ok, false);
+  assert.equal(validateFutureTimestamp("soon", now, minLead, maxAhead).ok, false);
+  assert.equal(validateFutureTimestamp(Number.POSITIVE_INFINITY, now, minLead, maxAhead).ok, false);
+  // Too far out (beyond the horizon) is rejected; exactly at the horizon is allowed.
+  assert.equal(validateFutureTimestamp(now + maxAhead + 60_000, now, minLead, maxAhead).ok, false);
+  assert.equal(validateFutureTimestamp(now + maxAhead, now, minLead, maxAhead).ok, true);
+  // The label appears in messages so the UI can surface which field failed.
+  const labeled = validateFutureTimestamp(now, now, minLead, maxAhead, "Apply time");
+  assert.equal(labeled.ok, false);
+  assert.match(labeled.ok ? "" : labeled.message, /Apply time/);
 });

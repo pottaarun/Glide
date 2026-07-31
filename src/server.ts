@@ -226,6 +226,7 @@ import {
   isSafeSyncedStateTransition,
   syncedStateSizeError,
   validateBusinessProfilePatch,
+  validateFutureTimestamp,
   validateIdentifier,
   validateOnboardingPatch,
 } from "./input-validation";
@@ -329,6 +330,10 @@ const DRIFT_WATCH_INTERVAL_SEC = 7 * 24 * 60 * 60;
 const AUTO_ROLLBACK_WINDOW_SEC = 15 * 60;
 /** Cap on open auto-rollback safety windows retained in synced state. */
 const MAX_PENDING_ROLLBACKS = 20;
+/** A maintenance-window apply must be scheduled at least this far out. */
+const MIN_SCHEDULE_APPLY_LEAD_MS = 60 * 1000;
+/** A maintenance-window apply may be scheduled at most this far out. */
+const MAX_SCHEDULE_APPLY_AHEAD_MS = 30 * 24 * 60 * 60 * 1000;
 
 function persistedChatMessageRole(
   rowId: string,
@@ -8631,9 +8636,26 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     }
 
     const attemptedAt = Date.now();
+    // A manual/bulk Apply that reaches this commitment point supersedes any
+    // maintenance-window schedule on this action: cancel the pending alarm and
+    // strip its markers so it can never re-apply later. The scheduled-fire path
+    // (runScheduledApply) already cleared the markers before calling, so this is
+    // a no-op there and never cancels the alarm mid-fire.
+    let actionsForApplying = this.state.pendingActions;
+    if (action.scheduleApplyId) {
+      try {
+        await this.cancelSchedule(action.scheduleApplyId);
+      } catch {
+        this.logChatEvent("schedule_apply.supersede_cancel_failed", {}, "warn");
+      }
+      action = this.withoutScheduleMarkers(action);
+      actionsForApplying = actionsForApplying.map((candidate) =>
+        candidate.id === id ? action! : candidate,
+      );
+    }
     this.setState({
       ...this.state,
-      pendingActions: markActionApplying(this.state.pendingActions, id, attemptedAt),
+      pendingActions: markActionApplying(actionsForApplying, id, attemptedAt),
     });
     try {
       await this.schedule(
@@ -8927,6 +8949,15 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
         ts: Date.now(),
       };
     }
+    // Rejecting a scheduled action also cancels its maintenance-window alarm so
+    // it can't fire against an action that's no longer pending.
+    if (action.scheduleApplyId) {
+      try {
+        await this.cancelSchedule(action.scheduleApplyId);
+      } catch {
+        this.logChatEvent("schedule_apply.reject_cancel_failed", {}, "warn");
+      }
+    }
     return this.recordActionResult(id, {
       id,
       product: action.product,
@@ -8959,6 +8990,178 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
       ) break;
     }
     return results;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Maintenance-window (scheduled) Apply
+  //
+  // A member can defer a pending action's Apply to a future time. The action
+  // stays `pending` (visible and still rejectable) with a "scheduled" marker
+  // until a DO alarm fires runScheduledApply, which applies it server-side with
+  // no access lease — the write was authorized by a member here, at schedule
+  // time. Scheduling is orthogonal to the auto-revert safety window. Clicking
+  // Apply now, or Reject, cancels any pending schedule (see applyActionInternal
+  // and rejectAction).
+  // ---------------------------------------------------------------------------
+
+  /** Return a copy of an action with any maintenance-window schedule markers removed. */
+  private withoutScheduleMarkers(action: PendingAction): PendingAction {
+    if (
+      action.scheduledFor === undefined &&
+      action.scheduleApplyId === undefined &&
+      action.scheduledBy === undefined
+    ) {
+      return action;
+    }
+    const { scheduledFor: _for, scheduleApplyId: _id, scheduledBy: _by, ...rest } = action;
+    return rest;
+  }
+
+  /**
+   * UI: schedule a pending action to auto-apply during a future maintenance
+   * window — the "Schedule apply" control on a pending-action card. Member-or-
+   * owner only.
+   *
+   * The action stays `pending` until a DO alarm fires {@link runScheduledApply}
+   * at the chosen time. `whenTs` (ms epoch) must be at least a minute out and
+   * within 30 days. Re-scheduling replaces any existing window. Snapshot-restore,
+   * in-flight, and outcome-uncertain actions are refused. Authorization happens
+   * here; the later server-driven apply carries no access lease.
+   */
+  @callable()
+  async scheduleApply(
+    id: string,
+    whenTs: number,
+    by = "someone",
+  ): Promise<{ ok: boolean; message: string; scheduledFor?: number }> {
+    const { lease } = this.requireCommitRole("schedule a change");
+    const actor = lease?.email ?? normalizeActor(by, "a teammate");
+    const parsedId = validateIdentifier(id, "Action id", 200);
+    if (!parsedId.ok) return { ok: false, message: parsedId.message };
+    const when = validateFutureTimestamp(
+      whenTs,
+      Date.now(),
+      MIN_SCHEDULE_APPLY_LEAD_MS,
+      MAX_SCHEDULE_APPLY_AHEAD_MS,
+      "Apply time",
+    );
+    if (!when.ok) return { ok: false, message: when.message };
+    const action = this.state.pendingActions.find((a) => a.id === parsedId.value);
+    if (!action) return { ok: false, message: "That action is no longer pending." };
+    if (isSnapshotRestoreAction(action)) {
+      return { ok: false, message: MIGRATION_SNAPSHOT_DISABLED };
+    }
+    if (isActionApplying(action)) {
+      return { ok: false, message: "That action is already being applied." };
+    }
+    if (isActionOutcomeUncertain(action)) {
+      return {
+        ok: false,
+        message:
+          "That action's last attempt was interrupted — verify the live configuration and retry it individually before scheduling.",
+      };
+    }
+    // Replace any existing window for this action.
+    if (action.scheduleApplyId) {
+      try {
+        await this.cancelSchedule(action.scheduleApplyId);
+      } catch {
+        this.logChatEvent("schedule_apply.replace_cancel_failed", {}, "warn");
+      }
+    }
+    const delaySec = Math.max(1, Math.round((when.value - Date.now()) / 1_000));
+    let scheduleId: string;
+    try {
+      const scheduled = await this.schedule(
+        delaySec,
+        "runScheduledApply",
+        { actionId: parsedId.value },
+        { idempotent: true },
+      );
+      scheduleId = scheduled.id;
+    } catch (err) {
+      console.error(
+        JSON.stringify({
+          message: "failed to schedule maintenance-window apply",
+          actionId: parsedId.value,
+          error: err instanceof Error ? err.message : String(err),
+        }),
+      );
+      return { ok: false, message: "Couldn't schedule that apply — try again." };
+    }
+    this.setState({
+      ...this.state,
+      pendingActions: this.state.pendingActions.map((a) =>
+        a.id === parsedId.value
+          ? { ...a, scheduledFor: when.value, scheduleApplyId: scheduleId, scheduledBy: actor }
+          : a,
+      ),
+    });
+    this.recordAudit(
+      "schedule_apply",
+      actor,
+      action.id,
+      `Scheduled "${action.summary}" for ${new Date(when.value).toISOString()}`,
+    );
+    return {
+      ok: true,
+      scheduledFor: when.value,
+      message: `Scheduled "${action.summary}" to apply automatically at the chosen time. It stays in Pending approvals until then — you can apply it sooner or cancel the schedule.`,
+    };
+  }
+
+  /**
+   * UI: cancel a maintenance-window apply, leaving the action pending for manual
+   * Apply/Reject. Member-or-owner only.
+   */
+  @callable()
+  async cancelScheduledApply(id: string, by = "someone"): Promise<{ ok: boolean; message: string }> {
+    const { lease } = this.requireCommitRole("cancel a scheduled change");
+    const actor = lease?.email ?? normalizeActor(by, "a teammate");
+    const parsedId = validateIdentifier(id, "Action id", 200);
+    if (!parsedId.ok) return { ok: false, message: parsedId.message };
+    const action = this.state.pendingActions.find((a) => a.id === parsedId.value);
+    if (!action || action.scheduledFor === undefined) {
+      return { ok: false, message: "That action isn't scheduled." };
+    }
+    if (action.scheduleApplyId) {
+      try {
+        await this.cancelSchedule(action.scheduleApplyId);
+      } catch {
+        this.logChatEvent("schedule_apply.cancel_failed", {}, "warn");
+      }
+    }
+    this.setState({
+      ...this.state,
+      pendingActions: this.state.pendingActions.map((a) =>
+        a.id === parsedId.value ? this.withoutScheduleMarkers(a) : a,
+      ),
+    });
+    this.recordAudit("schedule_apply", actor, action.id, `Canceled scheduled apply of "${action.summary}"`);
+    return { ok: true, message: `Canceled the scheduled apply of "${action.summary}" — it's back to manual approval.` };
+  }
+
+  /**
+   * Scheduled callback (public so the DO scheduler can invoke it by name): apply
+   * a maintenance-window action when its window arrives. Server-driven with no
+   * access lease — the write was authorized by a member at schedule time. A no-op
+   * if the action was rejected, applied early, or its schedule was canceled.
+   */
+  async runScheduledApply(payload: { actionId?: string }): Promise<void> {
+    const actionId = typeof payload?.actionId === "string" ? payload.actionId : undefined;
+    if (!actionId) return;
+    const action = this.state.pendingActions.find((a) => a.id === actionId);
+    if (!action || action.scheduledFor === undefined) return;
+    const by = action.scheduledBy ?? "a scheduled maintenance window";
+    // Clear the schedule markers before applying so the card stops showing the
+    // window and the Apply chokepoint doesn't try to cancel the alarm mid-fire.
+    this.setState({
+      ...this.state,
+      pendingActions: this.state.pendingActions.map((a) =>
+        a.id === actionId ? this.withoutScheduleMarkers(a) : a,
+      ),
+    });
+    await this.applyActionInternal(actionId, by, true, false);
   }
 
   /** Record an outcome atomically. Failed writes stay queued for correction or verification. */

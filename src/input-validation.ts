@@ -272,3 +272,31 @@ export function validateIdentifier(value: unknown, label: string, max = 200): Va
     ? parsed
     : { ok: false, message: `${label} is required.` };
 }
+
+/**
+ * Validate a client-supplied future timestamp (ms epoch) for scheduling, e.g. a
+ * maintenance-window apply. Rejects non-finite values, times too soon (< now +
+ * `minLeadMs`) and times too far out (> now + `maxAheadMs`). Returns the rounded
+ * timestamp so callers can derive an integer delay.
+ */
+export function validateFutureTimestamp(
+  value: unknown,
+  now: number,
+  minLeadMs: number,
+  maxAheadMs: number,
+  label = "scheduled time",
+): ValidationResult<number> {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return { ok: false, message: `${label} must be a timestamp.` };
+  }
+  const whenTs = Math.round(value);
+  if (whenTs < now + minLeadMs) {
+    const mins = Math.max(1, Math.round(minLeadMs / 60_000));
+    return { ok: false, message: `${label} must be at least ${mins} minute(s) in the future.` };
+  }
+  if (whenTs > now + maxAheadMs) {
+    const days = Math.max(1, Math.round(maxAheadMs / 86_400_000));
+    return { ok: false, message: `${label} must be within ${days} day(s).` };
+  }
+  return { ok: true, value: whenTs };
+}

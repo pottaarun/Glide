@@ -538,6 +538,13 @@ function fmtWhen(ms?: number): string {
   return ms ? new Date(ms).toLocaleString() : "";
 }
 
+/** Format a ms epoch as a `datetime-local` input value (local `YYYY-MM-DDTHH:mm`). */
+function toLocalInputValue(ms: number): string {
+  const d = new Date(ms);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
 /** Human-readable byte size. */
 function fmtBytes(n: number): string {
   if (n < 1024) return `${n} B`;
@@ -1239,6 +1246,9 @@ function RoomSession({
   const [autoRevertIds, setAutoRevertIds] = useState<Set<string>>(new Set());
   /** Rollback windows the user is actively keeping/reverting, to disable their buttons. */
   const [rollbackBusyIds, setRollbackBusyIds] = useState<Set<string>>(new Set());
+  /** Pending action whose "Schedule apply" form is open, and its datetime-local draft. */
+  const [schedulingId, setSchedulingId] = useState<string | undefined>();
+  const [scheduleDraft, setScheduleDraft] = useState("");
   const [draft, setDraft] = useState(() => initialDraft?.text ?? "");
   const [recoverableDrafts, setRecoverableDrafts] = useState<PendingDelivery[]>(() =>
     readRecoverableDrafts(sessionStorage, recoverableStorageKey));
@@ -2363,6 +2373,45 @@ function RoomSession({
     [runRpc, name],
   );
 
+  // Maintenance-window Apply: defer a pending action to a future time, or cancel
+  // a pending schedule. The action stays in Pending approvals until it fires.
+  const scheduleApply = useCallback(
+    async (id: string, whenTs: number) => {
+      setBusyIds((prev) => new Set(prev).add(id));
+      try {
+        const res = await runRpc<{ ok: boolean; message: string }>("scheduleApply", [id, whenTs, name]);
+        if (res?.message) setNotice(res.message);
+        if (res?.ok) {
+          setSchedulingId(undefined);
+          setScheduleDraft("");
+        }
+      } finally {
+        setBusyIds((prev) => {
+          const next = new Set(prev);
+          next.delete(id);
+          return next;
+        });
+      }
+    },
+    [runRpc, name],
+  );
+  const cancelScheduledApply = useCallback(
+    async (id: string) => {
+      setBusyIds((prev) => new Set(prev).add(id));
+      try {
+        const res = await runRpc<{ ok: boolean; message: string }>("cancelScheduledApply", [id, name]);
+        if (res?.message) setNotice(res.message);
+      } finally {
+        setBusyIds((prev) => {
+          const next = new Set(prev);
+          next.delete(id);
+          return next;
+        });
+      }
+    },
+    [runRpc, name],
+  );
+
   // ---- Onboarding wizard callbacks ----
   const patchOnboarding = useCallback(
     (patch: Record<string, unknown>) =>
@@ -3227,6 +3276,9 @@ function RoomSession({
               // clean one-call inverse (an invertible zone-setting PATCH).
               const invertible = !disabledRestore && invertibleSetting(a) !== null;
               const autoRevert = invertible && autoRevertIds.has(a.id);
+              // Maintenance-window schedule: the action auto-applies at this time.
+              const scheduledFor = typeof a.scheduledFor === "number" ? a.scheduledFor : undefined;
+              const scheduling = schedulingId === a.id;
               const statusLabel = disabledRestore
                 ? "restore disabled"
                 : applying
@@ -3298,6 +3350,24 @@ function RoomSession({
                       )}
                     </div>
                   )}
+                  {scheduledFor !== undefined && (
+                    <div style={S.scheduledRow} title={`Auto-applies at ${fmtWhen(scheduledFor)}`}>
+                      <span style={S.scheduledBadge}>⏰ scheduled</span>
+                      <span style={S.scheduledText}>
+                        Applies {fmtWhen(scheduledFor)}
+                        {a.scheduledBy ? ` · set by ${a.scheduledBy}` : ""}
+                      </span>
+                      {canWrite && (
+                        <button
+                          style={S.scheduledCancel}
+                          disabled={busyIds.has(a.id)}
+                          onClick={() => void cancelScheduledApply(a.id)}
+                        >
+                          Cancel schedule
+                        </button>
+                      )}
+                    </div>
+                  )}
                   {canWrite ? (
                     <div style={S.actionBtns}>
                       <button
@@ -3343,7 +3413,7 @@ function RoomSession({
                   ) : (
                     <div style={S.hint}>Read-only — ask a room member or owner to apply or reject this.</div>
                   )}
-                  {canWrite && invertible && !failed && !uncertain && (
+                  {canWrite && invertible && !failed && !uncertain && !scheduling && scheduledFor === undefined && (
                     <label style={S.autoRevertRow} title="After Apply, Glide restores the previous value in 15 minutes unless you click Keep — a safety net for changes that might break traffic.">
                       <input
                         type="checkbox"
@@ -3361,6 +3431,63 @@ function RoomSession({
                       />
                       <span>Auto-revert in 15 min unless I Keep it</span>
                     </label>
+                  )}
+                  {canWrite && !disabledRestore && !applying && !uncertain && scheduledFor === undefined && (
+                    scheduling ? (
+                      <div style={S.scheduleForm}>
+                        <input
+                          type="datetime-local"
+                          style={S.scheduleInput}
+                          value={scheduleDraft}
+                          min={toLocalInputValue(Date.now() + 60_000)}
+                          onChange={(e) => setScheduleDraft(e.target.value)}
+                        />
+                        <button
+                          style={S.miniBtn}
+                          disabled={busyIds.has(a.id) || !scheduleDraft}
+                          onClick={() => {
+                            const whenTs = new Date(scheduleDraft).getTime();
+                            if (!Number.isFinite(whenTs)) {
+                              setNotice("Pick a valid date and time to schedule this apply.");
+                              return;
+                            }
+                            if (whenTs < Date.now() + 60_000) {
+                              setNotice("Schedule the apply at least a minute in the future.");
+                              return;
+                            }
+                            if (!state?.tokenConfigured) {
+                              setShowTokenForm(true);
+                              setNotice("Add a Cloudflare API token before scheduling this change.");
+                              return;
+                            }
+                            void scheduleApply(a.id, whenTs);
+                          }}
+                        >
+                          Schedule
+                        </button>
+                        <button
+                          style={S.scheduleCancelForm}
+                          title="Close"
+                          onClick={() => {
+                            setSchedulingId(undefined);
+                            setScheduleDraft("");
+                          }}
+                        >
+                          ×
+                        </button>
+                      </div>
+                    ) : (
+                      <button
+                        style={S.scheduleToggle}
+                        onClick={() => {
+                          setSchedulingId(a.id);
+                          setScheduleDraft(toLocalInputValue(Date.now() + 60 * 60_000));
+                        }}
+                        title="Defer this change to a future maintenance window — Glide applies it automatically at the time you pick."
+                      >
+                        ⏰ Schedule apply…
+                      </button>
+                    )
                   )}
                 </div>
               );
@@ -6692,6 +6819,14 @@ const S: Record<string, React.CSSProperties> = {
   rollbackCard: { background: "rgba(20,27,39,.88)", border: "1px solid rgba(251,191,36,.24)", borderRadius: 8, padding: 12, marginBottom: 9, boxShadow: "inset 2px 0 0 rgba(251,191,36,.7)" },
   rollbackMeta: { fontSize: 11, color: "#fbbf24", margin: "2px 0 6px" },
   rollbackRevert: { fontSize: 12, color: "#9aa7b8", marginBottom: 9, lineHeight: 1.4 },
+  scheduledRow: { display: "flex", alignItems: "center", flexWrap: "wrap", gap: 8, marginTop: 9, padding: "6px 9px", background: "rgba(56,189,248,.08)", border: "1px solid rgba(56,189,248,.24)", borderRadius: 7 },
+  scheduledBadge: { fontSize: 11, fontWeight: 700, color: "#0b1220", background: "#38bdf8", borderRadius: 5, padding: "2px 7px", whiteSpace: "nowrap" },
+  scheduledText: { fontSize: 12, color: "#bae6fd", flex: "1 1 140px", lineHeight: 1.35 },
+  scheduledCancel: { fontSize: 12, fontWeight: 600, border: "1px solid rgba(56,189,248,.4)", background: "transparent", color: "#7dd3fc", borderRadius: 6, padding: "3px 9px", cursor: "pointer" },
+  scheduleForm: { display: "flex", alignItems: "center", flexWrap: "wrap", gap: 7, marginTop: 9 },
+  scheduleInput: { fontSize: 12, color: "#e2e8f0", background: "rgba(15,20,30,.85)", border: "1px solid rgba(148,163,184,.28)", borderRadius: 6, padding: "4px 8px", colorScheme: "dark" },
+  scheduleToggle: { fontSize: 12, fontWeight: 600, border: "1px dashed rgba(56,189,248,.35)", background: "transparent", color: "#7dd3fc", borderRadius: 6, padding: "4px 10px", cursor: "pointer", marginTop: 9 },
+  scheduleCancelForm: { fontSize: 15, lineHeight: 1, color: "#9aa7b8", background: "transparent", border: "none", cursor: "pointer", padding: "0 4px" },
 
   kv: { display: "flex", justifyContent: "space-between", gap: 10, fontSize: 13, padding: "5px 0", borderBottom: "1px solid rgba(148,163,184,.1)" },
   kvKey: { color: "#93a3b8" },

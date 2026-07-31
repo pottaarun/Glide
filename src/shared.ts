@@ -126,6 +126,15 @@ export interface PendingAction {
   error?: string;
   /** Start/end time of the latest Apply attempt, used to recover interrupted attempts. */
   attemptedAt?: number;
+  /**
+   * When set (ms epoch), this action is scheduled to auto-apply during a future
+   * maintenance window. The action stays `pending` until the DO alarm fires.
+   */
+  scheduledFor?: number;
+  /** Id of the DO schedule that will apply this action, so it can be cancelled. */
+  scheduleApplyId?: string;
+  /** Verified email of the member who scheduled the apply (for display/audit). */
+  scheduledBy?: string;
   ts: number;
 }
 
@@ -182,7 +191,8 @@ export type RoomAuditAction =
   | "inspect"
   | "posture_baseline"
   | "drift_watch"
-  | "rollback";
+  | "rollback"
+  | "schedule_apply";
 
 /**
  * One append-only governance audit entry: who did what, when. Stored in SQLite

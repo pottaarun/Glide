@@ -61,6 +61,8 @@ import {
   type RoomAuditEntry,
   type RoomMember,
   type RoomSummary,
+  type SecurityPostureCheckView,
+  type SecurityPostureReport,
   type SetupType,
   type TerraformArtifact,
 } from "../shared";
@@ -2454,6 +2456,29 @@ function RoomSession({
     [sendChatText],
   );
 
+  // Security posture scorecard: (re)grade the live zone, and queue a single
+  // one-click fix. The server rebuilds the exact call from its posture catalog
+  // (never from client input), so we only ever send the check id + zone id.
+  const refreshSecurityPosture = useCallback(
+    () => runRpc<{ ok: boolean; message: string; grade?: string; score?: number }>("refreshSecurityPosture", [name]),
+    [runRpc, name],
+  );
+  const queuePostureFix = useCallback(
+    (checkId: string) =>
+      runRpc<{ ok: boolean; message: string; id?: string }>("queuePostureFix", [
+        checkId,
+        state?.defaultZone?.id ?? "",
+        name,
+      ]),
+    [runRpc, name, state?.defaultZone?.id],
+  );
+  const askPostureFix = useCallback(
+    (ask: string) => {
+      void sendChatText(ask);
+    },
+    [sendChatText],
+  );
+
   const onboarding = state?.onboarding;
   // Form is opt-in: only show when the user explicitly opens it.
   const showWizard = !!state && formOpen && !onboarding?.completed;
@@ -3094,6 +3119,18 @@ function RoomSession({
             </Section>
           )}
 
+          {(state?.defaultZone || state?.securityPosture) && (
+            <Section title="Security posture">
+              <SecurityPosturePanel
+                report={state?.securityPosture}
+                zoneId={state?.defaultZone?.id}
+                onRefresh={refreshSecurityPosture}
+                onQueueFix={queuePostureFix}
+                onAsk={askPostureFix}
+              />
+            </Section>
+          )}
+
           {!!state?.docLinks?.length && (
             <Section
               title="Cloudflare docs"
@@ -3703,6 +3740,169 @@ function BusinessProfilePanel({ profile }: { profile: BusinessProfile }) {
 
 function priColor(pri: Recommendation["priority"]): string {
   return pri === "high" ? "#fb923c" : pri === "medium" ? "#fbbf24" : "#94a3b8";
+}
+
+const GRADE_COLORS: Record<SecurityPostureReport["grade"], string> = {
+  A: "#22c55e",
+  B: "#84cc16",
+  C: "#eab308",
+  D: "#fb923c",
+  F: "#ef4444",
+};
+
+const POSTURE_STATUS_COLORS: Record<SecurityPostureCheckView["status"], string> = {
+  pass: "#22c55e",
+  warn: "#eab308",
+  fail: "#ef4444",
+  unknown: "#6b7280",
+};
+
+const POSTURE_STATUS_RANK: Record<SecurityPostureCheckView["status"], number> = {
+  fail: 0,
+  warn: 1,
+  pass: 2,
+  unknown: 3,
+};
+
+/**
+ * Security-posture scorecard panel. Renders the room's graded scorecard (A–F)
+ * for its default zone, read from the zone's LIVE Cloudflare configuration by the
+ * server. Failing / to-improve checks come first; concrete gaps get a one-click
+ * **Queue fix** button (routed through the `queuePostureFix` RPC, which re-reads
+ * the zone and rebuilds the call server-side), while checks that need a short
+ * setup offer **Ask Glide**. A **Check now / Refresh** button (re)grades on
+ * demand. When `onRefresh`/`onQueueFix` are omitted the panel is read-only
+ * (used in the /admin dashboard).
+ */
+function SecurityPosturePanel({
+  report,
+  zoneId,
+  onRefresh,
+  onQueueFix,
+  onAsk,
+}: {
+  report?: SecurityPostureReport;
+  zoneId?: string;
+  onRefresh?: () => Promise<{ ok: boolean; message: string } | undefined>;
+  onQueueFix?: (checkId: string) => Promise<{ ok: boolean; message: string; id?: string } | undefined>;
+  onAsk?: (ask: string) => void;
+}) {
+  const [busy, setBusy] = useState<string>();
+  const [msg, setMsg] = useState<string>();
+  const readOnly = !onRefresh;
+
+  const refresh = async () => {
+    if (!onRefresh) return;
+    setBusy("__refresh");
+    setMsg(undefined);
+    const res = await onRefresh();
+    setBusy(undefined);
+    if (res && !res.ok) setMsg(res.message);
+  };
+
+  const queueFix = async (checkId: string) => {
+    if (!onQueueFix) return;
+    setBusy(checkId);
+    setMsg(undefined);
+    const res = await onQueueFix(checkId);
+    setBusy(undefined);
+    if (res && !res.ok) setMsg(res.message);
+  };
+
+  if (!report) {
+    return (
+      <>
+        <Muted>
+          Grade this zone's live security configuration (SSL/TLS, HSTS, WAF, DNSSEC, proxy coverage) into an
+          A–F scorecard with one-click fixes.
+        </Muted>
+        {!readOnly &&
+          (zoneId ? (
+            <button style={{ ...S.recQueueBtn, marginTop: 10 }} disabled={busy === "__refresh"} onClick={() => void refresh()}>
+              {busy === "__refresh" ? "Checking…" : "Check now"}
+            </button>
+          ) : (
+            <div style={S.recNote}>Set a target zone first (ask Glide to find your zone) to grade it.</div>
+          ))}
+        {msg && <div style={S.recMsg}>{msg}</div>}
+      </>
+    );
+  }
+
+  const checks = [...report.checks].sort(
+    (a, b) => POSTURE_STATUS_RANK[a.status] - POSTURE_STATUS_RANK[b.status],
+  );
+
+  return (
+    <>
+      <div style={S.postureHead}>
+        <span style={{ ...S.postureGrade, color: GRADE_COLORS[report.grade], borderColor: GRADE_COLORS[report.grade] }}>
+          {report.grade}
+        </span>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontWeight: 700, fontSize: 14 }}>{report.score}/100</div>
+          <div style={S.listMeta}>
+            {report.tally.pass} pass · {report.tally.warn} improve · {report.tally.fail} fail
+            {report.tally.unknown ? ` · ${report.tally.unknown} n/a` : ""}
+          </div>
+          <div style={S.listMeta}>
+            checked {relTime(report.ts)}
+            {report.by ? ` · by ${report.by}` : ""}
+          </div>
+        </div>
+        {!readOnly && (
+          <button style={S.miniBtn} disabled={busy === "__refresh"} onClick={() => void refresh()} title="Re-grade the live zone">
+            {busy === "__refresh" ? "…" : "Refresh"}
+          </button>
+        )}
+      </div>
+      {msg && <div style={S.recMsg}>{msg}</div>}
+      {checks.map((c) => (
+        <div key={c.id} style={S.recRow} className="glide-lift">
+          <div style={S.recTitleRow}>
+            <span style={{ ...S.recDot, background: POSTURE_STATUS_COLORS[c.status] }} />
+            <span style={S.recTitle}>{c.title}</span>
+          </div>
+          <div style={S.recMeta}>
+            {c.area} · {c.status}
+          </div>
+          <div style={S.recWhy}>{c.detail}</div>
+          <div style={S.recActionRow}>
+            {c.status === "pass" ? (
+              <span style={S.recApplied}>Pass ✓</span>
+            ) : c.status === "unknown" ? (
+              <span style={S.recProposal}>not readable</span>
+            ) : readOnly ? (
+              <span style={S.recProposal}>{c.queueable ? "one-click in the room" : "Glide-guided"}</span>
+            ) : c.queueable ? (
+              <button
+                style={{ ...S.recQueueBtn, ...(!zoneId || busy === c.id ? S.recBtnDisabled : null) }}
+                disabled={!zoneId || busy === c.id}
+                onClick={() => void queueFix(c.id)}
+                title={zoneId ? "Queue this fix for a human to Apply" : "Set a target zone first"}
+              >
+                {busy === c.id ? "Queuing…" : "Queue fix"}
+              </button>
+            ) : c.ask ? (
+              <button style={S.recAskBtn} onClick={() => onAsk?.(c.ask!)} title="Have Glide set this up in chat">
+                Ask Glide
+              </button>
+            ) : null}
+            {c.reviewRequired && c.queueable && (c.status === "fail" || c.status === "warn") && (
+              <span style={S.recFlag} title="Review the queued change before you Apply it">
+                review
+              </span>
+            )}
+            {c.doc && (
+              <a href={c.doc} target="_blank" rel="noreferrer" style={S.recDoc}>
+                Docs ↗
+              </a>
+            )}
+          </div>
+        </div>
+      ))}
+    </>
+  );
 }
 
 /**
@@ -6251,6 +6451,8 @@ const S: Record<string, React.CSSProperties> = {
   recMsg: { marginTop: 8, fontSize: 12.5, color: "#7dd3fc", background: "rgba(56,189,248,.07)", border: "1px solid rgba(56,189,248,.2)", borderRadius: 8, padding: "8px 10px", whiteSpace: "pre-wrap" },
   recGroupLabel: { fontSize: 11, fontWeight: 700, letterSpacing: 0.5, textTransform: "uppercase", color: "#93a3b8", margin: "2px 0 6px" },
   recRow: { border: "1px solid rgba(148,163,184,.14)", borderRadius: 9, padding: "9px 11px", marginBottom: 8, background: "rgba(9,12,17,.4)" },
+  postureHead: { display: "flex", alignItems: "center", gap: 11, marginBottom: 10 },
+  postureGrade: { fontSize: 26, fontWeight: 800, lineHeight: 1, width: 44, height: 44, display: "grid", placeItems: "center", borderRadius: 10, border: "2px solid", background: "rgba(9,12,17,.5)", fontFamily: DISPLAY, flexShrink: 0 },
   recTitleRow: { display: "flex", alignItems: "center", gap: 8 },
   recDot: { width: 8, height: 8, borderRadius: 999, flexShrink: 0 },
   recTitle: { fontSize: 13.5, fontWeight: 600, color: "#f1f5f9", lineHeight: 1.35 },

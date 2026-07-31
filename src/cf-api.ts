@@ -596,3 +596,61 @@ export async function getZoneManagedWafDeployed(token: string, zoneId: string): 
   const deployed = baseline.result.some((rule) => rule.action === "execute" && rule.enabled !== false);
   return { ok: true, result: deployed };
 }
+
+/**
+ * Read a scalar zone setting's value (GET /zones/{id}/settings/{setting}). The
+ * settings API returns `{ value: <scalar> }`; this returns the value coerced to a
+ * string (e.g. "on" / "off" / "1.2"). Used by the security-posture scorecard to
+ * grade Always-Use-HTTPS, minimum TLS, and TLS 1.3 from the zone's real state.
+ */
+export async function getZoneSettingValue(
+  token: string,
+  zoneId: string,
+  setting: string,
+): Promise<CfResult<string>> {
+  const id = zoneId.trim();
+  if (!id) {
+    return { ok: false, status: 400, category: "validation", message: "A zone id is required to read a setting." };
+  }
+  const name = setting.trim();
+  if (!/^[a-z0-9_]+$/.test(name)) {
+    return { ok: false, status: 400, category: "validation", message: "Invalid zone setting name." };
+  }
+  const res = await cfGet<{ value?: unknown }>(`/zones/${encodeURIComponent(id)}/settings/${name}`, token);
+  if (!res.ok) return res;
+  const value = res.result?.value;
+  const scalar = typeof value === "string" || typeof value === "number" || typeof value === "boolean" ? String(value) : "";
+  return { ok: true, result: scalar };
+}
+
+/**
+ * Report whether HSTS is enabled (GET /zones/{id}/settings/security_header). The
+ * value is nested at `value.strict_transport_security.enabled`.
+ */
+export async function getZoneHstsEnabled(token: string, zoneId: string): Promise<CfResult<boolean>> {
+  const id = zoneId.trim();
+  if (!id) {
+    return { ok: false, status: 400, category: "validation", message: "A zone id is required to read HSTS." };
+  }
+  const res = await cfGet<{ value?: { strict_transport_security?: { enabled?: unknown } } }>(
+    `/zones/${encodeURIComponent(id)}/settings/security_header`,
+    token,
+  );
+  if (!res.ok) return res;
+  return { ok: true, result: res.result?.value?.strict_transport_security?.enabled === true };
+}
+
+/**
+ * Read the zone's DNSSEC status (GET /zones/{id}/dnssec) — "active" | "pending" |
+ * "disabled" | other. A 404 means DNSSEC has never been configured ("disabled").
+ */
+export async function getZoneDnssecStatus(token: string, zoneId: string): Promise<CfResult<string>> {
+  const id = zoneId.trim();
+  if (!id) {
+    return { ok: false, status: 400, category: "validation", message: "A zone id is required to read DNSSEC." };
+  }
+  const res = await cfGet<{ status?: unknown }>(`/zones/${encodeURIComponent(id)}/dnssec`, token);
+  if (!res.ok) return res.category === "not_found" ? { ok: true, result: "disabled" } : res;
+  const status = typeof res.result?.status === "string" ? res.result.status : "unknown";
+  return { ok: true, result: status };
+}

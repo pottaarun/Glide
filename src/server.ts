@@ -59,7 +59,10 @@ import {
   cfGetAll,
   cfRequest,
   findZoneByName,
+  getZoneDnssecStatus,
+  getZoneHstsEnabled,
   getZoneManagedWafDeployed,
+  getZoneSettingValue,
   getZoneSslMode,
   listAccounts,
   listZones,
@@ -104,6 +107,8 @@ import {
   type RoomMember,
   type RoomRole,
   type RoomSummary,
+  type SecurityPostureCheckView,
+  type SecurityPostureReport,
   type SetupType,
   type TerraformArtifact,
   type WriteMethod,
@@ -114,6 +119,15 @@ import {
   recommendConfigurations,
   recommendationToPending,
 } from "./recommendations";
+import {
+  formatPostureForModel,
+  isPostureFixQueueable,
+  postureFixToPending,
+  scorePosture,
+  type PostureCheck,
+  type PostureReport,
+  type ZonePostureFacts,
+} from "./posture";
 import {
   boundedMigrationPreviewRules,
   buildConfigData,
@@ -3668,6 +3682,129 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     this.mergeLiveZone(facts);
   }
 
+  /**
+   * Read a zone's live, security-relevant configuration into posture facts. Each
+   * read is best-effort and independent: a read that fails (missing permission,
+   * transient error) simply leaves its fact `undefined`, which the scorer treats
+   * as an "unreadable" check excluded from the grade rather than a failure.
+   */
+  private async collectZonePostureFacts(
+    zoneId: string,
+    zoneName: string | undefined,
+    credential: CredentialLease,
+  ): Promise<ZonePostureFacts> {
+    const token = credential.token;
+    const [ssl, waf, alwaysHttps, minTls, tls13, hsts, dnssec] = await Promise.all([
+      getZoneSslMode(token, zoneId),
+      getZoneManagedWafDeployed(token, zoneId),
+      getZoneSettingValue(token, zoneId, "always_use_https"),
+      getZoneSettingValue(token, zoneId, "min_tls_version"),
+      getZoneSettingValue(token, zoneId, "tls_1_3"),
+      getZoneHstsEnabled(token, zoneId),
+      getZoneDnssecStatus(token, zoneId),
+    ]);
+    const facts: ZonePostureFacts = { zoneId, zoneName };
+    if (ssl.ok) facts.sslMode = ssl.result;
+    if (waf.ok) facts.managedWaf = waf.result;
+    if (alwaysHttps.ok) facts.alwaysUseHttps = alwaysHttps.result === "on";
+    if (minTls.ok && minTls.result) facts.minTlsVersion = minTls.result;
+    if (tls13.ok) facts.tls13 = tls13.result === "on";
+    if (hsts.ok) facts.hsts = hsts.result;
+    if (dnssec.ok) facts.dnssec = dnssec.result;
+    // Proxy coverage is already captured by list_dns_records into the live-zone
+    // facts; reuse it rather than re-listing every record here.
+    const live = this.currentLiveZone();
+    if (live && live.zoneId === zoneId) {
+      if (typeof live.proxiedRecords === "number") facts.proxiedRecords = live.proxiedRecords;
+      if (typeof live.proxiableRecords === "number") facts.proxiableRecords = live.proxiableRecords;
+    }
+    return facts;
+  }
+
+  /** Project a scored report onto the client-facing shape (no raw fix bodies). */
+  private toClientPostureReport(report: PostureReport, by?: string): SecurityPostureReport {
+    return {
+      zoneId: report.zoneId,
+      zoneName: report.zoneName,
+      grade: report.grade,
+      score: report.score,
+      summary: report.summary,
+      tally: report.tally,
+      ts: report.ts,
+      by,
+      checks: report.checks.map(
+        (c): SecurityPostureCheckView => ({
+          id: c.id,
+          area: c.area,
+          title: c.title,
+          status: c.status,
+          detail: c.detail,
+          queueable: isPostureFixQueueable(c),
+          reviewRequired: c.fix?.reviewRequired,
+          ask: c.ask,
+          doc: c.docs[0],
+        }),
+      ),
+    };
+  }
+
+  /**
+   * Read the room's default zone's live config, grade it, store the scorecard in
+   * synced state, and return the full report (for chat relay). Shared by the
+   * `security_posture` tool, the "Check now" RPC, and (later) the drift watch.
+   */
+  private async computeSecurityPosture(
+    by: string,
+    isCurrent: () => boolean,
+  ): Promise<{ ok: true; report: PostureReport } | { ok: false; message: string }> {
+    const zone = this.state.defaultZone;
+    if (!zone) return { ok: false, message: "No target zone yet — ask Glide to find your zone first." };
+    const credential = await this.getCredentialLease();
+    if (!isCurrent()) return { ok: false, message: "Room access ended before the posture check completed." };
+    if (!credential) return { ok: false, message: this.credentialUnavailableMessage() };
+    const facts = await this.collectZonePostureFacts(zone.id, zone.name, credential);
+    if (!isCurrent()) return { ok: false, message: "Room access ended before the posture check completed." };
+    if (!this.isCredentialLeaseCurrent(credential)) return { ok: false, message: this.credentialSupersededMessage() };
+    if (this.state.defaultZone?.id !== zone.id) {
+      return { ok: false, message: "The target zone changed while the posture check ran — run it again." };
+    }
+    const report = scorePosture(facts);
+    this.setState({ ...this.state, securityPosture: this.toClientPostureReport(report, by) });
+    return { ok: true, report };
+  }
+
+  /**
+   * Resolve one posture check to a concrete, queue-ready Cloudflare call by
+   * re-reading the zone's live state and rebuilding the fix from the posture
+   * catalog — never from client input. Returns the check's fix (or an error).
+   */
+  private async resolvePostureFix(
+    checkId: string,
+    zoneId: string,
+    isCurrent: () => boolean,
+  ): Promise<{ ok: true; check: PostureCheck } | { ok: false; message: string }> {
+    const zone = this.state.defaultZone;
+    if (!zone || zone.id !== zoneId) {
+      return { ok: false, message: "That zone is no longer the room's target zone — run find_zone again." };
+    }
+    const credential = await this.getCredentialLease();
+    if (!isCurrent()) return { ok: false, message: "Room access ended before the fix could be prepared." };
+    if (!credential) return { ok: false, message: this.credentialUnavailableMessage() };
+    const facts = await this.collectZonePostureFacts(zone.id, zone.name, credential);
+    if (!isCurrent()) return { ok: false, message: "Room access ended before the fix could be prepared." };
+    if (!this.isCredentialLeaseCurrent(credential)) return { ok: false, message: this.credentialSupersededMessage() };
+    const report = scorePosture(facts);
+    // Refresh the stored scorecard while we have fresh facts.
+    this.setState({ ...this.state, securityPosture: this.toClientPostureReport(report, this.state.securityPosture?.by) });
+    const check = report.checks.find((c) => c.id === checkId);
+    if (!check) return { ok: false, message: "That posture check no longer applies to this zone." };
+    if (check.status === "pass") return { ok: false, message: `"${check.title}" already passes — nothing to queue.` };
+    if (!check.fix) {
+      return { ok: false, message: `"${check.title}" needs a quick chat-guided setup — ask Glide and it'll walk you through it.` };
+    }
+    return { ok: true, check };
+  }
+
   /** Ensure an onboarding object exists (checklist is filled once a path is chosen). */
   private ensureOnboarding(): OnboardingState {
     return this.state.onboarding ?? { active: true, goals: [], checklist: [] };
@@ -4098,6 +4235,61 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
         ok: false,
         message: `"${rec.title}" needs a quick setup — ask Glide in chat and it'll walk you through it before queuing.`,
       };
+    }
+    const before = new Set(this.state.pendingActions.map((action) => action.id));
+    const message = this.queuePending(mapped, actor);
+    const created = this.state.pendingActions.find((action) => !before.has(action.id));
+    if (!created) return { ok: false, message };
+    return { ok: true, message, id: created.id };
+  }
+
+  /**
+   * UI: (re)compute the security-posture scorecard for the room's default zone
+   * from its LIVE Cloudflare configuration and store it in synced state — the
+   * "Check now / Refresh" button in the Security posture panel. Read-only.
+   */
+  @callable()
+  async refreshSecurityPosture(
+    by = "someone",
+  ): Promise<{ ok: boolean; message: string; grade?: string; score?: number }> {
+    const actor = this.verifiedActor(by);
+    const res = await this.computeSecurityPosture(actor, () => true);
+    if (!res.ok) return { ok: false, message: res.message };
+    return {
+      ok: true,
+      message: `Security posture graded ${res.report.grade} (${res.report.score}/100).`,
+      grade: res.report.grade,
+      score: res.report.score,
+    };
+  }
+
+  /**
+   * UI: queue a single security-posture fix as a pending action for human Apply
+   * — the "Queue fix" button in the Security posture panel.
+   *
+   * Security: the client sends only the check **id** and the target zone id. The
+   * server re-reads the zone's live state, rebuilds the scorecard, and rebuilds
+   * the exact API call from the posture catalog via {@link postureFixToPending},
+   * so the button can never inject an arbitrary Cloudflare request. Checks with
+   * no one-click fix are refused here and must be set up through chat.
+   */
+  @callable()
+  async queuePostureFix(
+    checkId: string,
+    zoneId: string,
+    by = "someone",
+  ): Promise<{ ok: boolean; message: string; id?: string }> {
+    const actor = this.verifiedActor(by);
+    if (typeof zoneId !== "string" || !/^[0-9a-f]{32}$/i.test(zoneId.trim())) {
+      return { ok: false, message: "A valid target zone id is required — ask Glide to find your zone." };
+    }
+    const parsedCheckId = validateIdentifier(checkId, "Posture check id", 100);
+    if (!parsedCheckId.ok) return { ok: false, message: parsedCheckId.message };
+    const resolved = await this.resolvePostureFix(parsedCheckId.value, zoneId.trim(), () => true);
+    if (!resolved.ok) return { ok: false, message: resolved.message };
+    const mapped = postureFixToPending(resolved.check, zoneId.trim());
+    if (!mapped) {
+      return { ok: false, message: `"${resolved.check.title}" can't be one-click queued — ask Glide in chat.` };
     }
     const before = new Set(this.state.pendingActions.map((action) => action.id));
     const message = this.queuePending(mapped, actor);
@@ -6645,6 +6837,17 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
               ? { ...set, recommendations: set.recommendations.filter((r) => r.category === focus) }
               : set;
           return clip(formatRecommendationsForModel(filtered));
+        },
+      }),
+
+      security_posture: tool({
+        description:
+          "Grade the room's default zone's LIVE Cloudflare security configuration into an A–F scorecard: SSL/TLS mode, Always-Use-HTTPS, minimum TLS version, TLS 1.3, HSTS, Managed WAF, DNSSEC, and DNS proxy coverage. READ-ONLY — it reads the zone's real settings and changes nothing, but surfaces concrete one-click fixes the user can QUEUE (a human still Applies them). Requires a default zone (run find_zone first) and a connected API token. Use when the user asks things like 'how secure is my site', 'what's my security grade', or 'what should I fix'. The scorecard also appears in the sidebar.",
+        inputSchema: z.object({}).strict(),
+        execute: async () => {
+          const res = await this.computeSecurityPosture(turn.actor, () => this.isChatTurnAccessCurrent(turn));
+          if (!res.ok) return `Error: ${res.message}`;
+          return clip(formatPostureForModel(res.report));
         },
       }),
 

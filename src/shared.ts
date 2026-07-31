@@ -282,6 +282,14 @@ export interface GlideState {
    */
   businessProfile?: BusinessProfile;
   /**
+   * Most recent security-posture scorecard for the room's default zone (grade
+   * A–F + per-check pass/warn/fail), read from the zone's *live* Cloudflare
+   * configuration. Populated on demand by the `security_posture` tool / the
+   * "Check now" button and refreshed after a posture fix is queued. See
+   * {@link SecurityPostureReport}.
+   */
+  securityPosture?: SecurityPostureReport;
+  /**
    * A running "further reading" list of Cloudflare docs pages the RAG retriever
    * surfaced while answering this room's questions (see {@link DocLink}). Deduped
    * by URL, most-recent first, capped at {@link MAX_DOC_LINKS}. Built automatically
@@ -529,6 +537,54 @@ export interface LiveZoneFacts {
   proxiableRecords?: number;
   /** ms epoch these facts were captured. */
   ts: number;
+}
+
+/** Status of a single security-posture check, mirrored to the room UI. */
+export type PostureCheckStatus = "pass" | "warn" | "fail" | "unknown";
+
+/**
+ * A single security-posture check as projected to the room UI. The raw fix
+ * (method/path/body) is deliberately NOT synced — the client sends only the
+ * check id and the server rebuilds the exact call from its own catalog, so the
+ * fix button can't inject an arbitrary request.
+ */
+export interface SecurityPostureCheckView {
+  id: string;
+  area: "TLS" | "WAF" | "DNS" | "Network";
+  title: string;
+  status: PostureCheckStatus;
+  /** Plain-English description of the current live state. */
+  detail: string;
+  /** True when the gap can be one-click queued via `queuePostureFix`. */
+  queueable: boolean;
+  /** True when the one-click fix should be reviewed before Apply (sticky/risky). */
+  reviewRequired?: boolean;
+  /** When not one-click fixable: the chat prompt to hand to Glide instead. */
+  ask?: string;
+  /** First Cloudflare docs link for the check. */
+  doc?: string;
+}
+
+/**
+ * A security-posture scorecard for the room's default zone, synced to the UI.
+ * Graded (A–F) from the zone's *live* Cloudflare configuration. See
+ * {@link ./posture.PostureReport} for the server-side source shape.
+ */
+export interface SecurityPostureReport {
+  zoneId: string;
+  zoneName?: string;
+  grade: "A" | "B" | "C" | "D" | "F";
+  /** 0–100, weighted over the checks that could be read. */
+  score: number;
+  checks: SecurityPostureCheckView[];
+  /** One-line natural-language summary of the result. */
+  summary: string;
+  /** How many checks are pass / warn / fail / unknown. */
+  tally: Record<PostureCheckStatus, number>;
+  /** ms epoch the report was produced. */
+  ts: number;
+  /** Who ran the check (email/name), for display. */
+  by?: string;
 }
 
 /** One step in the onboarding checklist (mirrors Cloudflare's go-live path). */

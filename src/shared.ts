@@ -181,7 +181,8 @@ export type RoomAuditAction =
   | "destroy"
   | "inspect"
   | "posture_baseline"
-  | "drift_watch";
+  | "drift_watch"
+  | "rollback";
 
 /**
  * One append-only governance audit entry: who did what, when. Stored in SQLite
@@ -234,6 +235,41 @@ export interface ActionResult {
 }
 
 /**
+ * An Applied change that is inside its auto-rollback safety window: a member
+ * opted into "auto-revert unless kept" when applying an invertible zone-setting
+ * change, so Glide captured the inverse and armed a timer that restores the prior
+ * state at {@link expiresTs} unless someone clicks Keep. The inverse call is
+ * built and stored server-side (synced state is server-authored; clients can't
+ * mutate it), and the Keep / Revert-now RPCs take only this record's id. See
+ * {@link ./rollback}.
+ */
+export interface PendingRollback {
+  /** Unique id for this safety window (distinct from the original action id). */
+  id: string;
+  /** The original applied action's id, for reference. */
+  actionId: string;
+  product: string;
+  /** What was applied (the original action summary). */
+  summary: string;
+  /** What the auto-revert will do (e.g. "Revert ssl to full"). */
+  revertSummary: string;
+  /** The inverse call the server executes to restore the prior value. */
+  method: "PATCH";
+  path: string;
+  body: unknown;
+  /** Target zone, when known. */
+  zoneId?: string;
+  /** Who applied the change (and thus armed the window). */
+  by: string;
+  /** ms epoch the change was applied. */
+  appliedTs: number;
+  /** ms epoch the auto-revert fires unless kept. */
+  expiresTs: number;
+  /** Id of the scheduled revert, so Keep / Revert-now can cancel the timer. */
+  scheduleId?: string;
+}
+
+/**
  * State synced live to every client in the room (Agents SDK state sync).
  * This is also the room's persistent memory — it survives restarts.
  */
@@ -251,6 +287,12 @@ export interface GlideState {
   pendingActions: PendingAction[];
   /** Last N applied/failed/rejected actions retained in synced state, newest first. */
   recentResults: ActionResult[];
+  /**
+   * Applied changes currently inside their auto-rollback safety window: each will
+   * auto-revert at its `expiresTs` unless a member clicks Keep first. Newest
+   * first, bounded. Empty/omitted when no window is open. See {@link PendingRollback}.
+   */
+  pendingRollbacks?: PendingRollback[];
   /** People invited to this room by email (most recent first). */
   invites: Invite[];
   /** Convenience pointers the agent can set so users don't repeat IDs. */

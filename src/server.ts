@@ -102,6 +102,7 @@ import {
   type OnboardingState,
   type OnboardingStep,
   type PendingAction,
+  type PendingRollback,
   type RoomAccessStatus,
   type RoomAuditAction,
   type RoomAuditEntry,
@@ -136,6 +137,7 @@ import {
   type ZonePostureFacts,
 } from "./posture";
 import { estimateBlastRadius, formatBlastRadius, type BlastRadiusEstimate } from "./blast-radius";
+import { buildRollbackPlan, invertibleSetting } from "./rollback";
 import {
   boundedMigrationPreviewRules,
   buildConfigData,
@@ -323,6 +325,10 @@ const LEGACY_CHAT_TOKEN_DECRYPTION_FAILED = "token_decryption_failed";
 const LEGACY_CHAT_ENCRYPTION_KEY_UNAVAILABLE = "encryption_key_unavailable";
 /** Interval (seconds) between scheduled security-posture drift checks (~weekly). */
 const DRIFT_WATCH_INTERVAL_SEC = 7 * 24 * 60 * 60;
+/** How long an opted-in Applied change stays auto-revertible before the timer fires. */
+const AUTO_ROLLBACK_WINDOW_SEC = 15 * 60;
+/** Cap on open auto-rollback safety windows retained in synced state. */
+const MAX_PENDING_ROLLBACKS = 20;
 
 function persistedChatMessageRole(
   rowId: string,
@@ -8464,7 +8470,12 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
   }
 
   @callable()
-  async applyAction(id: string, by = "someone", confirmUncertain = false): Promise<ActionResult> {
+  async applyAction(
+    id: string,
+    by = "someone",
+    confirmUncertain = false,
+    autoRevert = false,
+  ): Promise<ActionResult> {
     const { lease: accessLease } = this.requireCommitRole("apply changes");
     const actor = accessLease?.email ?? normalizeActor(by, "a teammate");
     const parsedId = validateIdentifier(id, "Action id", 200);
@@ -8486,6 +8497,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
       confirmUncertain === true,
       undefined,
       accessLease,
+      autoRevert === true,
     );
   }
 
@@ -8496,6 +8508,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     confirmUncertain = false,
     capturedCredential?: CredentialLease | null,
     accessLease?: RoomAccessLease,
+    autoRevert = false,
   ): Promise<ActionResult> {
     let action = this.state.pendingActions.find((a) => a.id === id);
     if (!action) {
@@ -8755,10 +8768,71 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
       if (!this.isRoomAccessLeaseCurrent(accessLease)) {
         return this.applyCanceledForAccessLoss(action, by);
       }
+
+      // Auto-rollback safety window (opt-in; invertible zone-setting PATCH only):
+      // read the CURRENT value now so a successful write can be restored later. If
+      // the member opted in but we can't read the prior value, honor their intent
+      // by failing safe — send nothing to Cloudflare rather than apply a change we
+      // couldn't undo.
+      let rollbackPriorValue: unknown;
+      let armRollback = false;
+      const invertible = autoRevert ? invertibleSetting(action) : null;
+      if (invertible) {
+        const prior = await cfGet<{ value?: unknown }>(invertible.path, credential.token);
+        if (!this.isRoomAccessLeaseCurrent(accessLease)) {
+          return this.applyCanceledForAccessLoss(action, by);
+        }
+        if (!this.isCredentialLeaseCurrent(credential)) {
+          return this.recordActionResult(
+            id,
+            {
+              id,
+              product: action.product,
+              summary: action.summary,
+              status: "failed",
+              detail: "The Cloudflare credential changed during the auto-revert safety read. Nothing was sent; retry with the current token.",
+              by,
+              ts: Date.now(),
+            },
+            true,
+            notify,
+          );
+        }
+        if (!prior.ok || prior.result?.value === undefined) {
+          const why = prior.ok
+            ? "Cloudflare didn't return a current value."
+            : prior.hint
+              ? `${prior.message} — needs token permission: ${prior.hint}`
+              : prior.message;
+          return this.recordActionResult(
+            id,
+            {
+              id,
+              product: action.product,
+              summary: action.summary,
+              status: "failed",
+              detail: `Couldn't read the current value to arm the auto-revert safety window, so nothing was changed: ${why} Retry, or apply without the safety window.`,
+              by,
+              ts: Date.now(),
+            },
+            true,
+            notify,
+          );
+        }
+        rollbackPriorValue = prior.result.value;
+        armRollback = true;
+      }
       const res = await cfRequest(action.method, action.path, credential.token, body);
 
       if (res.ok) {
         const createdId = (res.result as { id?: string } | undefined)?.id;
+        let detail = createdId ? `Applied — created ${createdId}` : "Applied successfully.";
+        if (armRollback) {
+          const armed = await this.armAutoRollback(action, rollbackPriorValue, by);
+          detail += armed
+            ? " Auto-revert armed — restores the previous setting in 15 min unless you Keep it."
+            : " (Couldn't arm auto-revert; the change stays unless you revert it manually.)";
+        }
         return this.recordActionResult(
           id,
           {
@@ -8766,7 +8840,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
             product: action.product,
             summary: action.summary,
             status: "applied",
-            detail: createdId ? `Applied — created ${createdId}` : "Applied successfully.",
+            detail,
             by,
             ts: Date.now(),
           },
@@ -8919,6 +8993,198 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     this.recomputeOnboardingChecklist();
     if (notify) await this.scheduleActionResultNotification([safeResult]);
     return safeResult;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Auto-rollback safety window
+  //
+  // When a member opts in while applying an invertible zone-setting change, the
+  // Apply path captured the prior value and calls armAutoRollback, which stores a
+  // PendingRollback and schedules runAutoRollback. The change auto-reverts when
+  // the timer fires unless a member calls keepAppliedChange first (or reverts
+  // early with revertAppliedChange). The executable inverse is server-authored
+  // and stored in synced state (clients cannot mutate synced state); the Keep /
+  // Revert RPCs take only the window id.
+  // ---------------------------------------------------------------------------
+
+  /** Store the inverse + arm the revert timer for a just-applied invertible change. */
+  private async armAutoRollback(action: PendingAction, priorValue: unknown, by: string): Promise<boolean> {
+    const plan = buildRollbackPlan(action, priorValue);
+    if (!plan) return false;
+    const rollbackId = crypto.randomUUID();
+    const now = Date.now();
+    let scheduleId: string | undefined;
+    try {
+      const scheduled = await this.schedule(
+        AUTO_ROLLBACK_WINDOW_SEC,
+        "runAutoRollback",
+        { rollbackId },
+        { idempotent: true },
+      );
+      scheduleId = scheduled.id;
+    } catch (err) {
+      console.error(
+        JSON.stringify({
+          message: "failed to schedule auto-rollback",
+          actionId: action.id,
+          error: err instanceof Error ? err.message : String(err),
+        }),
+      );
+      return false;
+    }
+    const rollback: PendingRollback = {
+      id: rollbackId,
+      actionId: action.id,
+      product: action.product,
+      summary: action.summary,
+      revertSummary: plan.summary,
+      method: plan.method,
+      path: plan.path,
+      body: plan.body,
+      zoneId: action.zoneId,
+      by,
+      appliedTs: now,
+      expiresTs: now + AUTO_ROLLBACK_WINDOW_SEC * 1_000,
+      scheduleId,
+    };
+    this.setState({
+      ...this.state,
+      pendingRollbacks: [rollback, ...(this.state.pendingRollbacks ?? [])].slice(0, MAX_PENDING_ROLLBACKS),
+    });
+    return true;
+  }
+
+  /**
+   * Scheduled callback (public so the DO scheduler can invoke it by name): fire an
+   * auto-revert when its safety window closes. A no-op if the window was already
+   * kept or reverted (the record is gone).
+   */
+  async runAutoRollback(payload: { rollbackId?: string }): Promise<void> {
+    const rollbackId = typeof payload?.rollbackId === "string" ? payload.rollbackId : undefined;
+    if (!rollbackId) return;
+    const rollback = (this.state.pendingRollbacks ?? []).find((r) => r.id === rollbackId);
+    if (!rollback) return;
+    await this.executeRollback(rollback, "the auto-revert safety window", true);
+  }
+
+  /**
+   * Restore an applied change's prior value. Removes the window first so a manual
+   * "Revert now" racing the timer can't double-apply, then sends the inverse and
+   * records the outcome.
+   */
+  private async executeRollback(rollback: PendingRollback, by: string, notify: boolean): Promise<ActionResult> {
+    this.setState({
+      ...this.state,
+      pendingRollbacks: (this.state.pendingRollbacks ?? []).filter((r) => r.id !== rollback.id),
+    });
+    const base = { id: rollback.id, product: rollback.product, summary: rollback.revertSummary, by, ts: Date.now() };
+    const credential = await this.getCredentialLease();
+    if (!credential) {
+      return this.recordRollbackOutcome(
+        { ...base, status: "failed", detail: `${this.credentialUnavailableMessage()} The change was NOT reverted.` },
+        rollback,
+        notify,
+      );
+    }
+    const res = await cfRequest(rollback.method, rollback.path, credential.token, rollback.body);
+    if (res.ok) {
+      return this.recordRollbackOutcome(
+        { ...base, status: "applied", detail: `Reverted to the previous setting (${rollback.summary}).` },
+        rollback,
+        notify,
+      );
+    }
+    const why = res.hint ? `${res.message} — needs token permission: ${res.hint}` : res.message;
+    return this.recordRollbackOutcome(
+      { ...base, status: "failed", detail: `Auto-revert failed — the applied change is still live: ${why}` },
+      rollback,
+      notify,
+    );
+  }
+
+  /** Record a revert outcome in recentResults + audit, without touching pendingActions. */
+  private async recordRollbackOutcome(
+    result: ActionResult,
+    rollback: PendingRollback,
+    notify: boolean,
+  ): Promise<ActionResult> {
+    const safeResult: ActionResult = {
+      ...result,
+      product: redactCloudflareApiTokens(result.product, this.tokenForRedaction),
+      summary: redactCloudflareApiTokens(result.summary, this.tokenForRedaction),
+      detail: redactCloudflareApiTokens(result.detail, this.tokenForRedaction),
+      by: redactCloudflareApiTokens(result.by, this.tokenForRedaction),
+    };
+    this.setState({
+      ...this.state,
+      recentResults: [safeResult, ...this.state.recentResults].slice(0, MAX_RECENT_RESULTS),
+    });
+    if (safeResult.status === "applied") {
+      this.recordAudit("rollback", safeResult.by, rollback.actionId, safeResult.summary);
+    }
+    // A revert can un-satisfy a go-live step (e.g. SSL mode changed back).
+    this.recomputeOnboardingChecklist();
+    if (notify) await this.scheduleActionResultNotification([safeResult]);
+    return safeResult;
+  }
+
+  /**
+   * UI: "Keep" an applied change — cancel its auto-revert timer and close the
+   * safety window so the change stays live. Member-or-owner only.
+   */
+  @callable()
+  async keepAppliedChange(rollbackId: string, by = "someone"): Promise<{ ok: boolean; message: string }> {
+    this.requireCommitRole("keep or revert an applied change");
+    const parsed = validateIdentifier(rollbackId, "Safety-window id", 200);
+    if (!parsed.ok) return { ok: false, message: parsed.message };
+    const rollback = (this.state.pendingRollbacks ?? []).find((r) => r.id === parsed.value);
+    if (!rollback) return { ok: false, message: "That safety window has already closed." };
+    if (rollback.scheduleId) {
+      try {
+        await this.cancelSchedule(rollback.scheduleId);
+      } catch {
+        this.logChatEvent("rollback.keep_schedule_cancel_failed", {}, "warn");
+      }
+    }
+    this.setState({
+      ...this.state,
+      pendingRollbacks: (this.state.pendingRollbacks ?? []).filter((r) => r.id !== rollback.id),
+    });
+    return { ok: true, message: `Kept "${rollback.summary}" — the change stays live.` };
+  }
+
+  /**
+   * UI: "Revert now" — restore the prior value immediately instead of waiting for
+   * the timer. Member-or-owner only.
+   */
+  @callable()
+  async revertAppliedChange(rollbackId: string, by = "someone"): Promise<ActionResult> {
+    const { lease } = this.requireCommitRole("keep or revert an applied change");
+    const actor = lease?.email ?? normalizeActor(by, "a teammate");
+    const parsed = validateIdentifier(rollbackId, "Safety-window id", 200);
+    if (!parsed.ok) {
+      return { id: "invalid", product: "—", summary: "(invalid)", status: "failed", detail: parsed.message, by: actor, ts: Date.now() };
+    }
+    const rollback = (this.state.pendingRollbacks ?? []).find((r) => r.id === parsed.value);
+    if (!rollback) {
+      return {
+        id: parsed.value,
+        product: "—",
+        summary: "(closed)",
+        status: "failed",
+        detail: "That safety window has already closed.",
+        by: actor,
+        ts: Date.now(),
+      };
+    }
+    if (rollback.scheduleId) {
+      try {
+        await this.cancelSchedule(rollback.scheduleId);
+      } catch {
+        this.logChatEvent("rollback.revert_schedule_cancel_failed", {}, "warn");
+      }
+    }
+    return this.executeRollback(rollback, actor, true);
   }
 
   /** Schedule the model follow-up outside the approval RPC, so Apply returns promptly. */

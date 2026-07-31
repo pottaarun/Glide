@@ -57,6 +57,7 @@ import {
   type OnboardingPath,
   type OnboardingState,
   type PendingAction,
+  type PendingRollback,
   type PostureDriftView,
   type RoomAccessStatus,
   type RoomAuditEntry,
@@ -74,6 +75,7 @@ import {
   isSnapshotRestoreAction,
   pendingActionStatus,
 } from "../action-lifecycle";
+import { invertibleSetting } from "../rollback";
 import {
   MAX_CHAT_DELIVERY_STATUS_IDS,
   MAX_CHAT_HISTORY_BYTES,
@@ -1233,6 +1235,10 @@ function RoomSession({
   const [state, setState] = useState<GlideState>();
   const [notice, setNotice] = useState<string>();
   const [busyIds, setBusyIds] = useState<Set<string>>(new Set());
+  /** Per-action opt-in for the auto-rollback safety window (invertible changes only). */
+  const [autoRevertIds, setAutoRevertIds] = useState<Set<string>>(new Set());
+  /** Rollback windows the user is actively keeping/reverting, to disable their buttons. */
+  const [rollbackBusyIds, setRollbackBusyIds] = useState<Set<string>>(new Set());
   const [draft, setDraft] = useState(() => initialDraft?.text ?? "");
   const [recoverableDrafts, setRecoverableDrafts] = useState<PendingDelivery[]>(() =>
     readRecoverableDrafts(sessionStorage, recoverableStorageKey));
@@ -2318,12 +2324,12 @@ function RoomSession({
   }, [agent, connected, state?.invites.length]);
 
   const apply = useCallback(
-    async (id: string, confirmUncertain = false) => {
+    async (id: string, confirmUncertain = false, autoRevert = false) => {
       setBusyIds((prev) => new Set(prev).add(id));
       try {
         const result = await runRpc<ActionResult>(
           "applyAction",
-          [id, name, confirmUncertain],
+          [id, name, confirmUncertain, autoRevert],
           { timeout: APPLY_RPC_TIMEOUT_MS },
         );
         if (result?.status === "failed") {
@@ -2341,6 +2347,19 @@ function RoomSession({
         });
       }
     },
+    [runRpc, name],
+  );
+
+  // Auto-rollback safety window: Keep (close the window, change stays) or Revert
+  // now (restore the prior value immediately). Both take only the window id.
+  const keepAppliedChange = useCallback(
+    (rollbackId: string) =>
+      runRpc<{ ok: boolean; message: string }>("keepAppliedChange", [rollbackId, name]),
+    [runRpc, name],
+  );
+  const revertAppliedChange = useCallback(
+    (rollbackId: string) =>
+      runRpc<ActionResult>("revertAppliedChange", [rollbackId, name], { timeout: APPLY_RPC_TIMEOUT_MS }),
     [runRpc, name],
   );
 
@@ -3204,6 +3223,10 @@ function RoomSession({
               const failed = status === "failed" || (status === "applying" && !applying);
               const uncertain = isActionOutcomeUncertain(a);
               const impact = impacts[a.id];
+              // Offer the auto-rollback safety window only when the change has a
+              // clean one-call inverse (an invertible zone-setting PATCH).
+              const invertible = !disabledRestore && invertibleSetting(a) !== null;
+              const autoRevert = invertible && autoRevertIds.has(a.id);
               const statusLabel = disabledRestore
                 ? "restore disabled"
                 : applying
@@ -3294,7 +3317,7 @@ function RoomSession({
                           ) {
                             return;
                           }
-                          void apply(a.id, uncertain);
+                          void apply(a.id, uncertain, autoRevert);
                         }}
                       >
                         {applying
@@ -3320,6 +3343,25 @@ function RoomSession({
                   ) : (
                     <div style={S.hint}>Read-only — ask a room member or owner to apply or reject this.</div>
                   )}
+                  {canWrite && invertible && !failed && !uncertain && (
+                    <label style={S.autoRevertRow} title="After Apply, Glide restores the previous value in 15 minutes unless you click Keep — a safety net for changes that might break traffic.">
+                      <input
+                        type="checkbox"
+                        checked={autoRevert}
+                        disabled={applying}
+                        onChange={(e) => {
+                          const on = e.target.checked;
+                          setAutoRevertIds((prev) => {
+                            const next = new Set(prev);
+                            if (on) next.add(a.id);
+                            else next.delete(a.id);
+                            return next;
+                          });
+                        }}
+                      />
+                      <span>Auto-revert in 15 min unless I Keep it</span>
+                    </label>
+                  )}
                 </div>
               );
             })}
@@ -3335,6 +3377,59 @@ function RoomSession({
               </div>
             )}
           </Section>
+
+          {!!state?.pendingRollbacks?.length && (
+            <Section title={`Safety window · ${state.pendingRollbacks.length}`}>
+              <Muted>
+                These changes auto-revert unless you Keep them — a safety net for changes that might break
+                traffic.
+              </Muted>
+              {state.pendingRollbacks.map((rb: PendingRollback) => {
+                const busy = rollbackBusyIds.has(rb.id);
+                const keep = async () => {
+                  setRollbackBusyIds((prev) => new Set(prev).add(rb.id));
+                  const res = await keepAppliedChange(rb.id);
+                  if (res && !res.ok) setNotice(res.message);
+                  setRollbackBusyIds((prev) => {
+                    const next = new Set(prev);
+                    next.delete(rb.id);
+                    return next;
+                  });
+                };
+                const revert = async () => {
+                  setRollbackBusyIds((prev) => new Set(prev).add(rb.id));
+                  const res = await revertAppliedChange(rb.id);
+                  if (res?.status === "failed") setNotice(res.detail);
+                  setRollbackBusyIds((prev) => {
+                    const next = new Set(prev);
+                    next.delete(rb.id);
+                    return next;
+                  });
+                };
+                return (
+                  <div key={rb.id} style={S.rollbackCard} className="glide-lift">
+                    <div style={S.actionSummary}>{rb.summary}</div>
+                    <div style={S.rollbackMeta}>
+                      <RollbackCountdown expiresTs={rb.expiresTs} /> · applied by {rb.by}
+                    </div>
+                    <div style={S.rollbackRevert}>{rb.revertSummary}</div>
+                    {canWrite ? (
+                      <div style={S.actionBtns}>
+                        <button style={S.applyBtn} disabled={busy} onClick={() => void keep()}>
+                          {busy ? "…" : "Keep"}
+                        </button>
+                        <button style={S.rejectBtn} disabled={busy} onClick={() => void revert()}>
+                          {busy ? "…" : "Revert now"}
+                        </button>
+                      </div>
+                    ) : (
+                      <div style={S.hint}>Read-only — a room member or owner can Keep or revert this.</div>
+                    )}
+                  </div>
+                );
+              })}
+            </Section>
+          )}
 
           {state?.migrationPlan && (
             <Section title="Migration plan">
@@ -3841,6 +3936,23 @@ const POSTURE_STATUS_RANK: Record<SecurityPostureCheckView["status"], number> = 
   pass: 2,
   unknown: 3,
 };
+
+/**
+ * Live, self-ticking countdown to an auto-rollback safety window's expiry. Kept
+ * as its own component so only the countdown re-renders each second, not the
+ * whole room. Shows "reverting now…" once the window has closed.
+ */
+function RollbackCountdown({ expiresTs }: { expiresTs: number }) {
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    const t = setInterval(() => setTick((n) => (n + 1) % 60), 1000);
+    return () => clearInterval(t);
+  }, []);
+  const diff = expiresTs - Date.now();
+  if (diff <= 0) return <>reverting now…</>;
+  const s = Math.floor(diff / 1000);
+  return <>auto-reverts in {s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`}</>;
+}
 
 /**
  * Security-posture scorecard panel. Renders the room's graded scorecard (A–F)
@@ -6576,6 +6688,10 @@ const S: Record<string, React.CSSProperties> = {
   applyBtn: { flex: 1, padding: "8px 0", borderRadius: 6, border: "1px solid #f6821f", background: "#f6821f", color: "#1a1008", fontWeight: 800, cursor: "pointer" },
   dangerBtn: { width: "100%", padding: "9px 10px", borderRadius: 6, border: "1px solid rgba(244,63,94,.62)", background: "rgba(190,24,93,.22)", color: "#fecdd3", fontWeight: 800, cursor: "pointer" },
   rejectBtn: { flex: 1, padding: "8px 0", borderRadius: 6, border: "1px solid rgba(148,163,184,.2)", background: "rgba(148,163,184,.055)", color: "#cbd5e1", cursor: "pointer" },
+  autoRevertRow: { display: "flex", alignItems: "center", gap: 7, marginTop: 9, fontSize: 12, color: "#9aa7b8", cursor: "pointer", lineHeight: 1.35 },
+  rollbackCard: { background: "rgba(20,27,39,.88)", border: "1px solid rgba(251,191,36,.24)", borderRadius: 8, padding: 12, marginBottom: 9, boxShadow: "inset 2px 0 0 rgba(251,191,36,.7)" },
+  rollbackMeta: { fontSize: 11, color: "#fbbf24", margin: "2px 0 6px" },
+  rollbackRevert: { fontSize: 12, color: "#9aa7b8", marginBottom: 9, lineHeight: 1.4 },
 
   kv: { display: "flex", justifyContent: "space-between", gap: 10, fontSize: 13, padding: "5px 0", borderBottom: "1px solid rgba(148,163,184,.1)" },
   kvKey: { color: "#93a3b8" },

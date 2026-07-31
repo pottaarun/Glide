@@ -3463,7 +3463,7 @@ function RoomSession({
             </Section>
           )}
 
-          {access.role === "owner" && (
+          {myRole === "owner" && (
             <Section title="Danger zone">
               <p style={S.hint}>
                 Permanently delete this room for everyone — chat history, pending approvals, memory,

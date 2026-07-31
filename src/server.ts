@@ -96,7 +96,10 @@ import {
   type OnboardingStep,
   type PendingAction,
   type RoomAccessStatus,
+  type RoomAuditAction,
+  type RoomAuditEntry,
   type RoomMember,
+  type RoomRole,
   type RoomSummary,
   type SetupType,
   type TerraformArtifact,
@@ -243,6 +246,10 @@ const MAX_RECENT_RESULTS = 25;
 const MAX_PENDING_ACTIONS = 100;
 const MAX_MEMORY_ENTRIES = 100;
 const MAX_ROOM_MEMBERS = 100;
+/** Cap on retained append-only audit rows per room; oldest are pruned past this. */
+const MAX_ROOM_AUDIT_ENTRIES = 5_000;
+/** Default page size when reading the audit log if the caller doesn't specify one. */
+const DEFAULT_ROOM_AUDIT_PAGE = 500;
 /** Give a queued first activation time to claim a room before denied-probe cleanup. */
 const FRESH_ROOM_CLEANUP_DELAY_SECONDS = 1;
 /** Retry transient schedule-write failures within the Durable Object waitUntil budget. */
@@ -373,9 +380,40 @@ function prepareRoomAccessStorage(
 ): void {
   storage.sql.exec(`CREATE TABLE IF NOT EXISTS glide_room_members (
     email      TEXT PRIMARY KEY COLLATE NOCASE,
-    role       TEXT NOT NULL CHECK (role IN ('owner', 'member')),
+    role       TEXT NOT NULL CHECK (role IN ('owner', 'member', 'viewer')),
     invited_by TEXT,
     joined_at  INTEGER NOT NULL
+  )`);
+  // Migration: rooms created before the "viewer" role existed have a members
+  // table whose CHECK constraint still rejects 'viewer'. SQLite cannot ALTER a
+  // CHECK constraint, so rebuild the table in place (data preserved) when the
+  // stored definition predates the expanded role set. New rooms already match.
+  const membersDef = storage.sql
+    .exec<{ sql: string | null }>(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'glide_room_members'",
+    )
+    .toArray()[0]?.sql;
+  if (membersDef && !membersDef.includes("viewer")) {
+    storage.sql.exec("ALTER TABLE glide_room_members RENAME TO glide_room_members_pre_viewer");
+    storage.sql.exec(`CREATE TABLE glide_room_members (
+      email      TEXT PRIMARY KEY COLLATE NOCASE,
+      role       TEXT NOT NULL CHECK (role IN ('owner', 'member', 'viewer')),
+      invited_by TEXT,
+      joined_at  INTEGER NOT NULL
+    )`);
+    storage.sql.exec(`INSERT INTO glide_room_members (email, role, invited_by, joined_at)
+      SELECT email, role, invited_by, joined_at FROM glide_room_members_pre_viewer`);
+    storage.sql.exec("DROP TABLE glide_room_members_pre_viewer");
+  }
+  // Append-only governance audit trail: who queued/applied/rejected/invited/etc.
+  // Stored only in SQLite (never synced in GlideState); read on demand by owners.
+  storage.sql.exec(`CREATE TABLE IF NOT EXISTS glide_room_audit (
+    id      TEXT PRIMARY KEY,
+    ts      INTEGER NOT NULL,
+    actor   TEXT NOT NULL,
+    action  TEXT NOT NULL,
+    target  TEXT,
+    detail  TEXT
   )`);
   storage.sql.exec(`CREATE TABLE IF NOT EXISTS glide_room_invites (
     email       TEXT PRIMARY KEY COLLATE NOCASE,
@@ -1694,13 +1732,111 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
       invited_by: string | null;
       joined_at: number;
     }>`SELECT email, role, invited_by, joined_at FROM glide_room_members
-      ORDER BY CASE role WHEN 'owner' THEN 0 ELSE 1 END, joined_at, email
+      ORDER BY CASE role WHEN 'owner' THEN 0 WHEN 'member' THEN 1 ELSE 2 END, joined_at, email
       LIMIT ${MAX_ROOM_MEMBERS}`.map((row) => ({
         email: row.email,
         role: row.role,
         ...(row.invited_by ? { invitedBy: row.invited_by } : {}),
         joinedAt: row.joined_at,
       }));
+  }
+
+  // ---------------------------------------------------------------------------
+  // Per-room RBAC. Three persisted roles (see {@link RoomRole}):
+  //   owner  — full control (manage roles/members, tokens, rename, delete)
+  //   member — apply/reject changes, invite teammates, manage the token
+  //   viewer — read-only: may read + chat + propose (queue) changes, but may NOT
+  //            apply/reject, invite, manage the token, rename, or delete.
+  // Write RPCs already require a current member lease; these helpers additionally
+  // block viewers from the "commit" surface. Owner-only actions gate separately.
+  // ---------------------------------------------------------------------------
+
+  /** The caller's persisted room role, or undefined if they are not a member. */
+  private roomRole(email: string): RoomRole | undefined {
+    return this.sql<{ role: RoomRole }>`SELECT role FROM glide_room_members
+      WHERE email = ${email} LIMIT 1`[0]?.role;
+  }
+
+  /**
+   * Gate a write/"commit" action behind member-or-owner (i.e. reject viewers).
+   *
+   * Over a browser socket, {@link currentRoomAccessLease} resolves a verified
+   * member lease (or throws for a non-member); this additionally rejects viewers.
+   * For DO-internal/programmatic calls there is no connection, so the lease is
+   * `undefined` and no role gate applies — mirroring the pre-RBAC behavior these
+   * write methods relied on (the caller is trusted server code, not a browser).
+   * Returns the lease + role for attribution/audit; `capability` is woven into
+   * the error a viewer sees.
+   */
+  private requireCommitRole(
+    capability: string,
+  ): { lease: RoomAccessLease | undefined; role: RoomRole | undefined } {
+    const lease = this.currentRoomAccessLease();
+    const role = lease ? this.roomRole(lease.email) : undefined;
+    if (role === "viewer") {
+      throw new Error(`Viewers have read-only access and cannot ${capability}. Ask a room owner or member.`);
+    }
+    return { lease, role };
+  }
+
+  /** Append one row to the append-only audit trail (best-effort; never throws). */
+  private recordAudit(
+    action: RoomAuditAction,
+    actor: string,
+    target?: string,
+    detail?: string,
+  ): void {
+    try {
+      this.sql`INSERT INTO glide_room_audit (id, ts, actor, action, target, detail)
+        VALUES (${crypto.randomUUID()}, ${Date.now()}, ${actor || "system"}, ${action},
+          ${target ?? null}, ${detail ?? null})`;
+      this.sql`DELETE FROM glide_room_audit WHERE id IN (
+        SELECT id FROM glide_room_audit ORDER BY ts DESC, id DESC
+        LIMIT -1 OFFSET ${MAX_ROOM_AUDIT_ENTRIES})`;
+    } catch {
+      this.logChatEvent("room.audit_write_failed", { action }, "warn");
+    }
+  }
+
+  /** Read recent audit rows (newest first), bounded. */
+  private roomAuditEntries(limit: number): RoomAuditEntry[] {
+    return this.sql<{
+      id: string;
+      ts: number;
+      actor: string;
+      action: string;
+      target: string | null;
+      detail: string | null;
+    }>`SELECT id, ts, actor, action, target, detail FROM glide_room_audit
+      ORDER BY ts DESC, id DESC LIMIT ${limit}`.map((row) => ({
+        id: row.id,
+        ts: row.ts,
+        actor: row.actor,
+        action: row.action as RoomAuditAction,
+        ...(row.target ? { target: row.target } : {}),
+        ...(row.detail ? { detail: row.detail } : {}),
+      }));
+  }
+
+  /**
+   * Owner-gated read of the room's audit trail, exported to CSV/JSON from the
+   * admin dashboard. Only the room owner may read who queued/applied what.
+   */
+  @callable()
+  async getAuditLog(limit?: unknown): Promise<RoomAuditEntry[]> {
+    const { connection } = getCurrentAgent<GlideAgent>();
+    const identity = this.connectionIdentity(connection);
+    if (
+      !identity ||
+      this.isAccessIdentityExpired(identity) ||
+      this.roomRole(identity.email) !== "owner"
+    ) {
+      throw new Error("Only the room owner can view the audit log.");
+    }
+    const cap = Number.isSafeInteger(limit) && (limit as number) > 0
+      ? Math.min(limit as number, MAX_ROOM_AUDIT_ENTRIES)
+      : DEFAULT_ROOM_AUDIT_PAGE;
+    return this.roomAuditEntries(cap);
   }
 
   // ---------------------------------------------------------------------------
@@ -3652,9 +3788,11 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
    */
   @callable()
   async setRoomName(name: unknown, by = "someone"): Promise<{ ok: true; roomName?: string }> {
-    // Attribution/membership is enforced for the calling connection like the
-    // other room-mutating RPCs; `by` is accepted for signature parity.
-    void this.verifiedActor(by);
+    // Membership + role are enforced for the calling connection like the other
+    // room-mutating RPCs (viewers are read-only); `by` is kept for signature
+    // parity but the verified lease email is used for attribution/audit.
+    const { lease } = this.requireCommitRole("rename the room");
+    const actor = lease?.email ?? normalizeActor(by, "a teammate");
     const roomName = normalizeRoomName(name);
     if (roomName === this.state.roomName) return { ok: true, roomName };
     if (roomName === undefined) {
@@ -3664,6 +3802,12 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
       this.setState({ ...this.state, roomName });
     }
     this.syncRoomToRegistry();
+    this.recordAudit(
+      "rename",
+      actor,
+      undefined,
+      roomName ? `Renamed room to "${roomName}"` : "Cleared the room name",
+    );
     return { ok: true, roomName };
   }
 
@@ -3696,6 +3840,9 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     if (confirmation !== ROOM_DELETE_CONFIRMATION) {
       return { ok: false, message: `Type ${ROOM_DELETE_CONFIRMATION} to confirm deleting this room.` };
     }
+    // Audit the deletion. (The row is wiped with everything else below, but the
+    // event is emitted to observability so the destruction is never silent.)
+    this.recordAudit("destroy", identity.email, this.name, "Deleted the room");
 
     // Mark destroyed so any in-flight registry sync bails instead of resurrecting
     // this room, then deregister (awaited) so it never lingers in the list.
@@ -3964,7 +4111,18 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
 
   @callable()
   async setCloudflareToken(rawToken: string): Promise<{ ok: boolean; message: string }> {
-    return this.setCloudflareTokenInternal(rawToken, this.currentRoomAccessLease());
+    const { lease } = this.requireCommitRole("manage the Cloudflare token");
+    const result = await this.setCloudflareTokenInternal(rawToken, lease);
+    if (result.ok) {
+      const last4 = typeof rawToken === "string" ? rawToken.trim().slice(-4) : "";
+      this.recordAudit(
+        "token_set",
+        lease?.email ?? "system",
+        undefined,
+        last4 ? `Saved the Cloudflare API token (…${last4})` : "Saved the Cloudflare API token",
+      );
+    }
+    return result;
   }
 
   private async setCloudflareTokenInternal(
@@ -4061,7 +4219,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
 
   @callable()
   async clearCloudflareToken(): Promise<{ ok: boolean; message?: string }> {
-    const accessLease = this.currentRoomAccessLease();
+    const { lease: accessLease } = this.requireCommitRole("manage the Cloudflare token");
     if (!this.assistantProvenanceReady) {
       await this.attemptLegacyChatMigration(true);
       if (!this.assistantProvenanceReady) {
@@ -4090,6 +4248,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
       });
       this.credentialReadyGeneration = generation;
       this.migrationCheckGeneration += 1;
+      this.recordAudit("token_clear", accessLease?.email ?? "system", undefined, "Cleared the Cloudflare API token");
       return { ok: true };
     } catch (error) {
       try {
@@ -4275,13 +4434,16 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     email: string,
     _by = "someone",
     link?: string,
+    role?: unknown,
   ): Promise<{ ok: boolean; message: string; members?: RoomMember[] }> {
     const e = canonicalizeEmail(email);
     if (!e) {
       return { ok: false, message: `"${email}" doesn't look like a valid email address.` };
     }
+    // Invites grant "member" by default; only an owner may grant read-only "viewer".
+    const desiredRole: RoomRole = role === "viewer" ? "viewer" : "member";
     let safeLink: string | undefined;
-    if (link !== undefined) {
+    if (link !== undefined && link !== null) {
       if (typeof link !== "string" || link.length > 2_048) return { ok: false, message: "Invite link is invalid." };
       try {
         const parsed = new URL(link);
@@ -4297,6 +4459,13 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     const identity = this.connectionIdentity(connection);
     if (!identity || this.isAccessIdentityExpired(identity) || !this.isRoomMember(identity.email)) {
       return { ok: false, message: "Only current room members can invite someone." };
+    }
+    const inviterRole = this.roomRole(identity.email);
+    if (inviterRole === "viewer") {
+      return { ok: false, message: "Viewers have read-only access and cannot invite teammates." };
+    }
+    if (desiredRole === "viewer" && inviterRole !== "owner") {
+      return { ok: false, message: "Only the room owner can invite a read-only viewer." };
     }
     const actor = identity.email;
     const memberCount = this.sql<{ count: number }>`SELECT COUNT(*) AS count FROM glide_room_members`[0]?.count ?? 0;
@@ -4325,7 +4494,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     try {
       this.durableStorage.transactionSync(() => {
         this.sql`INSERT INTO glide_room_members (email, role, invited_by, joined_at)
-          VALUES (${e}, ${"member"}, ${actor}, ${now})`;
+          VALUES (${e}, ${desiredRole}, ${actor}, ${now})`;
         this.sql`INSERT OR REPLACE INTO glide_room_invites (email, invited_by, link, invited_at)
           VALUES (${e}, ${actor}, ${safeLink ?? null}, ${now})`;
       });
@@ -4334,10 +4503,11 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
       return { ok: false, message: "Glide could not grant that room membership. Try again." };
     }
     this.publishInvitationAudit(nextInvites);
+    this.recordAudit("invite", actor, e, `Invited ${e} as ${desiredRole}`);
     this.syncRoomToRegistry();
     return {
       ok: true,
-      message: `Invited ${e}.`,
+      message: desiredRole === "viewer" ? `Invited ${e} as a read-only viewer.` : `Invited ${e}.`,
       members: this.roomMembers(),
     };
   }
@@ -4379,6 +4549,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
       return { ok: false, message: "Glide could not remove that room member. Try again." };
     }
     this.publishInvitationAudit(nextInvites);
+    this.recordAudit("remove", identity.email, targetEmail, `Removed ${targetEmail} (${target.role})`);
 
     for (const activeConnection of this.getConnections()) {
       if (this.connectionIdentity(activeConnection)?.email !== targetEmail) continue;
@@ -4399,6 +4570,57 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     return {
       ok: true,
       message: `Removed ${targetEmail} from this room.`,
+      members: this.roomMembers(),
+    };
+  }
+
+  /**
+   * UI: change a member's role between `member` and `viewer` — owner only. The
+   * owner's own role is immutable here, and this never creates a second owner
+   * (ownership transfer is out of scope). Downgrading to `viewer` takes effect on
+   * the target's next write attempt; their read/chat sessions stay connected.
+   */
+  @callable()
+  async setMemberRole(
+    email: string,
+    role: unknown,
+  ): Promise<{ ok: boolean; message: string; members?: RoomMember[] }> {
+    const targetEmail = canonicalizeEmail(email);
+    if (!targetEmail) return { ok: false, message: "Provide a valid member email address." };
+    const nextRole: RoomRole | undefined =
+      role === "member" ? "member" : role === "viewer" ? "viewer" : undefined;
+    if (!nextRole) return { ok: false, message: 'Role must be "member" or "viewer".' };
+
+    const { connection } = getCurrentAgent<GlideAgent>();
+    const identity = this.connectionIdentity(connection);
+    if (!identity || this.isAccessIdentityExpired(identity) || !this.isRoomMember(identity.email)) {
+      return { ok: false, message: "A current room owner session is required to change roles." };
+    }
+    if (this.roomRole(identity.email) !== "owner") {
+      return { ok: false, message: "Only the room owner can change member roles." };
+    }
+    const target = this.roomRole(targetEmail);
+    if (!target) return { ok: false, message: `${targetEmail} is not a room member.` };
+    if (target === "owner") return { ok: false, message: "The room owner's role cannot be changed." };
+    if (target === nextRole) {
+      return { ok: true, message: `${targetEmail} is already a ${nextRole}.`, members: this.roomMembers() };
+    }
+    try {
+      this.sql`UPDATE glide_room_members SET role = ${nextRole}
+        WHERE email = ${targetEmail} AND role != ${"owner"}`;
+    } catch {
+      this.logChatEvent("room.role_change_failed", {}, "error");
+      return { ok: false, message: "Glide could not change that member's role. Try again." };
+    }
+    this.recordAudit(
+      "role_change",
+      identity.email,
+      targetEmail,
+      `Changed ${targetEmail} from ${target} to ${nextRole}`,
+    );
+    return {
+      ok: true,
+      message: `${targetEmail} is now a ${nextRole}.`,
       members: this.roomMembers(),
     };
   }
@@ -6450,6 +6672,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     const stateError = syncedStateSizeError(nextState);
     if (stateError) return `No action queued: ${stateError}`;
     this.setState(nextState);
+    this.recordAudit("queue", createdBy, action.id, action.summary);
     trackedActions?.push(action);
     // Queueing a change may satisfy a go-live step (e.g. an SSL setting, a WAF
     // rule, a DNS record) — reflect that on the checklist immediately.
@@ -7503,7 +7726,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
 
   @callable()
   async applyAction(id: string, by = "someone", confirmUncertain = false): Promise<ActionResult> {
-    const accessLease = this.currentRoomAccessLease();
+    const { lease: accessLease } = this.requireCommitRole("apply changes");
     const actor = accessLease?.email ?? normalizeActor(by, "a teammate");
     const parsedId = validateIdentifier(id, "Action id", 200);
     if (!parsedId.ok) {
@@ -7854,7 +8077,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
   @callable()
   async rejectAction(id: string, by = "someone"): Promise<ActionResult> {
     const parsedId = validateIdentifier(id, "Action id", 200);
-    const actor = this.verifiedActor(by);
+    const actor = this.requireCommitRole("reject changes").lease?.email ?? normalizeActor(by, "a teammate");
     if (!parsedId.ok) {
       return {
         id: "invalid",
@@ -7910,7 +8133,7 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
     ).slice(0, 100);
     const safeIds = selectBulkApplyIds(this.state.pendingActions, reviewedIds);
     const results: ActionResult[] = [];
-    const accessLease = this.currentRoomAccessLease();
+    const { lease: accessLease } = this.requireCommitRole("apply changes");
     const actor = accessLease?.email ?? normalizeActor(by, "a teammate");
     const credential = await this.getCredentialLease() ?? null;
     for (const id of safeIds) {
@@ -7946,6 +8169,13 @@ export class GlideAgent extends AIChatAgent<Cloudflare.Env, GlideState> {
         : this.state.pendingActions.filter((a) => a.id !== id),
       recentResults: [safeResult, ...this.state.recentResults].slice(0, MAX_RECENT_RESULTS),
     });
+    // Governance audit: record who applied or rejected which change (failed
+    // attempts stay queued for retry and are not audited as a decision).
+    if (safeResult.status === "applied") {
+      this.recordAudit("apply", safeResult.by, safeResult.id, safeResult.summary);
+    } else if (safeResult.status === "rejected") {
+      this.recordAudit("reject", safeResult.by, safeResult.id, safeResult.summary);
+    }
     // An applied change (e.g. SSL set, WAF rule live) can complete a go-live step.
     this.recomputeOnboardingChecklist();
     if (notify) await this.scheduleActionResultNotification([safeResult]);

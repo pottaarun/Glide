@@ -139,9 +139,17 @@ export interface Invite {
   ts: number;
 }
 
+/**
+ * Persisted per-room membership roles (row in `glide_room_members`), least → most
+ * privileged: `viewer` can read + chat + propose but cannot apply/queue changes,
+ * invite, or manage the room; `member` can additionally apply changes and invite
+ * teammates; `owner` can additionally manage roles, tokens, rename, and delete.
+ */
+export type RoomRole = "owner" | "member" | "viewer";
+
 export interface RoomMember {
   email: string;
-  role: "owner" | "member";
+  role: RoomRole;
   invitedBy?: string;
   joinedAt: number;
 }
@@ -149,9 +157,45 @@ export interface RoomMember {
 export interface RoomAccessStatus {
   email: string;
   isEmployee: boolean;
-  role: RoomMember["role"];
+  /**
+   * The caller's effective role. `inspector` is NOT a persisted membership — it
+   * is the ephemeral read-only grant given to a verified Cloudflare employee who
+   * opens the `/admin` dashboard for a room they are not a member of.
+   */
+  role: RoomRole | "inspector";
   members: RoomMember[];
-  entry: "member" | "created" | "claimed";
+  entry: "member" | "created" | "claimed" | "inspect";
+}
+
+/** Audit-trail action verbs recorded in `glide_room_audit` (append-only). */
+export type RoomAuditAction =
+  | "queue"
+  | "apply"
+  | "reject"
+  | "invite"
+  | "remove"
+  | "role_change"
+  | "token_set"
+  | "token_clear"
+  | "rename"
+  | "destroy"
+  | "inspect";
+
+/**
+ * One append-only governance audit entry: who did what, when. Stored in SQLite
+ * (not synced in {@link GlideState}); read on demand by an owner via
+ * `getAuditLog` and exportable to CSV/JSON from the admin dashboard.
+ */
+export interface RoomAuditEntry {
+  id: string;
+  ts: number;
+  /** Canonical verified email of the actor (or a system label for automated entries). */
+  actor: string;
+  action: RoomAuditAction;
+  /** The object acted on: an invited email, a pending-action id, a member email, etc. */
+  target?: string;
+  /** Short human-readable summary of the entry. */
+  detail?: string;
 }
 
 /**

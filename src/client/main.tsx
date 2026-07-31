@@ -56,6 +56,7 @@ import {
   type OnboardingState,
   type PendingAction,
   type RoomAccessStatus,
+  type RoomAuditEntry,
   type RoomMember,
   type RoomSummary,
   type SetupType,
@@ -362,8 +363,8 @@ function parsedRoomAccessStatus(value: unknown): (RoomAccessStatus & { message?:
   if (
     typeof access.email !== "string" ||
     typeof access.isEmployee !== "boolean" ||
-    !["owner", "member"].includes(String(access.role)) ||
-    !["member", "created", "claimed"].includes(String(access.entry)) ||
+    !["owner", "member", "viewer", "inspector"].includes(String(access.role)) ||
+    !["member", "created", "claimed", "inspect"].includes(String(access.entry)) ||
     !Array.isArray(access.members) ||
     access.members.length > 100
   ) return undefined;
@@ -375,7 +376,7 @@ function parsedRoomAccessStatus(value: unknown): (RoomAccessStatus & { message?:
       typeof member.email !== "string" ||
       member.email.length === 0 ||
       member.email.length > 254 ||
-      !["owner", "member"].includes(String(member.role)) ||
+      !["owner", "member", "viewer"].includes(String(member.role)) ||
       (member.invitedBy !== undefined && typeof member.invitedBy !== "string") ||
       typeof member.joinedAt !== "number" ||
       !Number.isFinite(member.joinedAt)
@@ -494,8 +495,8 @@ interface RenderedTool {
 }
 
 /** Trigger a client-side download of a text file (used for Terraform export). */
-function downloadText(filename: string, content: string): void {
-  const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
+function downloadText(filename: string, content: string, mime = "text/plain"): void {
+  const blob = new Blob([content], { type: `${mime};charset=utf-8` });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
@@ -1221,7 +1222,16 @@ function RoomSession({
   const [tokenInput, setTokenInput] = useState("");
   const [showTokenForm, setShowTokenForm] = useState(false);
   const [inviteEmail, setInviteEmail] = useState("");
+  const [inviteRole, setInviteRole] = useState<"member" | "viewer">("member");
   const [members, setMembers] = useState<RoomMember[]>(access.members);
+  // The caller's live role: prefer the synced members list (so an owner's role
+  // change takes effect without a reconnect), falling back to the role captured
+  // at connect. Viewers are read-only: they may read + chat + propose (queue)
+  // changes, but cannot apply/reject, invite, manage the token, or rename.
+  const myRole: RoomAccessStatus["role"] =
+    members.find((m) => m.email === name)?.role ?? access.role;
+  const isViewer = myRole === "viewer";
+  const canWrite = myRole === "owner" || myRole === "member";
   // The guided FORM is opt-in now; onboarding is chat-led by default.
   const [formOpen, setFormOpen] = useState(false);
   const [migBusy, setMigBusy] = useState<string>();
@@ -2215,6 +2225,7 @@ function RoomSession({
       email,
       name,
       roomLink,
+      inviteRole,
     ]);
     if (res?.ok !== true) {
       if (res) setNotice(res.message);
@@ -2236,7 +2247,7 @@ function RoomSession({
     window.location.href = `mailto:${encodeURIComponent(email)}?subject=${subject}&body=${encodeURIComponent(
       lines.join("\n"),
     )}`;
-  }, [inviteEmail, name, room, roomLink, runRpc, state?.roomName]);
+  }, [inviteEmail, inviteRole, name, room, roomLink, runRpc, state?.roomName]);
 
   const removeMember = useCallback(async (email: string) => {
     if (!window.confirm(`Remove ${email} from this room? Their active connections will close immediately.`)) return;
@@ -2246,6 +2257,16 @@ function RoomSession({
     );
     if (res?.members) setMembers(res.members);
     if (res) setNotice(res.message);
+  }, [runRpc]);
+
+  // Owner-only: switch a member between "member" and "viewer" (read-only).
+  const setRole = useCallback(async (email: string, role: "member" | "viewer") => {
+    const res = await runRpc<{ ok: boolean; message: string; members?: RoomMember[] }>(
+      "setMemberRole",
+      [email, role],
+    );
+    if (res?.members) setMembers(res.members);
+    if (res && res.ok !== true) setNotice(res.message);
   }, [runRpc]);
 
   // Owner-only: permanently delete this room, then navigate back to the lobby.
@@ -2505,9 +2526,10 @@ function RoomSession({
             value={roomNameDraft}
             maxLength={MAX_ROOM_NAME_CHARS}
             placeholder="Name this room"
+            readOnly={isViewer}
             onFocus={() => { roomNameFocused.current = true; }}
             onChange={(e) => setRoomNameDraft(e.target.value)}
-            onBlur={() => { void commitRoomName(); }}
+            onBlur={() => { if (!isViewer) void commitRoomName(); }}
             onKeyDown={(event) => {
               if (event.key === "Enter") {
                 event.currentTarget.blur();
@@ -2520,7 +2542,7 @@ function RoomSession({
             style={S.roomNameInput}
             className="glide-room-name"
             aria-label="Room name"
-            title="Give this room a name everyone in it will see"
+            title={isViewer ? "Viewers have read-only access" : "Give this room a name everyone in it will see"}
           />
           <span style={S.roomPill} className="glide-room-pill">
             #
@@ -2875,21 +2897,28 @@ function RoomSession({
                         : ""}
                   </span>
                 </div>
-                <div style={S.actionBtns}>
-                  <button
-                    style={S.rejectBtn}
-                    onClick={() => {
-                      setTokenInput("");
-                      setShowTokenForm(true);
-                    }}
-                  >
-                    Change
-                  </button>
-                  <button style={S.rejectBtn} onClick={() => runRpc("clearCloudflareToken", [])}>
-                    Remove
-                  </button>
-                </div>
+                {canWrite && (
+                  <div style={S.actionBtns}>
+                    <button
+                      style={S.rejectBtn}
+                      onClick={() => {
+                        setTokenInput("");
+                        setShowTokenForm(true);
+                      }}
+                    >
+                      Change
+                    </button>
+                    <button style={S.rejectBtn} onClick={() => runRpc("clearCloudflareToken", [])}>
+                      Remove
+                    </button>
+                  </div>
+                )}
               </>
+            ) : !canWrite ? (
+              <p style={S.hint}>
+                No Cloudflare API token is connected. Viewers have read-only access — ask a room member or
+                owner to add one under Connection → Set token.
+              </p>
             ) : (
               <>
                 <input
@@ -3083,51 +3112,55 @@ function RoomSession({
                       )}
                     </details>
                   )}
-                  <div style={S.actionBtns}>
-                    <button
-                      style={{ ...S.applyBtn, opacity: applying ? 0.6 : 1 }}
-                      disabled={applying || disabledRestore}
-                      onClick={() => {
-                        if (!state?.tokenConfigured) {
-                          setShowTokenForm(true);
-                          setNotice("Add a Cloudflare API token before applying this change.");
-                          return;
-                        }
-                        if (
-                          uncertain &&
-                          !window.confirm(
-                            "Cloudflare may already have applied this change. Verify the live configuration first. Retry anyway?",
-                          )
-                        ) {
-                          return;
-                        }
-                        void apply(a.id, uncertain);
-                      }}
-                    >
-                      {applying
-                        ? "Applying…"
-                        : disabledRestore
-                          ? "Disabled"
-                        : !state?.tokenConfigured
-                          ? "Set token first"
-                          : uncertain
-                            ? "Retry anyway"
-                            : failed
-                              ? "Retry"
-                              : "Apply"}
-                    </button>
-                    <button
-                      style={S.rejectBtn}
-                      disabled={applying}
-                      onClick={() => void runRpc("rejectAction", [a.id, name])}
-                    >
-                      Reject
-                    </button>
-                  </div>
+                  {canWrite ? (
+                    <div style={S.actionBtns}>
+                      <button
+                        style={{ ...S.applyBtn, opacity: applying ? 0.6 : 1 }}
+                        disabled={applying || disabledRestore}
+                        onClick={() => {
+                          if (!state?.tokenConfigured) {
+                            setShowTokenForm(true);
+                            setNotice("Add a Cloudflare API token before applying this change.");
+                            return;
+                          }
+                          if (
+                            uncertain &&
+                            !window.confirm(
+                              "Cloudflare may already have applied this change. Verify the live configuration first. Retry anyway?",
+                            )
+                          ) {
+                            return;
+                          }
+                          void apply(a.id, uncertain);
+                        }}
+                      >
+                        {applying
+                          ? "Applying…"
+                          : disabledRestore
+                            ? "Disabled"
+                          : !state?.tokenConfigured
+                            ? "Set token first"
+                            : uncertain
+                              ? "Retry anyway"
+                              : failed
+                                ? "Retry"
+                                : "Apply"}
+                      </button>
+                      <button
+                        style={S.rejectBtn}
+                        disabled={applying}
+                        onClick={() => void runRpc("rejectAction", [a.id, name])}
+                      >
+                        Reject
+                      </button>
+                    </div>
+                  ) : (
+                    <div style={S.hint}>Read-only — ask a room member or owner to apply or reject this.</div>
+                  )}
                 </div>
               );
             })}
-            {pending.length > 1 && (
+            {canWrite && pending.length > 1 && (
               <div style={{ ...S.actionBtns, marginTop: 10 }}>
                 <button style={S.miniBtn} disabled={anyActionApplying} onClick={() => void applyAll()}>
                   {anyActionApplying
@@ -3262,10 +3295,23 @@ function RoomSession({
               <div key={member.email} style={S.inviteItem}>
                 <span style={{ fontSize: 13, wordBreak: "break-all" }}>{member.email}</span>
                 <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
-                  <span style={S.inviteBy}>
-                    {member.role}{member.email === name ? " · you" : ""}
-                  </span>
-                  {access.role === "owner" && member.role !== "owner" && (
+                  {myRole === "owner" && member.role !== "owner" ? (
+                    <select
+                      value={member.role}
+                      aria-label={`Role for ${member.email}`}
+                      style={S.roleSelect}
+                      onChange={(e) => void setRole(member.email, e.target.value as "member" | "viewer")}
+                    >
+                      <option value="member">member</option>
+                      <option value="viewer">viewer</option>
+                    </select>
+                  ) : (
+                    <span style={member.role === "viewer" ? S.roleViewerBadge : S.inviteBy}>
+                      {member.role}
+                    </span>
+                  )}
+                  {member.email === name && <span style={S.inviteBy}>· you</span>}
+                  {myRole === "owner" && member.role !== "owner" && (
                     <button
                       style={{ ...S.miniBtn, color: "#fca5a5" }}
                       onClick={() => void removeMember(member.email)}
@@ -3281,26 +3327,48 @@ function RoomSession({
           <Section
             title={`Invite teammates${(state?.invites?.length ?? 0) ? ` · ${state!.invites.length}` : ""}`}
           >
-            <div style={S.inviteRow}>
-              <input
-                type="email"
-                value={inviteEmail}
-                onChange={(e) => setInviteEmail(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") void invite();
-                }}
-                placeholder="name@company.com"
-                autoComplete="off"
-                style={{ ...S.input, marginBottom: 0 }}
-              />
-              <button style={S.miniPrimary} disabled={!inviteEmail.trim()} onClick={() => void invite()}>
-                Invite
-              </button>
-            </div>
-            <p style={S.hint}>
-              The invitation grants this verified email room membership. The recipient must authenticate through
-              Cloudflare Access before the link opens. Send the prefilled email, or copy the link:
-            </p>
+            {canWrite ? (
+              <>
+                <div style={S.inviteRow}>
+                  <input
+                    type="email"
+                    value={inviteEmail}
+                    onChange={(e) => setInviteEmail(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") void invite();
+                    }}
+                    placeholder="name@company.com"
+                    autoComplete="off"
+                    style={{ ...S.input, marginBottom: 0 }}
+                  />
+                  {myRole === "owner" && (
+                    <select
+                      value={inviteRole}
+                      aria-label="Invite role"
+                      style={S.roleSelect}
+                      onChange={(e) => setInviteRole(e.target.value as "member" | "viewer")}
+                    >
+                      <option value="member">member</option>
+                      <option value="viewer">viewer</option>
+                    </select>
+                  )}
+                  <button style={S.miniPrimary} disabled={!inviteEmail.trim()} onClick={() => void invite()}>
+                    Invite
+                  </button>
+                </div>
+                <p style={S.hint}>
+                  The invitation grants this verified email room membership
+                  {myRole === "owner" ? " with the selected role" : " as a member"}. Viewers get read-only
+                  access (read + chat + propose, but cannot apply). The recipient must authenticate through
+                  Cloudflare Access before the link opens. Send the prefilled email, or copy the link:
+                </p>
+              </>
+            ) : (
+              <p style={S.hint}>
+                You have read-only (viewer) access, so you can't invite teammates. Ask a room member or owner.
+                Share the link if they're already a member:
+              </p>
+            )}
             <div style={S.linkRow}>
               <code style={S.linkCode}>{roomLink}</code>
               <button style={S.miniBtn} onClick={() => navigator.clipboard?.writeText(roomLink)}>
@@ -4733,7 +4801,72 @@ function DocMarkdown({ src }: { src: string }) {
 
 // --- Admin building blocks --------------------------------------------------
 
-type AdminTab = "comms" | "actions" | "guidance" | "docs" | "onboarding";
+type AdminTab = "comms" | "actions" | "guidance" | "docs" | "onboarding" | "audit";
+
+/** Escape a single CSV field per RFC 4180 (quote when it contains ,"\n or \r). */
+function csvField(value: string): string {
+  return /[",\n\r]/.test(value) ? `"${value.replace(/"/g, '""')}"` : value;
+}
+
+/** Defensively parse a `getAuditLog` RPC payload into a bounded, sanitized list. */
+function parsedAuditEntries(value: unknown): RoomAuditEntry[] {
+  if (!Array.isArray(value)) return [];
+  const out: RoomAuditEntry[] = [];
+  for (const raw of value.slice(0, 5_000)) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+    const e = raw as Record<string, unknown>;
+    if (typeof e.id !== "string" || typeof e.actor !== "string" || typeof e.action !== "string") continue;
+    if (typeof e.ts !== "number" || !Number.isFinite(e.ts)) continue;
+    out.push({
+      id: e.id,
+      ts: e.ts,
+      actor: e.actor,
+      action: e.action as RoomAuditEntry["action"],
+      ...(typeof e.target === "string" ? { target: e.target } : {}),
+      ...(typeof e.detail === "string" ? { detail: e.detail } : {}),
+    });
+  }
+  return out;
+}
+
+/** Accent color for an audit action verb, to aid scanning the trail. */
+function auditActionColor(action: string): string {
+  switch (action) {
+    case "apply":
+      return "#4ade80";
+    case "reject":
+    case "remove":
+    case "destroy":
+      return "#fb7185";
+    case "queue":
+      return "#fbbf24";
+    case "invite":
+    case "role_change":
+      return "#38bdf8";
+    case "inspect":
+      return "#c4b5fd";
+    default:
+      return "#cbd5e1";
+  }
+}
+
+/** Render an audit log to CSV text for download. */
+function auditToCsv(entries: RoomAuditEntry[]): string {
+  const header = ["timestamp", "iso", "actor", "action", "target", "detail"];
+  const rows = entries.map((e) =>
+    [
+      String(e.ts),
+      new Date(e.ts).toISOString(),
+      e.actor ?? "",
+      e.action ?? "",
+      e.target ?? "",
+      e.detail ?? "",
+    ]
+      .map(csvField)
+      .join(","),
+  );
+  return [header.join(","), ...rows].join("\r\n");
+}
 
 function Panel({
   title,
@@ -5101,6 +5234,9 @@ function AdminRoom({
   const [tab, setTab] = useState<AdminTab>("comms");
   const [openDoc, setOpenDoc] = useState<string | null>(null);
   const [members, setMembers] = useState(access.members);
+  const [audit, setAudit] = useState<RoomAuditEntry[]>();
+  const [auditError, setAuditError] = useState<string>();
+  const [auditLoading, setAuditLoading] = useState(false);
   const connectionAccess = useRoomConnectionAccess(room, onAccessLost);
 
   const agent = useAgent<GlideState>({
@@ -5151,12 +5287,29 @@ function AdminRoom({
     };
   }, [agent, state?.invites.length]);
 
+  // Audit is owner-gated on the server; load it on demand when the tab is opened.
+  const loadAudit = useCallback(() => {
+    if (agent.readyState !== WebSocket.OPEN) return;
+    setAuditLoading(true);
+    setAuditError(undefined);
+    void agent.call("getAuditLog", [1_000], { timeout: AGENT_MESSAGES_TIMEOUT_MS })
+      .then((value) => setAudit(parsedAuditEntries(value)))
+      .catch((reason: unknown) =>
+        setAuditError(reason instanceof Error ? reason.message : "Could not load the audit log."))
+      .finally(() => setAuditLoading(false));
+  }, [agent]);
+
+  useEffect(() => {
+    if (tab === "audit") loadAudit();
+  }, [tab, loadAudit]);
+
   const tabs: Array<{ id: AdminTab; label: string; count?: number }> = [
     { id: "comms", label: "Comms", count: messages.length },
     { id: "actions", label: "Actions", count: pending.length },
     { id: "guidance", label: "Guidance", count: guidance.length },
     { id: "docs", label: "Dev docs", count: docsManifest.docs.length },
     { id: "onboarding", label: "Onboarding & migration" },
+    { id: "audit", label: "Audit" },
   ];
 
   return (
@@ -5519,6 +5672,62 @@ function AdminRoom({
             )}
           </>
         )}
+
+        {tab === "audit" && (
+          <Panel
+            title={`Audit trail${audit ? ` · ${audit.length}` : ""}`}
+            meta={
+              <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                <span style={S.panelMeta}>owner-only</span>
+                <button style={S.miniBtn} disabled={auditLoading} onClick={() => loadAudit()}>
+                  {auditLoading ? "Loading…" : "Refresh"}
+                </button>
+                <button
+                  style={S.miniBtn}
+                  disabled={!audit || audit.length === 0}
+                  onClick={() => audit && downloadText(`glide-audit-${room}.csv`, auditToCsv(audit), "text/csv")}
+                >
+                  Export CSV
+                </button>
+                <button
+                  style={S.miniBtn}
+                  disabled={!audit || audit.length === 0}
+                  onClick={() =>
+                    audit &&
+                    downloadText(`glide-audit-${room}.json`, JSON.stringify(audit, null, 2), "application/json")}
+                >
+                  Export JSON
+                </button>
+              </div>
+            }
+          >
+            <p style={S.hint}>
+              Append-only record of who queued, applied, rejected, invited, and changed settings in this room.
+              Visible to the room owner only.
+            </p>
+            {auditError ? (
+              <Muted>{auditError}</Muted>
+            ) : !audit ? (
+              <Muted>{auditLoading ? "Loading audit trail…" : "Open the tab to load the audit trail."}</Muted>
+            ) : audit.length === 0 ? (
+              <Muted>No audit entries recorded yet.</Muted>
+            ) : (
+              <div style={S.transcript}>
+                {audit.map((e) => (
+                  <div key={e.id} style={S.listRow}>
+                    <span style={{ ...S.auditBadge, color: auditActionColor(e.action) }}>{e.action}</span>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={S.commText}>{e.detail || e.target || "—"}</div>
+                      <div style={S.listMeta}>
+                        {e.actor} · {relTime(e.ts)}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </Panel>
+        )}
       </div>
     </div>
   );
@@ -5782,6 +5991,9 @@ const S: Record<string, React.CSSProperties> = {
   linkCode: { flex: 1, fontSize: 11, color: "#7dd3fc", background: "rgba(7,11,22,.7)", borderRadius: 6, padding: "6px 8px", wordBreak: "break-all", border: "1px solid rgba(56,189,248,.14)" },
   inviteItem: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, padding: "6px 0", borderBottom: "1px solid rgba(148,163,184,.1)" },
   inviteBy: { fontSize: 11, color: "#64748b", flexShrink: 0 },
+  roleSelect: { fontSize: 11, fontWeight: 600, border: "1px solid rgba(148,163,184,.22)", background: "rgba(9,12,17,.55)", color: "#cbd5e1", borderRadius: 6, padding: "2px 6px", cursor: "pointer", outline: "none" },
+  roleViewerBadge: { fontSize: 11, fontWeight: 600, color: "#38bdf8", flexShrink: 0 },
+  auditBadge: { fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: ".04em", flexShrink: 0, minWidth: 74, marginTop: 1 },
 
   progressWrap: { position: "relative", height: 7, borderRadius: 999, background: "rgba(148,163,184,.16)", overflow: "hidden", margin: "10px 0 12px" },
   progressBar: { height: "100%", borderRadius: 999, background: "#f6821f", transition: "width .3s ease-out" },

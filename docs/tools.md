@@ -25,8 +25,8 @@ to the model are clipped to ~6 KB. See [Architecture](./architecture.md#the-chat
 | --- | --- | --- |
 | `list_accounts` | — | List Cloudflare accounts the token can see. |
 | `list_zones` | `accountId?` | List zones, optionally filtered to one account. |
-| `find_zone` | `name` | Resolve a zone id by domain name and **save it as the room's default zone**. |
-| `list_dns_records` | `zoneId`, `type?` | List DNS records for a zone (optionally by record type). During an active onboarding it also sets `dnsReviewed`, ticking the "review DNS records" checklist step. |
+| `find_zone` | `name` | Resolve a zone id by domain name and **save it as the room's default zone**. Also captures the zone's live state (activation status, SSL mode, managed-WAF deployment) into `GlideState.liveZone` so the go-live checklist auto-ticks from reality. |
+| `list_dns_records` | `zoneId`, `type?` | List DNS records for a zone (optionally by record type). During an active onboarding it sets `dnsReviewed` (ticking the "review DNS records" step) and, for an untyped listing of the default zone, folds proxy coverage into `GlideState.liveZone` (ticking the "proxy status" step). |
 | `cf_get` | `path` | Generic READ against v4 JSON REST endpoints using the standard Cloudflare API envelope (path after `…/client/v4`). |
 | `recommend_configuration` | `focus?` (`all\|security\|performance\|reliability\|privacy\|bots\|api\|tls`) | Turn the room's captured `businessProfile` into tailored, priority-ranked Cloudflare recommendations (rationale, triggering profile signals, and a docs citation). **Read-only — it proposes and QUEUES NOTHING**; the model then presents the items grouped by theme and offers to queue the concrete ones via the write builders. Runs the local engine (`src/recommendations.ts`), so it never calls Cloudflare. |
 
@@ -170,9 +170,24 @@ never resends an `accepted_pruned` turn. See
 
 | RPC | Args | Returns | Notes |
 | --- | --- | --- | --- |
-| `roomAccessStatus` | none | `RoomAccessStatus` | Rechecks the current connection identity/membership and returns canonical email, role, entry status, and the bounded member list. |
-| `inviteTeammate` | `email`, `by?`, `link?` | `{ ok, message, members? }` | Only a current member can call it. Atomically adds the canonical ACL member and durable invite-audit row with the verified inviter, then updates the repairable UI projection. Refuses a 101st member. The optional link is metadata, not the credential. |
+| `roomAccessStatus` | none | `RoomAccessStatus` | Rechecks the current connection identity/membership and returns canonical email, role (`owner`/`member`/`viewer`), entry status, and the bounded member list. |
+| `inviteTeammate` | `email`, `by?`, `link?`, `role?` | `{ ok, message, members? }` | Only a current **non-viewer** member can call it. Grants `member` by default; `role: "viewer"` (read-only) may be granted **only by an owner**. Atomically adds the canonical ACL member and durable invite-audit row with the verified inviter, then updates the repairable UI projection. Refuses a 101st member. The optional link is metadata, not the credential. |
+| `setMemberRole` | `email`, `role` | `{ ok, message, members? }` | **Owner-only.** Flips an existing member between `member` and `viewer`; the owner's own role is immutable and a non-member target is rejected. Writes a `role_change` row to the audit trail. |
 | `removeRoomMember` | `email` | `{ ok, message, members? }` | Owner-only. Refuses owner removal, atomically deletes the target's ACL/audit rows, and immediately closes every matching socket with `1008 Room membership revoked`. |
+
+> **Per-room roles (RBAC).** Every commit path (Apply, reject, token set/clear,
+> rename, invite, migration writes) runs through `requireCommitRole()`, which reads
+> the caller's live `glide_room_members` role. A `viewer` can read, chat, and queue
+> proposals but is blocked from **every** commit; a `member` keeps apply + invite
+> (`member`-only); an `owner` additionally grants/changes roles and deletes the
+> room. See [Security → Roles](./security.md).
+
+> **Audit trail (`getAuditLog`).** Owner-gated RPC returning up to a bounded page
+> of `RoomAuditEntry` rows (invites, removals, role changes, applies, token
+> changes, deletions). The trail lives **only** in the append-only
+> `glide_room_audit` SQLite table — it is never mirrored into synced `GlideState`
+> — and self-prunes at 5,000 rows. Surfaced in the client **Audit** tab and inside
+> the employee inspection snapshot.
 
 ### Room settings & lifecycle
 

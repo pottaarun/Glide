@@ -77,8 +77,17 @@ export default {
   same-origin `Origin`, validates the display id, and maps it through the shared
   PartySocket-compatible `roomStorageName()` before Durable Object lookup. Agent
   routing calls the read-only authorization method and cannot activate a room.
-  `intent=inspect` gives the admin and unexpected-close checks that same read-only
-  decision, so opening admin cannot create or claim.
+  `intent=inspect` gives the unexpected-close recheck that same read-only,
+  members-only decision, so it cannot create or claim.
+- `/api/room-inspect` backs the `/admin` dashboard. It is `POST`-only, same-origin,
+  and authenticated, and calls the DO's `inspectRoom()` — a method kept **separate
+  from** the members-only socket/activation gate so widening inspection can never
+  widen write access. A room member is told to use the live socket (no snapshot); a
+  **verified Cloudflare employee who is not a member** receives an **audited,
+  read-only snapshot** (synced `state` + transcript + audit trail) and never a
+  connection, so inspection has zero mutation surface. A never-activated room (no
+  members) is reported non-existent and queued for provisional cleanup, so
+  inspecting an unknown id cannot materialize a junk room.
 - `/api/rooms` returns the deployment-wide room list for the admin **All rooms**
   view. It is `GET`-only (`405` with `Allow: GET` otherwise), requires an exact
   same-origin `Origin`, and — after Access verification — is restricted to verified
@@ -260,8 +269,9 @@ flags. No local pre-mutation snapshot storage remains.
 
 | Table | Columns | Purpose |
 | --- | --- | --- |
-| `glide_room_members` | `email` PK (NOCASE), `role`, `invited_by`, `joined_at` | Server-only authorization ACL, capped at 100 members. Never synced to an unadmitted client. |
+| `glide_room_members` | `email` PK (NOCASE), `role`, `invited_by`, `joined_at` | Server-only authorization ACL, capped at 100 members. `role` is `owner \| member \| viewer` (CHECK-constrained; a one-time migration rebuilds the pre-viewer table). Never synced to an unadmitted client. |
 | `glide_room_invites` | `email` PK (NOCASE), `invited_by`, `link`, `invited_at` | Durable invitation audit committed atomically with ACL grants/removals. `GlideState.invites` is a repairable UI projection, not authorization. |
+| `glide_room_audit` | `id` PK, `ts`, `actor`, `action`, `target`, `detail` | Append-only trail of who queued/applied/rejected/invited/changed roles/settings/inspected the room. Self-prunes to 5,000 rows. **Never synced** in `GlideState`; the `getAuditLog()` RPC is owner-gated (a non-member employee inspector receives it inside the read-only snapshot). |
 | `glide_room_lifecycle` | fixed `provisional` marker | Marks storage created before ownership. Denied probes schedule idempotent destruction; activation removes the marker atomically with the first owner. |
 | `glide_room_activations` | `id` PK, `email`, `entry`, `activated_at` | Replays the first `created`/`claimed` response when an idempotent activation is retried after a Durable Object reset. |
 | `glide_secrets` | `name` PK, `value`, `ts` | The Cloudflare API token, **AES-256-GCM encrypted** (`name = "cf_api_token"`). |
@@ -421,6 +431,7 @@ field is broadcast to all clients via `onStateUpdate` (`src/client/main.tsx`).
 | `invites` | `Invite[]` | Bounded invitation/audit records shown in the UI. Authorization uses the separate server-only membership table. |
 | `defaultAccountId` | `string?` | Convenience default so users needn't repeat the account id. |
 | `defaultZone` | `{ id, name, accountId? }?` | Convenience default zone plus owning-account provenance. Legacy rooms may lack `accountId`; zone creation verifies that provenance unless the caller supplies an explicit account. |
+| `liveZone` | `LiveZoneFacts?` | Live facts read from the default zone's real Cloudflare state (`status`, `sslMode`, `wafManaged`, proxied/proxiable record counts; `src/shared.ts`). Captured best-effort by `find_zone` (activation + SSL + WAF) and `list_dns_records` (proxy coverage) so the go-live `checklist` auto-ticks — and marks steps **N/A** — from the domain's actual configuration, not just in-room actions. |
 | `tokenConfigured` | `boolean` | This room's encrypted GUI token is available and decryptable. |
 | `tokenLast4` | `string?` | Last 4 chars of the GUI-set token (status only). |
 | `tokenValid` | `boolean?` | Result of the latest token authentication check: `/user/tokens/verify`, with account/zone read fallback for account-scoped tokens. |
@@ -515,6 +526,12 @@ message, hint? }`.
   table in [Setup & configuration](./setup.md#cloudflare-api-token-permissions).
 - **Pagination** (`cfGetAll`, `src/cf-api.ts`): follows `total_pages` up to a
   hard cap of 50 pages × 50 per page.
+- **Live-zone readers** (for go-live checklist auto-ticking): `getZoneSslMode()`
+  reads `/zones/:id/settings/ssl` and returns a normalized `ZoneSslMode`
+  (`off`/`flexible`/`full`/`strict`); `getZoneManagedWafDeployed()` checks the
+  zone's `http_request_firewall_managed` entrypoint ruleset for a deployed managed
+  rule. Both are best-effort — a failure or missing permission returns "unknown"
+  rather than throwing, leaving the related checklist step unticked.
 - **Token verification** (`verifyToken`): tries `/user/tokens/verify`, then real
   `/accounts` and `/zones` reads because the user-scoped verify endpoint can
   reject otherwise valid account-scoped tokens.
@@ -631,28 +648,41 @@ client is a single SPA: `Root()` (`src/client/main.tsx`) checks
 `isAdminPath()` (also in `src/client/main.tsx`, matching `/admin`) and renders
 `AdminGate` instead of the chat `App`; the room id comes from the URL hash, so
 `/admin#<room>` and `/#<room>` address the same Durable Object.
-`AdminGate` uses `/api/room-access?intent=inspect`, so inspecting an absent or
+`AdminGate` resolves access through `AdminRoomLoader`, which calls
+`POST /api/room-inspect` and branches on the returned `entry`:
+
+- A **room member** renders `LiveAdminRoom` — the live `useAgent()`/`useAgentChat()`
+  dashboard (editable **Team guidance**, on-demand owner-gated audit).
+- A **non-member Cloudflare employee** renders `InspectorAdminRoom` — the same
+  dashboard fed entirely by the audited read-only snapshot (no socket; guidance is
+  read-only; the audit trail comes from the snapshot). A header **"inspecting ·
+  read-only"** badge marks the mode.
+
+Both feed a shared presentational `AdminDashboard`. Inspecting an absent or
 unclaimed room is denied rather than creating it or assigning ownership. The admin
-landing screen (`AdminPickRoom`, `src/client/main.tsx`) also fetches `GET /api/rooms`
-for verified Cloudflare employees and renders a clickable **All rooms** list; every
-pick still routes through the same `intent=inspect` membership check.
+landing screen (`AdminPickRoom`, `src/client/main.tsx`) fetches `GET /api/rooms`
+for verified Cloudflare employees and renders a clickable **All rooms** list;
+picking any room routes through the same `/api/room-inspect` decision.
 
 It **reads** three sources — it defines no dedicated read RPCs:
 
-- **Synced `GlideState`** via `useAgent()` — pending queue, results, invites,
-  onboarding, migration plan/pre-flight/diff check, exports, guidance, token status.
-- **The chat transcript** via `useAgentChat()` — powers the **Comms** tab.
+- **Synced `GlideState`** (via `useAgent()` for members, or the inspection snapshot)
+  — pending queue, results, invites, onboarding, migration plan/pre-flight/diff
+  check, exports, guidance, token status, live-zone facts.
+- **The chat transcript** (via `useAgentChat()` for members, or the snapshot's
+  `messages`) — powers the **Comms** tab.
 - **A build-time docs manifest** (`virtual:glide-docs`, generated by the
   `glide-docs-manifest` Vite plugin in `vite.config.ts`) — powers the **Dev docs**
   tab. It embeds README + everything under `docs/` at build time (title,
   last-modified, size, lines, content), so a fresh `npm run build` refreshes it.
 
-Tabs are `comms | actions | guidance | docs | onboarding`
+Tabs are `comms | actions | guidance | docs | onboarding | audit`
 (`AdminTab` and the tab bar in `src/client/main.tsx`).
 There are no Apply/Reject controls in admin — the **Actions** tab is view-only and
-directs you to the chat room. **Team guidance** is the only editable tab and uses
-its three room-scoped guidance RPCs. The deployment-wide Cloudflare-docs index has
-no admin tab or client-callable controls.
+directs you to the chat room. **Team guidance** is editable only in the live
+member view (read-only for inspectors) and uses its three room-scoped guidance
+RPCs. The **Audit** tab exports the trail as CSV/JSON. The deployment-wide
+Cloudflare-docs index has no admin tab or client-callable controls.
 
 ## Client styling
 

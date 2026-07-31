@@ -69,6 +69,14 @@ This README is the overview. In-depth docs live in [`docs/`](docs/):
   application JWTs before dynamic routing. Verified `@cloudflare.com` employees
   can create or claim rooms; current members can grant another verified email
   access. Membership is durable, server-only, and checked on every WebSocket frame.
+- **Per-room roles (RBAC) with an exportable audit trail.** Every member holds one
+  of three roles: an **owner** (creator — grants roles, removes members, deletes
+  the room), a **member** (chat, queue proposals, **Apply**, invite other members),
+  or a read-only **viewer** (chat and queue proposals, but blocked from every
+  commit — Apply, token changes, invites). Only an owner can grant a viewer or flip
+  a member ↔ viewer. Every sensitive action (invites, removals, role changes,
+  applies, token changes, deletion) is written to an append-only, owner-viewable
+  **Audit** trail that lives only in SQLite — never synced to clients.
 - **Nameable rooms with an owner-only delete.** Any member can give a room a
   human-friendly name (e.g. "arubhe.com go-live") that labels it in the header,
   invites, and admin view without changing its routing id. The room **owner** can
@@ -101,10 +109,15 @@ This README is the overview. In-depth docs live in [`docs/`](docs/):
 - **Guided, chat-led onboarding.** Glide greets a new room and walks a team
   through going live **one question at a time** — _migrate from a provider_ or
   _start fresh_ — recording each answer and **auto-completing a checklist**
-  grounded in Cloudflare's recommended go-live path. Understanding the **nature of
-  the business** is a required, interleaved part of that flow (not an optional
-  extra), so onboarding never finishes with an empty business profile. A
-  click-through form wizard is available as an opt-in.
+  grounded in Cloudflare's recommended go-live path. The checklist ticks itself
+  from the domain's **real live Cloudflare state** too: once `find_zone` /
+  `list_dns_records` see the zone, an already-active zone auto-checks activation
+  and nameservers and marks "lower TTLs" **N/A**, `Full`/`Full (strict)` SSL checks
+  the SSL step, a deployed managed WAF checks security, and any proxied record
+  checks proxy status. Understanding the **nature of the business** is a required,
+  interleaved part of that flow (not an optional extra), so onboarding never
+  finishes with an empty business profile. A click-through form wizard is available
+  as an opt-in.
 - **Business-aware recommendations.** Glide asks probing questions about the
   _nature of the business_ — industry, app type, logins/API, audience & traffic,
   sensitive data, compliance, and top concerns — one at a time, and stores them as
@@ -131,8 +144,12 @@ This README is the overview. In-depth docs live in [`docs/`](docs/):
   docs when Vectorize isn't configured — so it always works.
 - **Read-only admin dashboard (`/admin`).** A per-room control room to review the
   full transcript, the pending/After-Apply action log, invites, onboarding and
-  migration status, exports, and a build-time docs tracker — plus
-  one editable surface for room-scoped **Team guidance**.
+  migration status, exports, the audit trail, and a build-time docs tracker — plus
+  one editable surface for room-scoped **Team guidance**. A verified Cloudflare
+  employee who is **not** a member can still open any room's dashboard through an
+  audited, read-only inspection snapshot (`POST /api/room-inspect`) that never opens
+  a socket and exposes no write controls — so oversight never widens the write
+  surface. Each inspection is itself recorded to the room's audit trail.
 - **Encrypted-at-rest tokens.** A Cloudflare API token can be set in the GUI and
   is stored AES-256-GCM encrypted in the Durable Object — never synced, logged, or
   returned (only a masked last-4 is shown).
@@ -443,11 +460,13 @@ follow the room-by-room migration and secret-removal steps in
     claims a room. The admin gate uses the endpoint's inspect-only intent and also
     cannot create or claim. Everyone else must already be in the server-side membership table.
 3. **Invite.** Any current member can grant another canonical email membership,
-   up to 100 members. The recipient must authenticate to Access as that exact email;
-   possessing the URL alone grants nothing. Only the owner can remove a non-owner;
-   removal immediately closes all of that member's room sockets.
-   Any member can also **name** the room from the header (a display-only label,
-   capped at 60 characters, that never changes the routing id).
+   up to 100 members. New members join as **member** by default; only the owner can
+   grant a read-only **viewer** or change an existing member's role. The recipient
+   must authenticate to Access as that exact email; possessing the URL alone grants
+   nothing. Only the owner can remove a non-owner; removal immediately closes all of
+   that member's room sockets. Any member can also **name** the room from the header
+   (a display-only label, capped at 60 characters, that never changes the routing
+   id).
 4. **Chat.** Wait for the **live** badge, then ask Glide to inspect or change your
    Cloudflare setup. Reads stream back immediately; changes appear in the
    **Pending approvals** panel.
@@ -476,19 +495,21 @@ Everything in the sidebar is live-synced read-only to every client: the optional
 `roomName`, room `memory`,
 `pendingActions`, `recentResults`, `invites`, `defaultAccountId` / `defaultZone`,
 token status (`tokenConfigured`, masked `tokenLast4`, `tokenValid`), the
-`onboarding` progress, the captured `businessProfile`, the current
-`migrationPlan`, `terraform` / `csv` exports,
-the latest pre-flight/diff `migrationCheck`, the team `guidance` docs, and
+`onboarding` progress (whose checklist steps carry a `done` flag and an optional
+`na`), the captured `businessProfile`, the current `migrationPlan`, `terraform` /
+`csv` exports, the latest pre-flight/diff `migrationCheck`, the best-effort
+`liveZone` facts that drive checklist auto-ticking, the team `guidance` docs, and
 whether migration import is configured (`migrationToolConfigured`). The decrypted
-token, the raw provider config, and the guidance **vectors** are **not** synced —
-they live only in the Durable Object's SQLite (or Vectorize).
+token, the raw provider config, the guidance **vectors**, and the **audit trail**
+are **not** synced — they live only in the Durable Object's SQLite (or Vectorize).
 
-Room authorization is also not synced state. The canonical email, owner/member
-role, inviter, and join time live in the server-only `glide_room_members` SQLite
-table. `glide_room_invites` is the durable invitation audit, while
-`GlideState.invites` is its bounded UI projection; neither grants access without
-an ACL row. Legacy invite records are retained only as audit data and must be
-re-issued before those guests can return.
+Room authorization is also not synced state. The canonical email, role
+(`owner`/`member`/`viewer`), inviter, and join time live in the server-only
+`glide_room_members` SQLite table. `glide_room_invites` is the durable invitation
+audit and `glide_room_audit` is the append-only trail of sensitive actions (both
+owner/employee-viewable, never synced), while `GlideState.invites` is a bounded UI
+projection; none of them grant access without an ACL row. Legacy invite records are
+retained only as audit data and must be re-issued before those guests can return.
 
 Clients mutate room data only through callable RPCs; direct client state writes
 are rejected by the agent.
@@ -619,15 +640,19 @@ the chat transcript, and a build-time docs manifest — there are **no** Apply/R
 controls here (do that from the chat room), and opening admin cannot create or
 claim a room. The admin landing screen also shows verified Cloudflare employees an
 **All rooms** list (from `GET /api/rooms`) so they can jump straight into any room's
-dashboard; opening a room there still enforces that room's membership. Tabs:
+dashboard; opening a room there still enforces that room's membership. A verified
+employee who isn't a member gets the same read-only dashboard, hydrated from an
+audited one-shot inspection snapshot (`POST /api/room-inspect`) instead of a live
+WebSocket — so oversight never opens a write path. Tabs:
 
 | Tab | Shows |
 | --- | --- |
 | **Comms** | The full chat transcript (with per-message tool chips) + invites. |
 | **Actions** | The pending queue (view-only) and the recent apply/fail/reject results. |
+| **Audit** | The append-only trail of sensitive actions (invites, removals, role changes, applies, token changes, inspections). Owner- and employee-viewable. |
 | **Team guidance** | An editable surface — add / edit / enable / delete guidance docs and **Reindex for search**. |
 | **Dev docs** | A "what changed" tracker of the repo's Markdown (README + `docs/`): title, last-modified, size, and an inline viewer. Refreshed on every `npm run build`. |
-| **Onboarding & migration** | Onboarding checklist/progress, the migration plan + last pre-flight/diff check, and the Terraform / CSV exports. |
+| **Onboarding & migration** | Onboarding checklist/progress (with live-zone auto-ticks and N/A steps), the migration plan + last pre-flight/diff check, and the Terraform / CSV exports. |
 
 ---
 
@@ -642,8 +667,8 @@ only add a pending action for human approval.
 | --- | --- |
 | `list_accounts` | List Cloudflare accounts the token can see. |
 | `list_zones` | List zones, optionally filtered to one account. |
-| `find_zone` | Resolve a zone id by domain name and save it as the room default. |
-| `list_dns_records` | List DNS records for a zone (optionally by type). |
+| `find_zone` | Resolve a zone id by domain name and save it as the room default. Also captures the zone's live status/SSL/WAF state to auto-tick the go-live checklist. |
+| `list_dns_records` | List DNS records for a zone (optionally by type). Folds proxy coverage into the live-zone facts (ticks the proxy-status step). |
 | `cf_get` | Generic READ against Cloudflare v4 JSON REST endpoints that use the standard API envelope. |
 | `recommend_configuration` | Turn the room's business profile into tailored, priority-ranked Cloudflare recommendations (rationale + docs). Read-only — it proposes; the write builders queue. |
 
@@ -713,6 +738,20 @@ answers that drive `recommend_configuration`), `list_migration_providers`,
   boundary; opening any listed room still requires that room's membership, and the
   registry lives in a reserved `__registry__` Durable Object that browser routes
   cannot reach.
+- **Roles are least-privilege and every sensitive action is audited.** Each commit
+  path runs through `requireCommitRole()`, which reads the caller's live role from
+  `glide_room_members`: a **viewer** can read, chat, and queue proposals but is
+  blocked from every commit; a **member** adds Apply and member invites; only an
+  **owner** grants/changes roles and deletes the room, and the owner's own role is
+  immutable. Invites, removals, role changes, applies, token changes, deletions,
+  and employee inspections are appended to `glide_room_audit`, which is owner-gated,
+  never synced, and self-prunes at 5,000 rows.
+- **Employee oversight is read-only.** A verified Cloudflare employee who is not a
+  member can inspect any room via `POST /api/room-inspect`, which returns a one-shot
+  read-only snapshot (`inspectRoom()`) and never opens a socket. That path is
+  deliberately separate from the members-only authorization gate, so widening
+  inspection can never widen writes — every write RPC still independently requires
+  membership. Each inspection is itself recorded to the audit trail.
 - **Unknown-room probes do not reserve storage.** The API and Agent client use one
   shared, bounded display-to-storage-name mapping. Storage created only by a
   denied probe remains provisional and is destroyed after a final serialized

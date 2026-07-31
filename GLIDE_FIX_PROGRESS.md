@@ -596,3 +596,113 @@ in the Workers deployment history rather than this source document.
   (bindings intact: `GlideAgent` DO, `VECTORIZE`, `AI`, both rate limiters, `ASSETS`,
   `GLIDE_MODEL=@cf/openai/gpt-oss-120b`). The app sits behind Cloudflare Access, so
   anonymous verification returns the expected `302` to the Access login.
+
+## Follow-up 15: room RBAC + audit trail, live-zone checklist, and audited employee inspection
+
+### Goal (roadmap #4 "Governance" — three user-requested features)
+
+1. **Per-room RBAC + an audit trail.** Rooms only had `owner`/`member`; add a
+   read-only **`viewer`** role (read + chat + propose, but no apply/reject/invite/
+   token/rename/delete), and an **append-only audit trail** of who queued, applied,
+   rejected, invited, changed roles/settings, etc., exportable from `/admin`.
+2. **Make the go-live checklist reflect the real zone.** The checklist only ticked
+   from in-room answers and queued actions, so steps a domain had *already*
+   satisfied (nameservers changed, zone active, SSL strict, WAF deployed, records
+   proxied) stayed unchecked, and "lower TTLs before cutover" showed even for a zone
+   that is already live. Auto-tick from the **live Cloudflare zone state**, and mark
+   inapplicable steps **N/A**.
+3. **Let Cloudflare employees inspect any room, audited.** Opening a room from the
+   `/admin` **All rooms** list dead-ended at "Room access required" for a non-member,
+   because inspection required membership. Give verified employees a **read-only,
+   audited** view of any room — with **zero mutation surface**.
+
+### Fix
+
+1. **RBAC + audit** (`src/shared.ts`, `src/server.ts`, `src/client/main.tsx`) —
+   - `RoomRole = "owner" | "member" | "viewer"`; `RoomMember.role` widened;
+     `RoomAccessStatus.role` adds `"inspector"` and `entry` adds `"inspect"`.
+   - `glide_room_members` `role` CHECK now includes `viewer`; a one-time migration
+     rebuilds the pre-viewer table (detected via `sqlite_master.sql`). Members sort
+     owner → member → viewer.
+   - New `glide_room_audit` table (`id, ts, actor, action, target, detail`) with a
+     `RoomAuditAction` union and `RoomAuditEntry` type. `recordAudit()` is
+     best-effort and self-prunes to `MAX_ROOM_AUDIT_ENTRIES` (5,000). Audit lives
+     **only in SQLite** (never synced in `GlideState`); the `getAuditLog()`
+     `@callable` is **owner-gated**.
+   - Commit paths route through `requireCommitRole()` (viewers are blocked;
+     programmatic/no-connection paths stay allowed). Gated: apply / applyAll /
+     reject / setRoomName / set+clearCloudflareToken / inviteTeammate (+ new 4th
+     `role` arg; only owners may grant `viewer`) / removeRoomMember / destroyRoom /
+     the new owner-only `setMemberRole` (member↔viewer; the owner is immutable).
+     `queuePending` and `recordActionResult` centrally audit queue/apply/reject.
+   - Client: role-aware UI — viewers see a read-only banner and lose Apply/Reject/
+     invite/token/rename controls; owners get a per-member role `<select>`; a new
+     **Audit** admin tab lists entries with CSV/JSON export.
+2. **Live-zone checklist** (`src/cf-api.ts`, `src/shared.ts`, `src/server.ts`,
+   `src/system-prompt.ts`, `src/client/main.tsx`) —
+   - New readers `getZoneSslMode()` (`/settings/ssl`) and
+     `getZoneManagedWafDeployed()` (managed-firewall phase entrypoint; a 404 means
+     "not deployed", not an error).
+   - New `GlideState.liveZone` (`LiveZoneFacts`: status, sslMode, wafManaged,
+     proxied/proxiable record counts). `find_zone` captures activation + SSL + WAF;
+     `list_dns_records` folds in proxy coverage (untyped listing of the default
+     zone only). `mergeLiveZone()` replaces cross-zone snapshots wholesale and
+     re-derives the checklist; `currentLiveZone()` guards staleness at the call site.
+   - `OnboardingStep.na?` added. `autoDoneSteps()` now returns `{ done, na }`: an
+     **active** zone ticks `nameservers` + `verify` and marks `ttl` **N/A**; SSL
+     `full`/`strict` ticks `ssl`; a deployed managed WAF ticks `security`; any
+     proxied record ticks `proxy`. Both callers union done+na (never uncheck).
+   - System prompt surfaces the live-zone facts and renders N/A as `[-]`; both
+     checklists (sidebar + admin) count `done || na` and show an **N/A** badge.
+3. **Audited employee inspection** (`src/server.ts`, `src/client/main.tsx`) —
+   - New DO method `inspectRoom(identity)`, deliberately **separate** from
+     `authorizeRoomAccess` (the socket/activation gate stays members-only, so
+     widening inspection can never widen write access). A member is told to use the
+     live socket; a **non-member Cloudflare employee** gets an audited, read-only
+     **snapshot** (`state` + transcript + audit) and never a connection; anyone else
+     is denied. A never-activated room (no members) is reported non-existent and
+     queued for provisional cleanup, so inspecting an unknown id can't create junk.
+   - New Worker route **`POST /api/room-inspect`** (same-origin, authenticated)
+     returns the access status and, for inspectors, the snapshot.
+   - Client refactor: `AdminRoom` split into a shared presentational
+     **`AdminDashboard`** fed by either **`LiveAdminRoom`** (members; WebSocket,
+     editable guidance, on-demand audit) or **`InspectorAdminRoom`** (non-member
+     employees; the HTTP snapshot, guidance read-only, audit from the snapshot). A
+     new `AdminRoomLoader` calls `/api/room-inspect` and branches on `entry`. The
+     header shows an **"inspecting · read-only"** badge; `GuidanceTab` gained a
+     `readOnly` mode.
+
+### Tests
+
+- `tests/workers/rbac-audit.test.ts` (7): viewer invite; viewers blocked from every
+  commit; viewers can still read; owner-only role change + owner immutable;
+  member-invites-member vs owner-only-viewer; audit records + owner-only read;
+  pre-viewer schema migration (`evictDurableObject` + old-CHECK rebuild).
+- `tests/workers/live-zone-checklist.test.ts` (8): `getZoneSslMode` /
+  `getZoneManagedWafDeployed` parsing (incl. 404 = not deployed, disabled rules);
+  an active+secured zone auto-ticks go-live steps and marks TTL N/A end-to-end
+  (through `captureLiveZoneFacts`); a pending/unsecured zone stays unticked; a
+  snapshot for a different zone than the default never ticks (staleness guard).
+- `tests/workers/room-inspection.test.ts` (5): member → member access, no snapshot;
+  non-member employee → inspector access + audited snapshot; non-member non-employee
+  denied; never-activated room reported non-existent; the inspect entry persists in
+  the audit trail.
+
+### Docs & deck
+
+- Added this Follow-up 15; updated `README.md`, `docs/architecture.md`,
+  `docs/security.md`, `docs/tools.md`, `docs/onboarding-and-migration.md`, and
+  `docs/README.md` for the viewer role, the audit table/trail, the `liveZone`
+  state + N/A checklist steps, and the `POST /api/room-inspect` inspection flow.
+  Refreshed `Glide.pptx` (roadmap #4 marked shipped).
+
+### Validation and release state
+
+- `npx tsc --noEmit` (app) and `-p tests/workers/tsconfig.json` (workers) both
+  clean; `npm run test:node` **154 pass**; `npm run test:workers` **119 pass**
+  (99 prior + 7 + 8 + 5 new); `npm run build` clean.
+- Deployed with `npm run deploy` — **Version ID `ec410a88-8bdc-4b7d-8971-61c7f8d4ee94`**,
+  client bundle `index-C9270O0C.js`, live at https://glide.arunpotta1024.workers.dev
+  (bindings intact: `GlideAgent` DO, `VECTORIZE`, `AI`, both rate limiters, `ASSETS`,
+  `GLIDE_MODEL=@cf/openai/gpt-oss-120b`). Behind Cloudflare Access, so `GET /` and
+  `POST /api/room-inspect` both return the expected `302` to the Access login.

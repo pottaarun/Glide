@@ -145,14 +145,23 @@ checklist mirroring Cloudflare's recommended go-live path. **The checklist
 completes itself as Glide gathers the required info** — you rarely tick a box by
 hand:
 
-- `autoDoneSteps()` (`src/server.ts`) derives which steps are done from the
-  captured answers (domain set, Full/Partial DNS chosen, provider config
-  previewed, scanned DNS records reviewed) **and** the action queue (a
-  queued/applied SSL setting, WAF rule, or migration rules).
+- `autoDoneSteps()` (`src/server.ts`) returns `{ done, na }` derived from three
+  sources: the captured answers (domain set, Full/Partial DNS chosen, provider
+  config previewed, scanned DNS records reviewed), the action queue (a
+  queued/applied SSL setting, WAF rule, or migration rules), **and the domain's
+  real live Cloudflare state** (`GlideState.liveZone`).
+- **Live-zone auto-ticking.** `find_zone` captures the zone's activation status,
+  SSL mode, and managed-WAF deployment; `list_dns_records` folds in proxy coverage
+  (`getZoneSslMode()` / `getZoneManagedWafDeployed()` in `src/cf-api.ts`, merged via
+  `mergeLiveZone()`). From that: an **active** zone ticks `nameservers` + `verify`
+  and marks `ttl` **N/A** (lowering TTLs before cutover no longer applies); SSL
+  `full`/`strict` ticks `ssl`; a deployed managed WAF ticks `security`; any proxied
+  record ticks `proxy`. N/A steps count as satisfied for progress but render
+  distinctly (a muted `N/A` badge; `[-]` in the system prompt).
 - It's applied on every onboarding update (`applyOnboardingPatch`,
-  `src/server.ts`) and re-derived whenever the queue changes
-  (`recomputeOnboardingChecklist`, also in `src/server.ts`, called from
-  `queuePending` / `queueMigrationRules` / `finish`).
+  `src/server.ts`) and re-derived whenever the queue **or** live-zone snapshot
+  changes (`recomputeOnboardingChecklist`, also in `src/server.ts`, called from
+  `queuePending` / `queueMigrationRules` / `finish` / `mergeLiveZone`).
 - `find_zone` / `add_domain` establish the target before downstream work.
   `add_domain` performs an exact lookup in the resolved account; when the zone
   already exists it saves that zone as the room default, queues no Add domain
@@ -410,7 +419,13 @@ room startup, Glide drops the legacy local `glide_snapshots` breadcrumb table.
 | `configProvided` | An exported config has been previewed. |
 | `dnsReviewed` | Scanned DNS records have been reviewed (`list_dns_records` ran during onboarding). Auto-ticks the "review DNS records" step. |
 | `goals` | What to migrate/set up. |
-| `checklist` | Ordered go-live steps (tailored to `path`). **Auto-completes** from captured answers + the action queue; see `autoDoneSteps()` (`src/server.ts`). |
+| `checklist` | Ordered go-live steps (tailored to `path`). Each step carries `done` and an optional `na` ("not applicable for this zone"). **Auto-completes** from captured answers + the action queue + the live-zone snapshot; see `autoDoneSteps()` (`src/server.ts`). |
+
+`GlideState.liveZone` (`LiveZoneFacts`, `src/shared.ts`) holds the live facts that
+drive live-zone auto-ticking: `zoneId`, `name`, `status`, `sslMode`, `wafManaged`,
+and `proxiedRecords`/`proxiableRecords`. All fields beyond `zoneId`/`ts` are
+best-effort — a reader that fails or lacks permission simply leaves its field
+unset and the related step stays unticked.
 | `updatedBy` / `ts` | Attribution + timestamp. |
 
 `MigrationPlan` (`src/shared.ts`) holds `provider`/`providerLabel`,

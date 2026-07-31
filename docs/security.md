@@ -114,8 +114,10 @@ no-store `503 access_keys_unavailable` with `Retry-After: 10` and logs only
 
 Authorization is a server-only SQLite ACL in each room's Durable Object:
 
-- `glide_room_members` stores canonical email, `owner | member` role, inviter, and
-  join time. It is not synced through `GlideState` and is capped at 100 entries.
+- `glide_room_members` stores canonical email, `owner | member | viewer` role,
+  inviter, and join time. It is not synced through `GlideState` and is capped at 100
+  entries. The `role` column is CHECK-constrained; a one-time migration rebuilds the
+  pre-viewer table on first load after upgrade.
 - Only a same-origin `POST /api/room-access` may activate membership. An exact
   `@cloudflare.com` email may create a canonical empty room or become owner of an
   existing unclaimed legacy room. Agent GET/WebSocket routing is read-only and
@@ -132,6 +134,18 @@ Authorization is a server-only SQLite ACL in each room's Durable Object:
   prefilled email is only delivery convenience; the durable ACL grant is what
   authorizes the recipient after Access verifies that exact email. Grants require
   the explicit Invite-panel RPC; the model has no membership mutation tool.
+- **Roles are least-privilege.** A `viewer` may read, chat, and *propose* (queue)
+  changes, but every commit path — apply / apply-all / reject, invite, remove,
+  token set/clear, rename, role change, delete — is gated by `requireCommitRole()`
+  and refused for viewers (the client also hides those controls). A `member` keeps
+  those commit rights and may invite other members; only an `owner` may grant the
+  `viewer` role, change a member's role (`setMemberRole`, member↔viewer; the owner
+  is immutable), or delete the room. The gate keys off the **live connection
+  identity's** stored role, never the untrusted `by` label.
+- Every governance-relevant action is recorded in an append-only `glide_room_audit`
+  table (who queued/applied/rejected/invited/changed roles or settings/inspected).
+  The trail is **never synced** in `GlideState`; the `getAuditLog()` RPC is
+  owner-gated and exportable to CSV/JSON from `/admin`.
 - Only the owner can remove a non-owner. Revocation atomically removes the ACL and
   invitation audit row, then closes every matching socket with `1008` and reason
   `Room membership revoked`.
@@ -143,7 +157,14 @@ Authorization is a server-only SQLite ACL in each room's Durable Object:
   (`setRoomName`) is any-member and display-only; it never affects routing,
   storage identity, or the ACL.
 - A nonemployee cannot create or claim a room. A second employee does not gain
-  access merely because they are an employee; an existing member must invite them.
+  *membership* merely because they are an employee; an existing member must invite
+  them. A verified employee may, however, **inspect** any existing room read-only
+  via `POST /api/room-inspect` → the DO's `inspectRoom()`, which is deliberately
+  **separate from** the members-only socket/activation gate: it returns an audited,
+  read-only snapshot (state + transcript + audit) and never a connection, so
+  inspection carries **zero mutation surface** (writes still require membership at
+  the RPC layer). Each inspection is itself written to the audit trail, and a
+  never-activated room is reported non-existent rather than materialized.
 - The Worker requires an exact same-origin `Origin` for Agent WebSocket upgrades
   and checks membership in `routeAgentRequest()` hooks before routing.
   `shouldSendProtocolMessages()` suppresses initial SDK state/identity frames for
@@ -395,7 +416,10 @@ These limits bound resource use and protect the model's context window:
 | Unauthorized room access | Server-only durable email ACL checked before routing and on every frame; URL possession alone is insufficient | Every admitted member can operate the room and its stored token; invite carefully. |
 | Revocation or same-id reconnect races an active chat, retry, or privileged RPC | Connection-bound authorization leases include a socket-session nonce; active model/retry work is aborted, chat tools recheck after awaits, and Apply/token/archive/migration paths recheck before writes or retained state | A Cloudflare write already dispatched before revocation cannot be recalled; its outcome is still recorded. A read-only upstream request may finish, but its result is discarded. |
 | Authenticated users create Agent facets | `onBeforeSubAgent()` rejects every `/sub/` route with `404` | Revisit this deny-all hook before intentionally adopting sub-agents. |
-| Admin inspection creates or claims a room | Admin and transient-close checks use read-only `intent=inspect`; only the chat activation flow can insert the first owner | A Cloudflare employee using the normal chat activation flow can still intentionally create or claim. |
+| Admin inspection creates or claims a room | `inspectRoom()` (behind `POST /api/room-inspect`) is separate from the members-only activation gate, never inserts an owner, and reports a never-activated room as non-existent (queuing provisional cleanup); the transient-close recheck uses read-only `intent=inspect` | A Cloudflare employee using the normal chat activation flow can still intentionally create or claim. |
+| Non-member employee inspection mutates a room | Inspection returns a read-only snapshot and never opens a socket; every write RPC independently requires membership via `requireCommitRole()`/the connection lease, so there is no mutation surface even if the snapshot path were abused | A verified employee can *read* any room's state, transcript, and audit; scope employee trust accordingly. Each inspection is itself audited. |
+| Viewer escalates to a write | Every commit path is gated by `requireCommitRole()` on the live connection role; only an owner can change roles or grant `viewer`, and the owner is immutable | A compromised owner account can still change roles; protect owner identities. |
+| Audit trail tampering or leakage | Append-only `glide_room_audit`, never synced in `GlideState`, self-pruning at 5,000 rows; `getAuditLog()` is owner-gated (or delivered inside an audited employee snapshot) | An owner or inspecting employee can read the trail; there is no in-app edit/delete, but storage-level access remains an operator concern. |
 | Legacy-room takeover | Only a verified Cloudflare employee may perform the one-time atomic claim | The first employee who knows an unclaimed legacy room id becomes owner; migrate sensitive legacy rooms promptly. |
 | Accidental or malicious room deletion | `destroyRoom` requires the live owner identity **and** the exact `DELETE THIS ROOM` phrase; the untrusted `by` label is never used | Deletion is intentional and irreversible — a legitimate owner can still delete a room; there is no built-in restore. |
 | Room registry leaks room contents | `GET /api/rooms` is employee-only and returns only id/name/owner/counts/timestamps; it is not an authorization boundary and each room is still membership-gated | A verified employee can enumerate room ids and names, but cannot read a room's data without being a member. |
